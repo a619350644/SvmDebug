@@ -1,47 +1,58 @@
 ﻿#include <ntifs.h>
 #include "SVM.h"
-//要用多线程给多个核心使用。
-//我们给虚拟核64个，所以留下size=64个数组
+
+// 给虚拟核64个
 SVM_CORE g_nVMCB[64] = { 0 };
 
-KSTART_ROUTINE KstartRoutine;
+// IPI广播回调函数，在每个核心的 IPI_LEVEL (IRQL 29) 级别执行
+ULONG_PTR IpiInstallBroadcastCallback(ULONG_PTR Argument) {
+	UNREFERENCED_PARAMETER(Argument);
 
-VOID KstartRoutine(PVOID StartContext) {
-
-	char vendor[13] = { 0 };
-	//先判断是amd还是intel
-	CommGetCPUName(vendor, sizeof(vendor));
-	SvmDebugPrint("CPUName:%s\n", vendor);
-	NTSTATUS STATUS = 0;
-	if (strcmp(vendor, "AuthenticAMD") == 0) {
-		//我们先绑核
-		KAFFINITY OldAffinity;
-		KAFFINITY affinity = (KAFFINITY)1 << (ULONG_PTR)StartContext;
-		OldAffinity = KeSetSystemAffinityThreadEx(affinity);
-		//先判断支不支持svm功能
-		BOOLEAN Support = CommCheckAMDsupport();
-		if (!Support) {
-			SvmDebugPrint("[ERROR][DriverEntry][CommCheckAMDsupport]不支持SVM功能\n");
-			STATUS = STATUS_UNSUCCESSFUL;
-			KeRevertToUserAffinityThreadEx(OldAffinity);
-		}
-		else {
-			STATUS = InitSVMCORE(&(g_nVMCB[(ULONG_PTR)StartContext]));
-			//if (NT_SUCCESS(STATUS)) {
-			//	HostLoop(&(g_nVMCB[(ULONG_PTR)StartContext]));
-			//}
-		}
-
-		KeRevertToUserAffinityThreadEx(OldAffinity);
+	ULONG processorNumber = KeGetCurrentProcessorNumber();
+	if (processorNumber >= 64) {
+		return 0;
 	}
-	
-	PsTerminateSystemThread(STATUS);
-	return;
+	PSVM_CORE vpData = &g_nVMCB[processorNumber];
+
+	// 检查当前核是否支持SVM
+	BOOLEAN Support = CommCheckAMDsupport();
+	if (!Support) {
+		return 0;
+	}
+
+	// 执行SVM虚拟化接管
+	NTSTATUS status = InitSVMCORE(vpData);
+
+	return NT_SUCCESS(status) ? 1 : 0;
+}
+
+ULONG_PTR IpiUnloadBroadcastCallback(ULONG_PTR Argument) {
+	UNREFERENCED_PARAMETER(Argument);
+	int regs[4] = { 0 };
+
+	__cpuid(regs, CPUID_UNLOAD_SVM_DEBUG);
+	return 0;
 }
 
 void UnloadDriver(PDRIVER_OBJECT DriverObject) {
 	UNREFERENCED_PARAMETER(DriverObject);
-	
+	// 卸载逻辑：需要发送卸载 IPI 广播、执行 VMMCALL 让虚拟机退出，并释放内存
+	ULONG n_cout = KeQueryActiveProcessorCount(0);
+	if (n_cout > 64) {
+		n_cout = 64;
+	}
+
+	KeIpiGenericCall(IpiUnloadBroadcastCallback, 0);
+	for (ULONG i = 0; i < n_cout; i++) {
+		if (g_nVMCB[i].HostStackBase) {
+			// 释放已经分配的内存
+			ExFreePoolWithTag(g_nVMCB[i].HostStackBase, 'HSTK');
+		}
+		
+		g_nVMCB[i].HostStackTop = 0;
+	}
+
+	SvmDebugPrint("[DrvMain] 开始 IPI 广播卸载 SVM...\n");
 
 	return;
 }
@@ -50,37 +61,43 @@ EXTERN_C NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegPa
 	UNREFERENCED_PARAMETER(RegPath);
 	DriverObject->DriverUnload = UnloadDriver;
 
-	//获取多少个核心
-	ULONG n_cout = KeQueryActiveProcessorCount(0);
-	if (n_cout > 128) {
-		n_cout = 128;
+	char vendor[13] = { 0 };
+	CommGetCPUName(vendor, sizeof(vendor));
+	SvmDebugPrint("CPUName:%s\n", vendor);
+
+	if (strcmp(vendor, "AuthenticAMD") != 0) {
+		SvmDebugPrint("[ERROR] 当前处理器不是AMD\n");
+		return STATUS_NOT_SUPPORTED;
 	}
+
+	// 获取多少个核心
+	ULONG n_cout = KeQueryActiveProcessorCount(0);
+	if (n_cout > 64) {
+		n_cout = 64;
+	}
+
+	// 1. 核心步骤：必须在 PASSIVE_LEVEL 预先分配内存！
+	// 因为 KeIpiGenericCall 运行在 IPI_LEVEL，绝对不允许调用 ExAllocatePool2
 	for (ULONG i = 0; i < n_cout; i++) {
-		NTSTATUS status;
-		HANDLE  ThreadHandle;
-		CLIENT_ID ClientID;
-		PVOID StartContext = (PVOID)(ULONG_PTR)i;
-		//这里面写每个虚拟核的代码，要创建线程和事件来完成
-		status = PsCreateSystemThread(&ThreadHandle,
-			THREAD_ALL_ACCESS,
-			nullptr,
-			nullptr,
-			&ClientID,
-			KstartRoutine,
-			StartContext
-		);
-		
-		if (!NT_SUCCESS(status)) {
-			SvmDebugPrint("[DrvMain] CPU %lu: PsCreateSystemThread FAILED: 0x%08X\n", i, status);
+		g_nVMCB[i].HostStackBase = ExAllocatePool2(POOL_FLAG_NON_PAGED, KERNEL_STACK_SIZE, 'HSTK');
+		if (g_nVMCB[i].HostStackBase == nullptr) {
+			SvmDebugPrint("[DrvMain] CPU %lu: HostStackBase 分配失败\n", i);
+			// 释放已经分配的内存
+			for (ULONG j = 0; j < i; j++) {
+				ExFreePoolWithTag(g_nVMCB[j].HostStackBase, 'HSTK');
+			}
 			return STATUS_INSUFFICIENT_RESOURCES;
 		}
-		else {
-			g_nVMCB[i].Guest_Thread = ThreadHandle;
-			
-		}
-
+		RtlZeroMemory(g_nVMCB[i].HostStackBase, KERNEL_STACK_SIZE);
+		g_nVMCB[i].HostStackTop = (UINT64)g_nVMCB[i].HostStackBase + KERNEL_STACK_SIZE;
 	}
 
+	SvmDebugPrint("[DrvMain] 开始 IPI 广播初始化 SVM...\n");
+
+	// 2. 发起 IPI 广播，所有 CPU 核心将同时执行 IpiBroadcastCallback
+	KeIpiGenericCall(IpiInstallBroadcastCallback, 0);
+
+	SvmDebugPrint("[DrvMain] IPI 广播初始化完成！系统现在运行在 Guest 中。\n");
 
 	return STATUS_SUCCESS;
 }

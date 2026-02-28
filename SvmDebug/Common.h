@@ -14,6 +14,7 @@
 
 #define EFER_SVME       (1UL << 12)
 
+
 #define RPL_MASK        3
 #define DPL_SYSTEM      0
 
@@ -26,7 +27,7 @@
 #define CPUID_SVM_FEATURES                                      0x8000000a
 #define CPUID_HV_VENDOR_AND_MAX_FUNCTIONS   0x40000000
 #define CPUID_HV_INTERFACE                  0x40000001
-#define CPUID_UNLOAD_SIMPLE_SVM     0x41414141
+#define CPUID_UNLOAD_SVM_DEBUG     0x41414141
 #define CPUID_HV_MAX                CPUID_HV_INTERFACE
 
 #define SVM_MSR_VM_CR                   0xc0010114

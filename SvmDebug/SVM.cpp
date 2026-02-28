@@ -1,22 +1,7 @@
 ﻿#include "SVM.h"
 
 
-NTSTATUS GuestEntry()
-{
-
-	int cpuInfo[4];
-	
-	LARGE_INTEGER timeout;
-	timeout.QuadPart = -10000; // 等待1毫秒
-	while (TRUE)
-	{
-		__cpuid(cpuInfo, 0);
-		KeDelayExecutionThread(KernelMode, FALSE, &timeout);
-	}
-	return STATUS_SUCCESS;
-}
-
-
+//初始化虚拟核
 NTSTATUS InitSVMCORE(PSVM_CORE vpData)
 {
 	if (vpData == nullptr) {
@@ -27,28 +12,19 @@ NTSTATUS InitSVMCORE(PSVM_CORE vpData)
 	RtlCaptureContext(&contextRecord);
 
 	if (IsSvmHypervisorInstalled()) {
-		// Guest 模式：正常返回，让 OS 继续运行
-		SvmDebugPrint("[INFO] CPU %d: 已进入 guest 模式\n",
-			KeGetCurrentProcessorNumber());
-		DbgBreakPoint();
-		int cpuInfo[4];
-
-		LARGE_INTEGER timeout;
-		timeout.QuadPart = -10000; // 等待1毫秒
-		while (TRUE)
-		{
-			__cpuid(cpuInfo, 0);
-			KeDelayExecutionThread(KernelMode, FALSE, &timeout);
-		}
-		return STATUS_SUCCESS;  
+		// Guest 模式：直接返回！
+		// IpiBroadcastCallback 收到返回值后，OS 会自动结束 IPI 级别，降回正常 IRQL 并继续正常运行。
+		return STATUS_SUCCESS;
 	}
 
+	// Host 模式：配置 VMCB 结构
 	NTSTATUS status = PrepareVMCB(vpData, contextRecord);
 	if (!NT_SUCCESS(status)) {
-		SvmDebugPrint("[ERROR] PrepareVMCB 失败\n");
+		SvmDebugPrint("[ERROR] CPU %d: PrepareVMCB 失败\n", KeGetCurrentProcessorNumber());
 		return status;
 	}
 
+	// 切换到 Host 独立栈，启动 Hypervisor
 	SvEnterVmmOnNewStack(vpData);
 
 	return STATUS_SUCCESS;
@@ -184,12 +160,12 @@ NTSTATUS PrepareVMCB(PSVM_CORE vpData, CONTEXT contextRecord)
 	vpData->Guestvmcb.ControlArea.GuestAsid = 1;
 	
 	//手动分配HostVMM独立栈
-	vpData->HostStackBase = ExAllocatePool2(POOL_FLAG_NON_PAGED, KERNEL_STACK_SIZE, 'HSTK');
-	if (vpData->HostStackBase == nullptr) {
-		return STATUS_INSUFFICIENT_RESOURCES;
-	}
-	RtlZeroMemory(vpData->HostStackBase, KERNEL_STACK_SIZE);
-	vpData->HostStackTop = (UINT64)vpData->HostStackBase + KERNEL_STACK_SIZE;
+	//vpData->HostStackBase = ExAllocatePool2(POOL_FLAG_NON_PAGED, KERNEL_STACK_SIZE, 'HSTK');
+	//if (vpData->HostStackBase == nullptr) {
+	//	return STATUS_INSUFFICIENT_RESOURCES;
+	//}
+	//RtlZeroMemory(vpData->HostStackBase, KERNEL_STACK_SIZE);
+	//vpData->HostStackTop = (UINT64)vpData->HostStackBase + KERNEL_STACK_SIZE;
 
 	// ====================================================================
 	// AMD 手册要求：在执行 VMRUN 之前，软件必须设置 VM_HSAVE_PA MSR
@@ -258,6 +234,7 @@ BOOLEAN IsSvmHypervisorInstalled()
 	return (strcmp(vendorId, "VtDebugView ") == 0);
 }
 
+//vmexit操作
 void SvHandleVmExit(PSVM_CORE vpData)
 {
 	if (vpData == nullptr) {
@@ -278,6 +255,17 @@ void SvHandleVmExit(PSVM_CORE vpData)
 			vpData->Guest_gpr.Rcx = 0x56677562;  // "bugV"
 			vpData->Guest_gpr.Rdx = 0x20776569;  // "iew "
 		}
+		else if (leaf == CPUID_UNLOAD_SVM_DEBUG) {
+			//先将全局中断标志位置1响应中断
+			//__svm_stgi();
+			vpData->isExit = 1;
+			
+			//__svm_vmsave(vpData->GuestVmcbPa);//我感觉可以不用save了
+			//__svm_vmload(vpData->HostVmcbPa);
+			//__writemsr(IA32_MSR_EFER, __readmsr(IA32_MSR_EFER) & (~EFER_SVME));
+			//要把栈切换回去
+			
+		}
 		else
 		{
 			// 对于普通CPUID，执行真实的CPUID并返回结果给guest
@@ -296,6 +284,7 @@ void SvHandleVmExit(PSVM_CORE vpData)
 		vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
 		break;
 
+
 	default:
 
 		vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
@@ -304,6 +293,7 @@ void SvHandleVmExit(PSVM_CORE vpData)
 
 }
 
+//Host运行guest
 void SVMLauchRun(PSVM_CORE vpData)
 {
 	if (vpData == nullptr) {
@@ -316,9 +306,10 @@ void SVMLauchRun(PSVM_CORE vpData)
 	return;
 }
 
+//host死循环，负责运行guest和vmexit
 EXTERN_C void HostLoop(PSVM_CORE vpData)
 {
-	while (TRUE) {
+	while (!vpData->isExit) {
 
 
 		SVMLauchRun(vpData);
@@ -326,9 +317,10 @@ EXTERN_C void HostLoop(PSVM_CORE vpData)
 
 		SvHandleVmExit(vpData);
 	}
+	SvSwitchStack(vpData);
 }
 
-
+//调试函数：负责打印通用寄存器
 VOID PrintGuestGpr(PGUEST_GPR Gpr)
 {
 	if (Gpr == NULL)

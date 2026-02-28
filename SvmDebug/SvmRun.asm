@@ -3,6 +3,7 @@ OPTION CASEMAP:NONE			; 使标签大小写敏感
 ;常量定义
 GuestVmcbPaOffset EQU 30F0h
 GuestGPR EQU 3000h
+GuestStateSaveAreaRSP EQU 5D8h
 HostStackTopOffset EQU 5020h
 
 HostVmcbPaOffset EQU 30F8h
@@ -10,6 +11,7 @@ HostVmcbPaOffset EQU 30F8h
 
 PUBLIC SvLaunchVm
 PUBLIC SvEnterVmmOnNewStack
+PUBLIC SvSwitchStack
 EXTERN HostLoop:PROC
 
 .CODE
@@ -100,8 +102,8 @@ SAVEGPR macro
     ;POP RDX
     endm
 
-    ;---------------------------------------------------------------------
-; 定义一个宏，将guest State加载到通用寄存器
+;---------------------------------------------------------------------
+; 定义一个宏，将host/guest加载到通用寄存器
 ;---------------------------------------------------------------------
 LOADGPR macro
          
@@ -139,7 +141,57 @@ SvEnterVmmOnNewStack PROC
     INT 3
 SvEnterVmmOnNewStack ENDP
 
+;---------------------------------------------------------------------
+; VOID SvSwitchStack(PSVM_CORE VpData);
+; 从 Host 栈切换回 Guest 栈，关闭 SVM，并恢复系统执行流
+;---------------------------------------------------------------------
+SvSwitchStack PROC
+    MOV R15, RCX                ; 暂存 VpData (RCX) 到 R15
 
+    ; 1. 开中断并恢复不可见寄存器 (接替之前在 C 语言里的工作)
+    STGI
+    MOV RAX, [R15 + GuestVmcbPaOffset]
+    VMLOAD RAX
+
+    ; 2. 关闭 SVM (接替之前在 C 语言里的工作)
+    MOV ECX, 0C0000080h         
+    RDMSR
+    BTR EAX, 12                 
+    WRMSR
+
+    ; 3. 构造 IRETQ 返回栈 (严格按 SS, RSP, RFLAGS, CS, RIP 顺序压栈)
+    MOVZX RAX, word ptr [R15 + 1420h]   ; 压入 SS
+    PUSH RAX
+    MOV RAX, [R15 + 15D8h]              ; 压入 RSP
+    PUSH RAX
+    MOV RAX, [R15 + 1570h]              ; 压入 RFLAGS
+    PUSH RAX
+    MOVZX RAX, word ptr [R15 + 1410h]   ; 压入 CS
+    PUSH RAX
+    MOV RAX, [R15 + 1578h]              ; 压入 RIP
+    PUSH RAX
+
+    ; 4. 恢复通用寄存器 (手动展开以防破坏刚建好的栈)
+    LEA RAX, [R15 + GuestGPR]              
+    MOV RBX, [RAX+08H]
+    MOV RCX, [RAX+10H]
+    MOV RDX, [RAX+18H]
+    MOV RSI, [RAX+20H]
+    MOV RDI, [RAX+28H]
+    MOV RBP, [RAX+30H]
+    MOV R8,  [RAX+38H]
+    MOV R9,  [RAX+40H]
+    MOV R10, [RAX+48H]
+    MOV R11, [RAX+50H]
+    MOV R12, [RAX+58H]
+    MOV R13, [RAX+60H]
+    MOV R14, [RAX+68H]
+    MOV R15, [RAX+70H]
+    MOV RAX, [RAX+00H]
+
+    ; 5. 起飞落地
+    IRETQ
+SvSwitchStack ENDP
 ;---------------------------------------------------------------------
 ; VOID SvLaunchVm(SVM_CORE vpData);
 ;
