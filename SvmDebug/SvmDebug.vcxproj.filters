@@ -28,6 +28,12 @@
     <ClCompile Include="SVM.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="NPT.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Hide.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common.h">
@@ -37,6 +43,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="winApiDef.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="NPT.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Hide.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

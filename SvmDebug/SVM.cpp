@@ -38,6 +38,15 @@ NTSTATUS PrepareVMCB(PSVM_CORE vpData, CONTEXT contextRecord)
 		return STATUS_INVALID_PARAMETER;
 	}
 
+	NTSTATUS status = InitNPT(vpData);
+	if (!NT_SUCCESS(status)) {
+		SvmDebugPrint("[ERROR][InitNPT]初始化NPT套页失败\n");
+		return STATUS_NOT_SUPPORTED;
+	}
+
+	//根据amd手册配置Guest PAT
+	vpData->Guestvmcb.StateSaveArea.GPat = __readmsr(IA32_MSR_PAT);
+
 	RtlZeroMemory(&vpData->Guestvmcb, sizeof(VMCB));
 	RtlZeroMemory(&vpData->Hostvmcb, sizeof(VMCB));
 	//先获得cr系列的寄存器
@@ -280,11 +289,22 @@ void SvHandleVmExit(PSVM_CORE vpData)
 		break;
 
 	case VMEXIT_VMRUN:
+	{
 		// Guest 尝试执行 VMRUN（被拦截），跳过该指令
 		vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
 		break;
+	}
+	case VMEXIT_NPF:
+	{
+		// 发生 NPF 时，ExitInfo1 存放错误码(类似普通PF)，ExitInfo2 存放引发异常的宿主物理地址 (HPA)
+		UINT64 faultHpa = vmcb->ControlArea.ExitInfo2;
+		UINT64 errorCode = vmcb->ControlArea.ExitInfo1;
 
+		SvmDebugPrint("[VMEXIT_NPF] 拦截到嵌套缺页! 物理地址: 0x%llX, 错误码: 0x%llX\n", faultHpa, errorCode);
 
+		vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
+		break;
+	}
 	default:
 
 		vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;

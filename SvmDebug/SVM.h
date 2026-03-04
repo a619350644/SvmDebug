@@ -1,7 +1,7 @@
 ﻿#pragma once
-#include "Common.h"
+#include "Common.h"     
 #include "winApiDef.h"
-
+#include "NPT.h"
 
 typedef struct _SVM_CORE {
     BOOLEAN isExit;                                     // 0x00

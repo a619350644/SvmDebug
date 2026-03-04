@@ -3,7 +3,7 @@
 
 // 给虚拟核64个
 SVM_CORE g_nVMCB[64] = { 0 };
-
+HANDLE g_ProtectedPID = NULL;
 // IPI广播回调函数，在每个核心的 IPI_LEVEL (IRQL 29) 级别执行
 ULONG_PTR IpiInstallBroadcastCallback(ULONG_PTR Argument) {
 	UNREFERENCED_PARAMETER(Argument);
@@ -19,7 +19,6 @@ ULONG_PTR IpiInstallBroadcastCallback(ULONG_PTR Argument) {
 	if (!Support) {
 		return 0;
 	}
-
 	// 执行SVM虚拟化接管
 	NTSTATUS status = InitSVMCORE(vpData);
 
@@ -31,6 +30,7 @@ ULONG_PTR IpiUnloadBroadcastCallback(ULONG_PTR Argument) {
 	int regs[4] = { 0 };
 
 	__cpuid(regs, CPUID_UNLOAD_SVM_DEBUG);
+	
 	return 0;
 }
 
@@ -51,7 +51,8 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject) {
 		
 		g_nVMCB[i].HostStackTop = 0;
 	}
-
+	//释放npt
+	FreeGlobalNPT();
 	SvmDebugPrint("[DrvMain] 开始 IPI 广播卸载 SVM...\n");
 
 	return;
@@ -76,7 +77,7 @@ EXTERN_C NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegPa
 		n_cout = 64;
 	}
 
-	// 1. 核心步骤：必须在 PASSIVE_LEVEL 预先分配内存！
+	// 1.核心步骤：必须在 PASSIVE_LEVEL 预先分配内存！
 	// 因为 KeIpiGenericCall 运行在 IPI_LEVEL，绝对不允许调用 ExAllocatePool2
 	for (ULONG i = 0; i < n_cout; i++) {
 		g_nVMCB[i].HostStackBase = ExAllocatePool2(POOL_FLAG_NON_PAGED, KERNEL_STACK_SIZE, 'HSTK');
@@ -91,10 +92,12 @@ EXTERN_C NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegPa
 		RtlZeroMemory(g_nVMCB[i].HostStackBase, KERNEL_STACK_SIZE);
 		g_nVMCB[i].HostStackTop = (UINT64)g_nVMCB[i].HostStackBase + KERNEL_STACK_SIZE;
 	}
-
+	// 2.构建npt页表，原因多态竞争问题+ipi等级问题
+	SvmDebugPrint("[DrvMain] 开始在安全级别构建全局 NPT 页表...\n");
+	g_GlobalNptCr3 = PrepareNPT();
 	SvmDebugPrint("[DrvMain] 开始 IPI 广播初始化 SVM...\n");
 
-	// 2. 发起 IPI 广播，所有 CPU 核心将同时执行 IpiBroadcastCallback
+	// 3.发起 IPI 广播，所有 CPU 核心将同时执行 IpiBroadcastCallback
 	KeIpiGenericCall(IpiInstallBroadcastCallback, 0);
 
 	SvmDebugPrint("[DrvMain] IPI 广播初始化完成！系统现在运行在 Guest 中。\n");
