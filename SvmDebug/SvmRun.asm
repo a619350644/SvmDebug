@@ -1,4 +1,4 @@
-OPTION CASEMAP:NONE			; 使标签大小写敏感
+OPTION CASEMAP:NONE
 
 ;常量定义
 GuestVmcbPaOffset EQU 30F0h
@@ -14,7 +14,11 @@ PUBLIC SvEnterVmmOnNewStack
 PUBLIC SvSwitchStack
 EXTERN HostLoop:PROC
 
+
 .CODE
+
+
+
 ;---------------------------------------------------------------------
 ; 定义一个宏，保存通用寄存器
 ;---------------------------------------------------------------------
@@ -125,7 +129,7 @@ LOADGPR macro
     MOV RAX, [RAX+00H]          ; 最后加载 RAX
     endm
 ;---------------------------------------------------------------------
-; VOID SvEnterVmmOnNewStack(PSVM_CORE VpData);
+; VOID SvEnterVmmOnNewStack(PVCPU_CONTEXT VpData);
 ;
 ; 切换到 Host 独立栈，然后调用 SVMLoop(VpData)
 ; 此函数永远不会返回
@@ -142,7 +146,7 @@ SvEnterVmmOnNewStack PROC
 SvEnterVmmOnNewStack ENDP
 
 ;---------------------------------------------------------------------
-; VOID SvSwitchStack(PSVM_CORE VpData);
+; VOID SvSwitchStack(PVCPU_CONTEXT VpData);
 ; 从 Host 栈切换回 Guest 栈，关闭 SVM，并恢复系统执行流
 ;---------------------------------------------------------------------
 SvSwitchStack PROC
@@ -193,7 +197,7 @@ SvSwitchStack PROC
     IRETQ
 SvSwitchStack ENDP
 ;---------------------------------------------------------------------
-; VOID SvLaunchVm(SVM_CORE vpData);
+; VOID SvLaunchVm(VCPU_CONTEXT vpData);
 ;
 ; RCX = Guestvmcb
 ; 

@@ -71,6 +71,7 @@
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
+    <Driver_SpectreMitigation>Spectre</Driver_SpectreMitigation>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
@@ -136,25 +137,43 @@
     <Link>
       <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
     </Link>
+    <ClCompile>
+      <BufferSecurityCheck>true</BufferSecurityCheck>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Common.cpp" />
+    <ClCompile Include="Disguise.c">
+      <CompileAs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CompileAsC</CompileAs>
+    </ClCompile>
     <ClCompile Include="DrvMain.cpp" />
+    <ClCompile Include="hde\hde64.cpp" />
     <ClCompile Include="Hide.cpp" />
+    <ClCompile Include="Hook.cpp" />
+    <ClCompile Include="HvMemory.cpp" />
+    <ClCompile Include="MDL\MDL.cpp" />
     <ClCompile Include="NPT.cpp" />
     <ClCompile Include="SVM.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common.h" />
+    <ClInclude Include="hde\hde64.h" />
+    <ClInclude Include="hde\headers.hpp" />
+    <ClInclude Include="hde\pstdint.h" />
+    <ClInclude Include="hde\table64.h" />
     <ClInclude Include="Hide.h" />
+    <ClInclude Include="Hook.h" />
+    <ClInclude Include="HvMemory.h" />
+    <ClInclude Include="MDL\MDL.h" />
     <ClInclude Include="NPT.h" />
     <ClInclude Include="SVM.h" />
     <ClInclude Include="winApiDef.h" />
   </ItemGroup>
   <ItemGroup>
+    <MASM Include="Asm.asm" />
     <MASM Include="SvmRun.asm" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
