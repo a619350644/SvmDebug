@@ -1,146 +1,203 @@
 ﻿#include "SVM.h"
+#include "HvMemory.h"
 
+extern ULONG64 g_SystemCr3;
 
-//初始化虚拟核
-NTSTATUS InitSVMCORE(PSVM_CORE vpData)
+static inline VOID ForceNptFlush(PVCPU_CONTEXT vpData)
 {
-	if (vpData == nullptr) {
-		return STATUS_INVALID_PARAMETER;
+	vpData->Guestvmcb.ControlArea.VmcbClean = 0;
+	vpData->Guestvmcb.ControlArea.NCr3 = vpData->NptCr3;
+	vpData->Guestvmcb.ControlArea.TlbControl = 1;
+}
+
+// ================================================================
+// 【FIX】从 Guest RIP 直接读取指令字节并解码 MOV CRn
+//
+// AMD SVM 对 exception intercepts（如 #GP）不填充
+// GuestInstructionBytes / NumOfBytesFetched！
+// 因此必须从 Guest RIP 直接读取。
+//
+// 在我们的 hypervisor 中，Host 和 Guest 共享内核地址空间，
+// 且内核代码页始终驻留（non-paged），所以可以直接访问。
+// ================================================================
+static BOOLEAN DecodeCrInstructionFromRip(
+	UINT64 GuestRip,
+	PULONG crNum,
+	PULONG gprNum,
+	PULONG instrLen,
+	PBOOLEAN isWrite)
+{
+	// 安全检查：只处理内核地址
+	if (GuestRip < 0xFFFF800000000000ULL) return FALSE;
+	if (!MmIsAddressValid((PVOID)GuestRip)) return FALSE;
+
+	PUCHAR instr = (PUCHAR)GuestRip;
+	ULONG pos = 0;
+	BOOLEAN rexB = FALSE, rexR = FALSE;
+
+	// 跳过 Legacy prefixes (最多扫描 5 个前缀)
+	for (int i = 0; i < 5 && MmIsAddressValid((PVOID)(GuestRip + pos)); i++) {
+		UCHAR b = instr[pos];
+		if (b == 0xF0 || b == 0xF2 || b == 0xF3 || b == 0x66 ||
+			b == 0x2E || b == 0x36 || b == 0x3E || b == 0x26 ||
+			b == 0x64 || b == 0x65 || b == 0x67) {
+			pos++;
+		}
+		else break;
 	}
 
+	// 检测 REX prefix (0x40-0x4F)
+	if (MmIsAddressValid((PVOID)(GuestRip + pos)) && (instr[pos] & 0xF0) == 0x40) {
+		rexB = (instr[pos] & 0x01) != 0;
+		rexR = (instr[pos] & 0x04) != 0;
+		pos++;
+	}
+
+	// 需要至少 3 个字节: 0F + 22/20 + ModRM
+	if (!MmIsAddressValid((PVOID)(GuestRip + pos + 2))) return FALSE;
+
+	// MOV CRn, GPR = 0F 22 /r    MOV GPR, CRn = 0F 20 /r
+	if (instr[pos] == 0x0F && (instr[pos + 1] == 0x22 || instr[pos + 1] == 0x20)) {
+		UCHAR modrm = instr[pos + 2];
+		*crNum = (modrm >> 3) & 7;
+		*gprNum = modrm & 7;
+		if (rexR) *crNum += 8;
+		if (rexB) *gprNum += 8;
+		*instrLen = pos + 3;
+		*isWrite = (instr[pos + 1] == 0x22);
+		return TRUE;
+	}
+
+	return FALSE;
+}
+
+static UINT64 ReadGuestGpr(PVCPU_CONTEXT vpData, PVMCB vmcb, ULONG gprIndex)
+{
+	switch (gprIndex) {
+	case 0:  return vmcb->StateSaveArea.Rax;
+	case 1:  return vpData->Guest_gpr.Rcx;
+	case 2:  return vpData->Guest_gpr.Rdx;
+	case 3:  return vpData->Guest_gpr.Rbx;
+	case 4:  return vmcb->StateSaveArea.Rsp;
+	case 5:  return vpData->Guest_gpr.Rbp;
+	case 6:  return vpData->Guest_gpr.Rsi;
+	case 7:  return vpData->Guest_gpr.Rdi;
+	case 8:  return vpData->Guest_gpr.R8;
+	case 9:  return vpData->Guest_gpr.R9;
+	case 10: return vpData->Guest_gpr.R10;
+	case 11: return vpData->Guest_gpr.R11;
+	case 12: return vpData->Guest_gpr.R12;
+	case 13: return vpData->Guest_gpr.R13;
+	case 14: return vpData->Guest_gpr.R14;
+	case 15: return vpData->Guest_gpr.R15;
+	default: return 0;
+	}
+}
+
+static VOID WriteGuestGpr(PVCPU_CONTEXT vpData, PVMCB vmcb, ULONG gprIndex, UINT64 value)
+{
+	switch (gprIndex) {
+	case 0:  vmcb->StateSaveArea.Rax = value; break;
+	case 1:  vpData->Guest_gpr.Rcx = value; break;
+	case 2:  vpData->Guest_gpr.Rdx = value; break;
+	case 3:  vpData->Guest_gpr.Rbx = value; break;
+	case 4:  vmcb->StateSaveArea.Rsp = value; break;
+	case 5:  vpData->Guest_gpr.Rbp = value; break;
+	case 6:  vpData->Guest_gpr.Rsi = value; break;
+	case 7:  vpData->Guest_gpr.Rdi = value; break;
+	case 8:  vpData->Guest_gpr.R8 = value; break;
+	case 9:  vpData->Guest_gpr.R9 = value; break;
+	case 10: vpData->Guest_gpr.R10 = value; break;
+	case 11: vpData->Guest_gpr.R11 = value; break;
+	case 12: vpData->Guest_gpr.R12 = value; break;
+	case 13: vpData->Guest_gpr.R13 = value; break;
+	case 14: vpData->Guest_gpr.R14 = value; break;
+	case 15: vpData->Guest_gpr.R15 = value; break;
+	}
+}
+
+NTSTATUS InitSVMCORE(PVCPU_CONTEXT vpData)
+{
+	if (vpData == nullptr) return STATUS_INVALID_PARAMETER;
 	CONTEXT contextRecord = { 0 };
 	RtlCaptureContext(&contextRecord);
-
-	if (IsSvmHypervisorInstalled()) {
-		// Guest 模式：直接返回！
-		// IpiBroadcastCallback 收到返回值后，OS 会自动结束 IPI 级别，降回正常 IRQL 并继续正常运行。
-		return STATUS_SUCCESS;
-	}
-
-	// Host 模式：配置 VMCB 结构
+	if (IsSvmHypervisorInstalled()) return STATUS_SUCCESS;
 	NTSTATUS status = PrepareVMCB(vpData, contextRecord);
 	if (!NT_SUCCESS(status)) {
-		SvmDebugPrint("[ERROR] CPU %d: PrepareVMCB 失败\n", KeGetCurrentProcessorNumber());
+		SvmDebugPrint("[ERROR] CPU %d: PrepareVMCB failed\n", KeGetCurrentProcessorNumber());
 		return status;
 	}
-
-	// 切换到 Host 独立栈，启动 Hypervisor
+	if (g_SystemCr3 != 0) __writecr3(g_SystemCr3);
 	SvEnterVmmOnNewStack(vpData);
-
 	return STATUS_SUCCESS;
 }
 
-//准备VMCB
-NTSTATUS PrepareVMCB(PSVM_CORE vpData, CONTEXT contextRecord)
+NTSTATUS PrepareVMCB(PVCPU_CONTEXT vpData, CONTEXT contextRecord)
 {
-	if (vpData == nullptr) {
-		SvmDebugPrint("[ERROR][PrepareVMCB]vmcb为空\n");
-		return STATUS_INVALID_PARAMETER;
-	}
-
-	NTSTATUS status = InitNPT(vpData);
-	if (!NT_SUCCESS(status)) {
-		SvmDebugPrint("[ERROR][InitNPT]初始化NPT套页失败\n");
-		return STATUS_NOT_SUPPORTED;
-	}
-
-	//根据amd手册配置Guest PAT
-	vpData->Guestvmcb.StateSaveArea.GPat = __readmsr(IA32_MSR_PAT);
+	if (vpData == nullptr) return STATUS_INVALID_PARAMETER;
 
 	RtlZeroMemory(&vpData->Guestvmcb, sizeof(VMCB));
 	RtlZeroMemory(&vpData->Hostvmcb, sizeof(VMCB));
-	//先获得cr系列的寄存器
+
+	NTSTATUS status = InitNPT(vpData);
+	if (!NT_SUCCESS(status)) return STATUS_NOT_SUPPORTED;
+
 	vpData->Guestvmcb.StateSaveArea.Cr0 = __readcr0();
 	vpData->Guestvmcb.StateSaveArea.Cr2 = __readcr2();
 	vpData->Guestvmcb.StateSaveArea.Cr3 = __readcr3();
 	vpData->Guestvmcb.StateSaveArea.Cr4 = __readcr4();
 	vpData->Guestvmcb.StateSaveArea.Dr6 = __readdr(6);
 	vpData->Guestvmcb.StateSaveArea.Dr7 = __readdr(7);
-	//获取IDTR、GDTR。
-	UINT8 gdtBuffer[10] = { 0 };
-	UINT8 idtBuffer[10] = { 0 };
 
+	UINT8 gdtBuffer[10] = { 0 }, idtBuffer[10] = { 0 };
 	__sidt(idtBuffer);
 	_sgdt(gdtBuffer);
-
-	UINT16 gdtLimit = *(UINT16*)(gdtBuffer + 0);
+	UINT16 gdtLimit = *(UINT16*)(gdtBuffer);
 	UINT64 gdtBase = *(UINT64*)(gdtBuffer + 2);
-	UINT16 idtLimit = *(UINT16*)(idtBuffer + 0);
+	UINT16 idtLimit = *(UINT16*)(idtBuffer);
 	UINT64 idtBase = *(UINT64*)(idtBuffer + 2);
 
 	vpData->Guestvmcb.StateSaveArea.GdtrLimit = gdtLimit;
 	vpData->Guestvmcb.StateSaveArea.GdtrBase = gdtBase;
 	vpData->Guestvmcb.StateSaveArea.IdtrLimit = idtLimit;
 	vpData->Guestvmcb.StateSaveArea.IdtrBase = idtBase;
-
 	vpData->Guestvmcb.StateSaveArea.Rax = contextRecord.Rax;
-	//获取cs ds es ss寄存器
+
 	vpData->Guestvmcb.StateSaveArea.CsSelector = contextRecord.SegCs;
 	vpData->Guestvmcb.StateSaveArea.CsLimit = GetSegmentLimit(contextRecord.SegCs);
 	vpData->Guestvmcb.StateSaveArea.CsAttrib = GetSegmentAttribute(contextRecord.SegCs, gdtBase);
 	vpData->Guestvmcb.StateSaveArea.CsBase = GetSegmentBase(contextRecord.SegCs, gdtBase);
-
 	vpData->Guestvmcb.StateSaveArea.DsSelector = contextRecord.SegDs;
 	vpData->Guestvmcb.StateSaveArea.DsLimit = GetSegmentLimit(contextRecord.SegDs);
 	vpData->Guestvmcb.StateSaveArea.DsAttrib = GetSegmentAttribute(contextRecord.SegDs, gdtBase);
 	vpData->Guestvmcb.StateSaveArea.DsBase = GetSegmentBase(contextRecord.SegDs, gdtBase);
-
 	vpData->Guestvmcb.StateSaveArea.EsSelector = contextRecord.SegEs;
 	vpData->Guestvmcb.StateSaveArea.EsLimit = GetSegmentLimit(contextRecord.SegEs);
 	vpData->Guestvmcb.StateSaveArea.EsAttrib = GetSegmentAttribute(contextRecord.SegEs, gdtBase);
 	vpData->Guestvmcb.StateSaveArea.EsBase = GetSegmentBase(contextRecord.SegEs, gdtBase);
-
 	vpData->Guestvmcb.StateSaveArea.SsSelector = contextRecord.SegSs;
 	vpData->Guestvmcb.StateSaveArea.SsLimit = GetSegmentLimit(contextRecord.SegSs);
 	vpData->Guestvmcb.StateSaveArea.SsAttrib = GetSegmentAttribute(contextRecord.SegSs, gdtBase);
 	vpData->Guestvmcb.StateSaveArea.SsBase = GetSegmentBase(contextRecord.SegSs, gdtBase);
+	vpData->Guestvmcb.StateSaveArea.FsSelector = contextRecord.SegFs;
+	vpData->Guestvmcb.StateSaveArea.FsLimit = GetSegmentLimit(contextRecord.SegFs);
+	vpData->Guestvmcb.StateSaveArea.FsAttrib = GetSegmentAttribute(contextRecord.SegFs, gdtBase);
+	vpData->Guestvmcb.StateSaveArea.FsBase = __readmsr(MSR_IA32_FS_BASE);
+	vpData->Guestvmcb.StateSaveArea.GsSelector = contextRecord.SegGs;
+	vpData->Guestvmcb.StateSaveArea.GsLimit = GetSegmentLimit(contextRecord.SegGs);
+	vpData->Guestvmcb.StateSaveArea.GsAttrib = GetSegmentAttribute(contextRecord.SegGs, gdtBase);
+	vpData->Guestvmcb.StateSaveArea.GsBase = __readmsr(MSR_IA32_GS_BASE);
 
 	vpData->Guestvmcb.StateSaveArea.Rflags = __readeflags();
 	vpData->Guestvmcb.StateSaveArea.Cpl = 0;
-	//这里我直接给Rsp一个独立的空间,栈是递减的所以栈顶是反过来的
-	//SIZE_T stackSize = PAGE_SIZE * 0x10;  // 64KB
-	//vpData->GuestStackBase = ExAllocatePool2(POOL_FLAG_NON_PAGED, stackSize, 'GSTK');
-	//if (vpData->GuestStackBase == nullptr) {
-	//	return STATUS_INSUFFICIENT_RESOURCES;
-	//}
-	//RtlZeroMemory(vpData->GuestStackBase, stackSize);
-	//vpData->GuestStackTop = (UINT64)vpData->GuestStackBase + stackSize;
-
-	//// ============================================================
-	//// Guest stub: 纯机器码，没有任何相对地址，可以在任意地址执行
-	////
-	//// loop:
-	////     mov eax, 0x40000000    ; CPUID hypervisor leaf
-	////     cpuid                  ; → 触发 #VMEXIT
-	////     jmp loop               ; #VMEXIT 处理完 VMRUN 回来后继续循环
-	//// ============================================================
-	//UINT8 guestStub[] = {
-	//	0xB8, 0x00, 0x00, 0x00, 0x40,   // mov eax, 0x40000000
-	//	0x0F, 0xA2,                      // cpuid
-	//	0xEB, 0xF7                       // jmp -9 (回到 mov eax)
-	//};
-	//DbgBreakPoint();
-	//vpData->GuestCodeBase = ExAllocatePool2(
-	//	POOL_FLAG_NON_PAGED_EXECUTE,
-	//	PAGE_SIZE, 'GCOD');
-	//if (vpData->GuestCodeBase == nullptr) {
-	//	ExFreePoolWithTag(vpData->GuestStackBase, 'GSTK');
-	//	return STATUS_INSUFFICIENT_RESOURCES;
-	//}
-	//RtlZeroMemory(vpData->GuestCodeBase, PAGE_SIZE);
-	//RtlCopyMemory(vpData->GuestCodeBase, guestStub, sizeof(guestStub));
-
-	//vpData->Guestvmcb.StateSaveArea.Rsp = vpData->GuestStackTop;
-	//vpData->Guestvmcb.StateSaveArea.Rip = (UINT64)vpData->GuestCodeBase;
+	vpData->Guestvmcb.StateSaveArea.GPat = __readmsr(IA32_MSR_PAT);
 	vpData->Guestvmcb.StateSaveArea.Rsp = contextRecord.Rsp;
 	vpData->Guestvmcb.StateSaveArea.Rip = contextRecord.Rip;
 	vpData->Guestvmcb.ControlArea.VIntr = 0;
 	vpData->Guestvmcb.ControlArea.InterruptShadow = 0;
 
-
 	vpData->GuestVmcbPa = MmGetPhysicalAddress(&vpData->Guestvmcb).QuadPart;
 	vpData->HostVmcbPa = MmGetPhysicalAddress(&vpData->Hostvmcb).QuadPart;
-	//将通用寄存器保存起来
 
 	vpData->Guest_gpr.Rax = contextRecord.Rax;
 	vpData->Guest_gpr.Rbx = contextRecord.Rbx;
@@ -158,49 +215,36 @@ NTSTATUS PrepareVMCB(PSVM_CORE vpData, CONTEXT contextRecord)
 	vpData->Guest_gpr.R14 = contextRecord.R14;
 	vpData->Guest_gpr.R15 = contextRecord.R15;
 
-	//拦截cpuid指令和拦截vmrun指令
 	vpData->Guestvmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_CPUID;
-	vpData->Guestvmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMRUN;
+	vpData->Guestvmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMRUN | SVM_INTERCEPT_MISC2_VMCALL;
 
-	//根据文档要写入MSRC000_0080[SVME]=1才可以算是启动安全虚拟机
+	// 拦截 #DB (Hook单步) + #GP (模拟 mov crN)
+	vpData->Guestvmcb.ControlArea.InterceptException |= (1UL << 1);   // #DB
+	vpData->Guestvmcb.ControlArea.InterceptException |= (1UL << 13);  // #GP
+
+	// RDTSC/RDTSCP
+	vpData->Guestvmcb.ControlArea.InterceptMisc1 |= SVM_INTERCEPT_MISC1_RDTSC;
+	vpData->Guestvmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_RDTSCP;
+
 	__writemsr(IA32_MSR_EFER, __readmsr(IA32_MSR_EFER) | EFER_SVME);
 	vpData->Guestvmcb.StateSaveArea.Efer = __readmsr(IA32_MSR_EFER);
-	//asid不能为0
 	vpData->Guestvmcb.ControlArea.GuestAsid = 1;
-	
-	//手动分配HostVMM独立栈
-	//vpData->HostStackBase = ExAllocatePool2(POOL_FLAG_NON_PAGED, KERNEL_STACK_SIZE, 'HSTK');
-	//if (vpData->HostStackBase == nullptr) {
-	//	return STATUS_INSUFFICIENT_RESOURCES;
-	//}
-	//RtlZeroMemory(vpData->HostStackBase, KERNEL_STACK_SIZE);
-	//vpData->HostStackTop = (UINT64)vpData->HostStackBase + KERNEL_STACK_SIZE;
 
-	// ====================================================================
-	// AMD 手册要求：在执行 VMRUN 之前，软件必须设置 VM_HSAVE_PA MSR
-	// 指向一个页对齐的 4KB 物理地址块，处理器会在此保存 host 状态。
-	// 如果不设置，VMRUN 会将 host 状态保存到物理地址 0（或 MSR 中的随机值），
-	// 导致 #VMEXIT 时无法正确恢复 host 状态。
-	// ====================================================================
 	PHYSICAL_ADDRESS hostSaveAreaPa = MmGetPhysicalAddress(vpData->HostSaveArea);
 	__writemsr(SVM_MSR_VM_HSAVE_PA, hostSaveAreaPa.QuadPart);
-
+	if ((vpData->GuestVmcbPa & 0xFFF) != 0 || (hostSaveAreaPa.QuadPart & 0xFFF) != 0) {
+		return STATUS_UNSUCCESSFUL;
+	}
 	__svm_vmsave(vpData->GuestVmcbPa);
 	__svm_vmsave(vpData->HostVmcbPa);
-
 	return STATUS_SUCCESS;
 }
 
-//获得段描述符
 UINT16 GetSegmentAttribute(UINT16 SegmentSelector, UINT64 GdtBase)
 {
 	SEGMENT_ATTRIBUTE attribute = { 0 };
-	if ((SegmentSelector & ~RPL_MASK) == 0)
-		return attribute.AsUInt16;
-
-	PSEGMENT_DESCRIPTOR descriptor = reinterpret_cast<PSEGMENT_DESCRIPTOR>(
-		GdtBase + (SegmentSelector & ~RPL_MASK));
-
+	if ((SegmentSelector & ~RPL_MASK) == 0) return attribute.AsUInt16;
+	PSEGMENT_DESCRIPTOR descriptor = reinterpret_cast<PSEGMENT_DESCRIPTOR>(GdtBase + (SegmentSelector & ~RPL_MASK));
 	attribute.Fields.Type = descriptor->Fields.Type;
 	attribute.Fields.System = descriptor->Fields.System;
 	attribute.Fields.Dpl = descriptor->Fields.Dpl;
@@ -213,71 +257,85 @@ UINT16 GetSegmentAttribute(UINT16 SegmentSelector, UINT64 GdtBase)
 	return attribute.AsUInt16;
 }
 
-//获取段基址
 UINT64 GetSegmentBase(UINT16 SegmentSelector, UINT64 GdtBase)
 {
 	UINT16 index = SegmentSelector >> 3;
-	if (index == 0)
-		return 0;
-
+	if (index == 0) return 0;
 	PSEGMENT_DESCRIPTOR descriptor = (PSEGMENT_DESCRIPTOR)(GdtBase + index * sizeof(SEGMENT_DESCRIPTOR));
-
 	ULONG_PTR base = ((ULONG_PTR)descriptor->Fields.BaseHigh << 24) |
-		((ULONG_PTR)descriptor->Fields.BaseMiddle << 16) |
-		descriptor->Fields.BaseLow;
+		((ULONG_PTR)descriptor->Fields.BaseMiddle << 16) | descriptor->Fields.BaseLow;
 	return base;
 }
 
-//区分vmm是否安装
 BOOLEAN IsSvmHypervisorInstalled()
 {
 	int regs[4] = { 0 };
 	char vendorId[13] = { 0 };
-
 	__cpuid(regs, CPUID_HV_VENDOR_AND_MAX_FUNCTIONS);
-	RtlCopyMemory(vendorId + 0, &regs[1], 4);
+	RtlCopyMemory(vendorId, &regs[1], 4);
 	RtlCopyMemory(vendorId + 4, &regs[2], 4);
 	RtlCopyMemory(vendorId + 8, &regs[3], 4);
 	vendorId[12] = ANSI_NULL;
-
 	return (strcmp(vendorId, "VtDebugView ") == 0);
 }
 
-//vmexit操作
-void SvHandleVmExit(PSVM_CORE vpData)
+void SvHandleVmExit(PVCPU_CONTEXT vpData)
 {
-	if (vpData == nullptr) {
-		SvmDebugPrint("[ERROR][SvHandleVmExitC]VMData为空\n");
-		return;
-	}
+	if (vpData == nullptr) return;
 	PVMCB vmcb = &vpData->Guestvmcb;
+
+	// 暗影恢复
+	if (vpData->SuspendedHook != nullptr) {
+		PNPT_HOOK_CONTEXT suspCtx = (PNPT_HOOK_CONTEXT)vpData->SuspendedHook;
+		ULONG64 ripPage = vmcb->StateSaveArea.Rip & ~0xFFFULL;
+		ULONG64 hookVaPage = ((ULONG64)suspCtx->TargetAddress) & ~0xFFFULL;
+		if (ripPage != hookVaPage) {
+			ApplyNptHookByPa(vpData, suspCtx->TargetPa, suspCtx->OriginalPagePa);
+			SetNptPagePermissions(vpData, suspCtx->TargetPa, NPT_PERM_READ_ONLY);
+			ForceNptFlush(vpData);
+			vpData->SuspendedHook = nullptr;
+		}
+	}
+
 	UINT64 exitCode = vmcb->ControlArea.ExitCode;
 	UINT32 leaf = (UINT32)vmcb->StateSaveArea.Rax;
+
 	switch (exitCode)
 	{
 	case VMEXIT_CPUID:
-
-		if (leaf == CPUID_HV_VENDOR_AND_MAX_FUNCTIONS)
-		{
+	{
+		if (leaf == CPUID_HV_VENDOR_AND_MAX_FUNCTIONS) {
+			extern HANDLE g_PendingProtectPID;
+			g_PendingProtectPID = (HANDLE)vpData->Guest_gpr.Rcx;
 			vmcb->StateSaveArea.Rax = CPUID_HV_INTERFACE;
-			vpData->Guest_gpr.Rbx = 0x65447456;  // "VtDe"
-			vpData->Guest_gpr.Rcx = 0x56677562;  // "bugV"
-			vpData->Guest_gpr.Rdx = 0x20776569;  // "iew "
+			vpData->Guest_gpr.Rbx = 0x65447456;
+			vpData->Guest_gpr.Rcx = 0x56677562;
+			vpData->Guest_gpr.Rdx = 0x20776569;
 		}
 		else if (leaf == CPUID_UNLOAD_SVM_DEBUG) {
-			//先将全局中断标志位置1响应中断
-			//__svm_stgi();
+			extern volatile BOOLEAN g_DriverUnloading;
+			g_DriverUnloading = TRUE;
+			     
+			// 在广播 IPI 之前先恢复 DKOM
+			RestoreProcessByDkom();
+			RestoreAllProcessCallbacks();
+
+			// 当前核心退出
 			vpData->isExit = 1;
-			
-			//__svm_vmsave(vpData->GuestVmcbPa);//我感觉可以不用save了
-			//__svm_vmload(vpData->HostVmcbPa);
-			//__writemsr(IA32_MSR_EFER, __readmsr(IA32_MSR_EFER) & (~EFER_SVME));
-			//要把栈切换回去
-			
 		}
-		else
-		{
-			// 对于普通CPUID，执行真实的CPUID并返回结果给guest
+		else if (leaf == CPUID_UNLOAD_SVM_INSTALL_HOOK) {
+			ActivateAllNptHooks(vpData);
+			ForceNptFlush(vpData);
+		}
+		else if (leaf == CPUID_UNLOAD_SVM_UNINSTALL_HOOK) {
+			vpData->Guest_gpr.Rax = 0;
+			break;
+		}
+		else if (leaf == CPUID_HV_MEMORY_OP) {
+			vpData->Guest_gpr.Rbx = g_HvSharedContextPa;
+			HvHandleMemoryOp(vpData);
+		}
+		else {
 			int cpuInfo[4] = { 0 };
 			__cpuidex(cpuInfo, leaf, (int)vpData->Guest_gpr.Rcx);
 			vmcb->StateSaveArea.Rax = (UINT64)cpuInfo[0];
@@ -287,82 +345,219 @@ void SvHandleVmExit(PSVM_CORE vpData)
 		}
 		vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
 		break;
+	}
 
 	case VMEXIT_VMRUN:
-	{
-		// Guest 尝试执行 VMRUN（被拦截），跳过该指令
 		vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
 		break;
-	}
+
 	case VMEXIT_NPF:
 	{
-		// 发生 NPF 时，ExitInfo1 存放错误码(类似普通PF)，ExitInfo2 存放引发异常的宿主物理地址 (HPA)
 		UINT64 faultHpa = vmcb->ControlArea.ExitInfo2;
 		UINT64 errorCode = vmcb->ControlArea.ExitInfo1;
+		BOOLEAN isExecFault = (errorCode & 0x10) != 0;
+		PNPT_HOOK_CONTEXT hookCtx = FindHookByFaultPa(faultHpa);
+		if (hookCtx != nullptr) {
+			if (isExecFault) {
+				if (vmcb->StateSaveArea.Rip == (ULONG64)hookCtx->TargetAddress) {
+					ApplyNptHookByPa(vpData, hookCtx->TargetPa, hookCtx->FakePagePa);
+					SetNptPagePermissions(vpData, hookCtx->TargetPa, NPT_PERM_EXECUTE);
+					vpData->ActiveHook = hookCtx;
+					vmcb->StateSaveArea.Rflags |= 0x100;
+					ForceNptFlush(vpData);
+				}
+				else {
+					ApplyNptHookByPa(vpData, hookCtx->TargetPa, hookCtx->OriginalPagePa);
+					SetNptPagePermissions(vpData, hookCtx->TargetPa, NPT_PERM_EXECUTE);
+					vpData->SuspendedHook = hookCtx;
+					ForceNptFlush(vpData);
+				}
+			}
+			else {
+				ApplyNptHookByPa(vpData, hookCtx->TargetPa, hookCtx->OriginalPagePa);
+				SetNptPagePermissions(vpData, hookCtx->TargetPa, NPT_PERM_READ_ONLY);
+				ForceNptFlush(vpData);
+			}
+		}
+		break;
+	}
 
-		SvmDebugPrint("[VMEXIT_NPF] 拦截到嵌套缺页! 物理地址: 0x%llX, 错误码: 0x%llX\n", faultHpa, errorCode);
+	case VMEXIT_EXCEPTION_DB:
+	{
+		if (vpData->ActiveHook != nullptr) {
+			PNPT_HOOK_CONTEXT hookCtx = (PNPT_HOOK_CONTEXT)vpData->ActiveHook;
+			vmcb->StateSaveArea.Rflags &= ~(UINT64)0x100;
+			ApplyNptHookByPa(vpData, hookCtx->TargetPa, hookCtx->OriginalPagePa);
+			SetNptPagePermissions(vpData, hookCtx->TargetPa, NPT_PERM_READ_ONLY);
+			vpData->ActiveHook = nullptr;
+			ForceNptFlush(vpData);
+		}
+		else {
+			EVENTINJ reinject = { 0 };
+			reinject.Fields.Vector = 1;
+			reinject.Fields.Type = 3;
+			reinject.Fields.Valid = 1;
+			vmcb->ControlArea.EventInj = reinject.AsUInt64;
+		}
+		break;
+	}
 
+	// ================================================================
+	// #GP 处理：从 Guest RIP 读取指令，模拟 MOV CRn
+	// ================================================================
+	case VMEXIT_EXCEPTION_GP:
+	{
+		ULONG crNum = 0, gprNum = 0, instrLen = 0;
+		BOOLEAN isCrWrite = FALSE;
+
+		// 【关键修复】从 Guest RIP 读取指令字节，不依赖 GuestInstructionBytes
+		if (DecodeCrInstructionFromRip(vmcb->StateSaveArea.Rip, &crNum, &gprNum, &instrLen, &isCrWrite))
+		{
+			if (isCrWrite) {
+				UINT64 value = ReadGuestGpr(vpData, vmcb, gprNum);
+				switch (crNum) {
+				case 0: vmcb->StateSaveArea.Cr0 = value; break;
+				case 2: vmcb->StateSaveArea.Cr2 = value; break;
+				case 3: vmcb->StateSaveArea.Cr3 = value; break;
+				case 4: vmcb->StateSaveArea.Cr4 = value; break;
+				default: break;
+				}
+			}
+			else {
+				UINT64 value = 0;
+				switch (crNum) {
+				case 0: value = vmcb->StateSaveArea.Cr0; break;
+				case 2: value = vmcb->StateSaveArea.Cr2; break;
+				case 3: value = vmcb->StateSaveArea.Cr3; break;
+				case 4: value = vmcb->StateSaveArea.Cr4; break;
+				default: break;
+				}
+				WriteGuestGpr(vpData, vmcb, gprNum, value);
+			}
+			vmcb->StateSaveArea.Rip += instrLen;
+		}
+		else {
+			// 非 MOV CRn，重新注入 #GP
+			EVENTINJ reinject = { 0 };
+			reinject.Fields.Vector = 13;
+			reinject.Fields.Type = 3;
+			reinject.Fields.ErrorCodeValid = 1;
+			reinject.Fields.Valid = 1;
+			reinject.Fields.ErrorCode = (UINT32)vmcb->ControlArea.ExitInfo1;
+			vmcb->ControlArea.EventInj = reinject.AsUInt64;
+		}
+		break;
+	}
+
+	case VMEXIT_RDTSC:
+	{
+		UINT64 tsc = __rdtsc();
+		tsc -= 2000;
+		vmcb->StateSaveArea.Rax = tsc & 0xFFFFFFFF;
+		vpData->Guest_gpr.Rdx = tsc >> 32;
 		vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
 		break;
 	}
+
+	case VMEXIT_RDTSCP:
+	{
+		UINT64 tsc = __rdtsc();
+		tsc -= 2000;
+		vmcb->StateSaveArea.Rax = tsc & 0xFFFFFFFF;
+		vpData->Guest_gpr.Rdx = tsc >> 32;
+		vpData->Guest_gpr.Rcx = (UINT64)(__readmsr(0xC0000103) & 0xFFFFFFFF);
+		vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
+		break;
+	}
+
+	case VMEXIT_VMMCALL:
+	{
+		leaf = (UINT32)vmcb->StateSaveArea.Rax;
+
+		if ((leaf & 0xFFFFFF00) == VMMCALL_CR_WRITE_BASE) {
+			ULONG crNum = leaf & 0xFF;
+			UINT64 value = vpData->Guest_gpr.Rcx;
+			switch (crNum) {
+			case 0: vmcb->StateSaveArea.Cr0 = value; break;
+			case 2: vmcb->StateSaveArea.Cr2 = value; break;
+			case 3: vmcb->StateSaveArea.Cr3 = value; break;
+			case 4: vmcb->StateSaveArea.Cr4 = value; break;
+			default: break;
+			}
+			vmcb->StateSaveArea.Rax = 0;
+		}
+		else if ((leaf & 0xFFFFFF00) == VMMCALL_CR_READ_BASE) {
+			ULONG crNum = leaf & 0xFF;
+			UINT64 value = 0;
+			switch (crNum) {
+			case 0: value = vmcb->StateSaveArea.Cr0; break;
+			case 2: value = vmcb->StateSaveArea.Cr2; break;
+			case 3: value = vmcb->StateSaveArea.Cr3; break;
+			case 4: value = vmcb->StateSaveArea.Cr4; break;
+			default: break;
+			}
+			vpData->Guest_gpr.Rcx = value;
+			vmcb->StateSaveArea.Rax = 0;
+		}
+		else if (leaf == 0x12345678) {
+			extern HANDLE g_PendingProtectPID;
+			g_PendingProtectPID = (HANDLE)vpData->Guest_gpr.Rcx;
+			vmcb->StateSaveArea.Rax = 1;
+			vpData->Guest_gpr.Rax = 1;
+			SvmDebugPrint("g_PendingProtectPID:%lu\n", g_PendingProtectPID);
+		}
+		else if (leaf == 0x12345679) {
+			AddProtectedHwnd((SVM_HWND)vpData->Guest_gpr.Rcx);
+			vpData->Guest_gpr.Rax = 1;
+		}
+		else if (leaf == 0x1234567A) {
+			AddProtectedChildHwnd((SVM_HWND)vpData->Guest_gpr.Rcx);
+			vpData->Guest_gpr.Rax = 1;
+		}
+		else if (leaf == 0x1234567F) {
+			ClearAllProtectedTargets();
+			vpData->Guest_gpr.Rax = 1;
+		}
+		else if (leaf == 0x12345680) {
+			DisableAllProcessCallbacks();
+			vpData->Guest_gpr.Rax = 1;
+		}
+		else if (leaf == 0x12345681) {
+			RestoreAllProcessCallbacks();
+			vpData->Guest_gpr.Rax = 1;
+		}
+		else {
+			vpData->Guest_gpr.Rax = 0xFFFFFFFFFFFFFFFFull;
+		}
+		vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
+		break;
+	}
+
 	default:
-
 		vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
 		break;
 	}
-
 }
 
-//Host运行guest
-void SVMLauchRun(PSVM_CORE vpData)
+void SVMLauchRun(PVCPU_CONTEXT vpData)
 {
-	if (vpData == nullptr) {
-		SvmDebugPrint("[ERROR][SVMLauchRun]VMData为空\n");
-		return;
-	}
-	//SvmDebugPrint("[SVMLauchRun]StateSaveArea.Rsp:%llx\n", vpData->Guestvmcb.StateSaveArea.Rsp);
+	if (vpData == nullptr) return;
 	SvLaunchVm(vpData);
-
-	return;
 }
 
-//host死循环，负责运行guest和vmexit
-EXTERN_C void HostLoop(PSVM_CORE vpData)
+EXTERN_C void HostLoop(PVCPU_CONTEXT vpData)
 {
 	while (!vpData->isExit) {
-
-
 		SVMLauchRun(vpData);
 		vpData->Guest_gpr.Rax = vpData->Guestvmcb.StateSaveArea.Rax;
-
 		SvHandleVmExit(vpData);
 	}
 	SvSwitchStack(vpData);
 }
 
-//调试函数：负责打印通用寄存器
 VOID PrintGuestGpr(PGUEST_GPR Gpr)
 {
-	if (Gpr == NULL)
-	{
-		SvmDebugPrint("GUEST_GPR is NULL\n");
-		return;
-	}
-
-	SvmDebugPrint("GUEST_GPR contents:\n");
-	SvmDebugPrint("RAX = %016I64X\n", Gpr->Rax);
-	SvmDebugPrint("RBX = %016I64X\n", Gpr->Rbx);
-	SvmDebugPrint("RCX = %016I64X\n", Gpr->Rcx);
-	SvmDebugPrint("RDX = %016I64X\n", Gpr->Rdx);
-	SvmDebugPrint("RSI = %016I64X\n", Gpr->Rsi);
-	SvmDebugPrint("RDI = %016I64X\n", Gpr->Rdi);
-	SvmDebugPrint("RBP = %016I64X\n", Gpr->Rbp);
-	SvmDebugPrint("R8  = %016I64X\n", Gpr->R8);
-	SvmDebugPrint("R9  = %016I64X\n", Gpr->R9);
-	SvmDebugPrint("R10 = %016I64X\n", Gpr->R10);
-	SvmDebugPrint("R11 = %016I64X\n", Gpr->R11);
-	SvmDebugPrint("R12 = %016I64X\n", Gpr->R12);
-	SvmDebugPrint("R13 = %016I64X\n", Gpr->R13);
-	SvmDebugPrint("R14 = %016I64X\n", Gpr->R14);
-	SvmDebugPrint("R15 = %016I64X\n", Gpr->R15);
+	if (Gpr == NULL) { SvmDebugPrint("GUEST_GPR is NULL\n"); return; }
+	SvmDebugPrint("RAX=%016I64X RBX=%016I64X RCX=%016I64X RDX=%016I64X\n",
+		Gpr->Rax, Gpr->Rbx, Gpr->Rcx, Gpr->Rdx);
 }
