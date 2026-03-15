@@ -1,4 +1,11 @@
-﻿#pragma once
+﻿/**
+ * @file Hook.h
+ * @brief NPT Hook框架头文件 - Hook上下文结构体、索引枚举与函数声明
+ * @author yewilliam
+ * @date 2026/02/06
+ */
+
+#pragma once
 #include <ntifs.h>
 
 #define HOOK_MAX_COUNT 64
@@ -68,19 +75,17 @@ typedef struct _NPT_HOOK_CONTEXT {
     SIZE_T HookedBytes;
     ULONG TrampolineLength;
     ULONG StolenBytesLength;
-
 } NPT_HOOK_CONTEXT, * PNPT_HOOK_CONTEXT;
 
 extern NPT_HOOK_CONTEXT g_HookList[HOOK_MAX_COUNT];
 
-// 在你的 Hook.h 或 Common.h 中定义
 #pragma pack(push, 1)
 typedef struct _REGISTER_CONTEXT {
     ULONG64 Rax;
     ULONG64 Rcx;
     ULONG64 Rdx;
     ULONG64 Rbx;
-    ULONG64 Rsp;  // 这是进入 Hook 时，最原始、最纯洁的 RSP
+    ULONG64 Rsp;
     ULONG64 Rbp;
     ULONG64 Rsi;
     ULONG64 Rdi;
@@ -97,10 +102,17 @@ typedef struct _REGISTER_CONTEXT {
 #pragma pack(pop)
 
 // 声明全局跳床地址（供汇编使用）
+#ifdef __cplusplus
 extern "C" ULONG64 g_Trampoline_NtUserBuildHwndList;
+#else
+extern ULONG64 g_Trampoline_NtUserBuildHwndList;
+#endif
 
+/* ========================================================================
+ *  HOOK 索引枚举 — 唯一定义点，所有文件通过 Hook.h 引用
+ * ======================================================================== */
 typedef enum _HOOK_INDEX {
-    // ---- SSDT hooks ----
+    // ---- SSDT 系统调用 ----
     HOOK_NtQuerySystemInformation = 0,
     HOOK_NtOpenProcess,
     HOOK_NtQueryInformationProcess,
@@ -108,28 +120,36 @@ typedef enum _HOOK_INDEX {
     HOOK_NtDuplicateObject,
     HOOK_NtGetNextProcess,
     HOOK_NtGetNextThread,
+    HOOK_NtReadVirtualMemory,
+    HOOK_NtWriteVirtualMemory,
+    HOOK_NtProtectVirtualMemory,
+    HOOK_NtTerminateProcess,
+    HOOK_NtCreateThreadEx,
 
-    // ---- Kernel export hooks ----
+    // ---- 内核导出函数 ----
     HOOK_PsLookupProcessByProcessId,
     HOOK_PsLookupThreadByThreadId,
     HOOK_ObReferenceObjectByHandle,
     HOOK_MmCopyVirtualMemory,
     HOOK_PsGetNextProcessThread,
+    HOOK_KeStackAttachProcess,
 
-    // ---- SSSDT (Win32k shadow syscall) hooks ----
+    // ---- SSSDT (Win32k shadow syscall) ----
     HOOK_NtUserFindWindowEx,
     HOOK_NtUserWindowFromPoint,
     HOOK_NtUserBuildHwndList,
-    // ---- Unexported internal hooks (pattern-scanned) ----
+    HOOK_ValidateHwnd,            // win32kbase 内部导出
+
+    // ---- 内部函数 (模式扫描) ----
     HOOK_PspReferenceCidTableEntry,
 
     HOOK_MAX_ENUM_COUNT
 } HOOK_INDEX;
 
 NTSTATUS RegisterNptHook(PVOID TargetAddress, PVOID ProxyFunction);
-NTSTATUS PrepareAllNptHooks();
+NTSTATUS PrepareAllNptHooks(void);
 NTSTATUS ActivateAllNptHooks(PVCPU_CONTEXT vpData);
-VOID CleanupAllNptHooks();
+VOID CleanupAllNptHooks(void);
 PNPT_HOOK_CONTEXT FindHookByFaultPa(ULONG64 FaultPa);
 
 NTSTATUS BuildPage(PNPT_HOOK_CONTEXT HookContext);
@@ -140,7 +160,6 @@ NTSTATUS ActivateNptHookInNpt(PVCPU_CONTEXT vpData, PNPT_HOOK_CONTEXT HookContex
 VOID FreeNptHook(PNPT_HOOK_CONTEXT HookContext);
 NTSTATUS HideDriver(PDRIVER_OBJECT DriverObject);
 PVOID GetRealNtAddress(PCWSTR ZwName);
-
 
 typedef union {
     struct {

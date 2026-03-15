@@ -6,21 +6,53 @@
 #include "HvMemory.h"
 #include "Common.h"
 
-VCPU_CONTEXT g_nVMCB[64] = { 0 };
+/* ========================================================================
+ *  设备名 / 符号链接 / IOCTL 定义
+ *  正常加载方式: sc create / ZwLoadDriver / inf 安装
+ * ======================================================================== */
+#define SVM_DEVICE_NAME     L"\\Device\\SvmDebug"
+#define SVM_SYMLINK_NAME    L"\\DosDevices\\SvmDebug"
 
-// ========================================================
-// Global variables
-// ========================================================
+/* 保护命令 IOCTL (0x820 起, 避开 HvMemory.h 中 0x810-0x812) */
+#define IOCTL_SVM_PROTECT_PID           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x820, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_PROTECT_HWND          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x821, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_PROTECT_CHILD_HWND    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x822, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_CLEAR_ALL             CTL_CODE(FILE_DEVICE_UNKNOWN, 0x823, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_DISABLE_CALLBACKS     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x824, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_RESTORE_CALLBACKS     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x825, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_PROTECT_EX            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x826, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+/* ========================================================================
+ *  全局变量
+ * ======================================================================== */
+PVCPU_CONTEXT g_nVMCB[64] = { 0 };
+
+PDEVICE_OBJECT g_DeviceObject = NULL;
+
 HANDLE g_PendingProtectPID = (HANDLE)0;
 HANDLE g_WorkerThreadHandle = NULL;
 volatile BOOLEAN g_DriverUnloading = FALSE;
 
+volatile LONG g_PendingCallbackOp = 0;
+
 static LONG volatile g_SuccessfulSvmCores = 0;
 
+ULONG64 g_SystemCr3 = 0;
+
+/* ========================================================================
+ *  前向声明
+ * ======================================================================== */
 ULONG_PTR IpiActivateHookBroadcastCallback(ULONG_PTR Argument);
 ULONG_PTR IpiInstallBroadcastCallback(ULONG_PTR Argument);
 ULONG_PTR IpiUnloadBroadcastCallback(ULONG_PTR Argument);
 
+VOID SvmInitSystemThread(PVOID StartContext);
+VOID CommunicationThread(PVOID Context);
+VOID DelayedHookWorkItemRoutine(PVOID Context);
+
+/* ========================================================================
+ *  资源释放
+ * ======================================================================== */
 static VOID ReleaseDriverResources()
 {
     ULONG n_cout = KeQueryActiveProcessorCount(0);
@@ -28,19 +60,184 @@ static VOID ReleaseDriverResources()
 
     for (ULONG i = 0; i < n_cout; i++)
     {
-        if (g_nVMCB[i].HostStackBase) {
-            ExFreePoolWithTag(g_nVMCB[i].HostStackBase, 'HSTK');
-            g_nVMCB[i].HostStackBase = nullptr;
+        if (!g_nVMCB[i]) continue;
+        if (g_nVMCB[i]->HostStackBase) {
+            ExFreePoolWithTag(g_nVMCB[i]->HostStackBase, 'HSTK');
+            g_nVMCB[i]->HostStackBase = nullptr;
         }
-        g_nVMCB[i].HostStackTop = 0;
-        FreePvCPUNPT(&g_nVMCB[i]);
+        g_nVMCB[i]->HostStackTop = 0;
+        FreePvCPUNPT(g_nVMCB[i]);
+        ExFreePoolWithTag(g_nVMCB[i], 'VMCB');
+        g_nVMCB[i] = nullptr;
     }
     CleanupAllNptHooks();
 }
 
-// ========================================================
-// Communication thread (runs at PASSIVE_LEVEL)
-// ========================================================
+/* ========================================================================
+ *  IRP 派发 — Create / Close
+ * ======================================================================== */
+static NTSTATUS DispatchCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+    Irp->IoStatus.Status = STATUS_SUCCESS;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+
+/* ========================================================================
+ *  IRP 派发 — DeviceIoControl
+ *  R3 通过 CreateFile("\\\\.\\SvmDebug") + DeviceIoControl 下发命令
+ * ======================================================================== */
+static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+    ULONG ioctl = irpSp->Parameters.DeviceIoControl.IoControlCode;
+    ULONG inLen = irpSp->Parameters.DeviceIoControl.InputBufferLength;
+    PVOID buffer = Irp->AssociatedIrp.SystemBuffer;
+
+    NTSTATUS status = STATUS_SUCCESS;
+    ULONG_PTR info = 0;
+
+    switch (ioctl)
+    {
+    /* ---- 保护 PID ---- */
+    case IOCTL_SVM_PROTECT_PID:
+    {
+        if (inLen < sizeof(PROTECT_INFO) || !buffer) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        PPROTECT_INFO pi = (PPROTECT_INFO)buffer;
+        HANDLE pid = (HANDLE)pi->Pid;
+
+        AddProtectedPid(pid);
+        g_PendingProtectPID = pid;
+
+        SvmDebugPrint("[IOCTL] PROTECT_PID: %llu\n", pi->Pid);
+        break;
+    }
+
+    /* ---- 扩展保护 (PID + HWND + 子窗口) ---- */
+    case IOCTL_SVM_PROTECT_EX:
+    {
+        if (inLen < sizeof(PROTECT_INFO_EX) || !buffer) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        PPROTECT_INFO_EX px = (PPROTECT_INFO_EX)buffer;
+
+        AddProtectedPid((HANDLE)px->Pid);
+        g_PendingProtectPID = (HANDLE)px->Pid;
+
+        if (px->Hwnd)
+            AddProtectedHwnd((SVM_HWND)px->Hwnd);
+
+        for (ULONG c = 0; c < px->ChildHwndCount && c < 8; c++) {
+            if (px->ChildHwnds[c])
+                AddProtectedChildHwnd((SVM_HWND)px->ChildHwnds[c]);
+        }
+
+        SvmDebugPrint("[IOCTL] PROTECT_EX: PID=%llu, HWND=0x%llX, children=%lu\n",
+            px->Pid, px->Hwnd, px->ChildHwndCount);
+        break;
+    }
+
+    /* ---- 保护窗口句柄 ---- */
+    case IOCTL_SVM_PROTECT_HWND:
+    {
+        if (inLen < sizeof(ULONG64) || !buffer) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        SVM_HWND hwnd = (SVM_HWND)(*(PULONG64)buffer);
+        AddProtectedHwnd(hwnd);
+        SvmDebugPrint("[IOCTL] PROTECT_HWND: 0x%llX\n", (ULONG64)hwnd);
+        break;
+    }
+
+    /* ---- 保护子窗口 ---- */
+    case IOCTL_SVM_PROTECT_CHILD_HWND:
+    {
+        if (inLen < sizeof(ULONG64) || !buffer) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        SVM_HWND hwnd = (SVM_HWND)(*(PULONG64)buffer);
+        AddProtectedChildHwnd(hwnd);
+        break;
+    }
+
+    /* ---- 清除所有保护 ---- */
+    case IOCTL_SVM_CLEAR_ALL:
+    {
+        ClearAllProtectedTargets();
+        SvmDebugPrint("[IOCTL] CLEAR_ALL\n");
+        break;
+    }
+
+    /* ---- 禁用 / 恢复回调 (IOCTL 已在 PASSIVE_LEVEL, 可直接调用) ---- */
+    case IOCTL_SVM_DISABLE_CALLBACKS:
+    {
+        DisableAllProcessCallbacks();
+        SvmDebugPrint("[IOCTL] DISABLE_CALLBACKS\n");
+        break;
+    }
+
+    case IOCTL_SVM_RESTORE_CALLBACKS:
+    {
+        RestoreAllProcessCallbacks();
+        SvmDebugPrint("[IOCTL] RESTORE_CALLBACKS\n");
+        break;
+    }
+
+    /* ---- 内存读写 (复用 HvMemory.h 定义) ---- */
+    case IOCTL_HV_READ_MEMORY:
+    {
+        if (inLen < sizeof(HV_MEMORY_REQUEST) || !buffer) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        PHV_MEMORY_REQUEST req = (PHV_MEMORY_REQUEST)buffer;
+        status = HvReadProcessMemory(
+            req->TargetPid,
+            (PVOID)req->Address,
+            (PVOID)req->BufferAddress,
+            (SIZE_T)req->Size);
+        break;
+    }
+
+    case IOCTL_HV_WRITE_MEMORY:
+    {
+        if (inLen < sizeof(HV_MEMORY_REQUEST) || !buffer) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        PHV_MEMORY_REQUEST req = (PHV_MEMORY_REQUEST)buffer;
+        status = HvWriteProcessMemory(
+            req->TargetPid,
+            (PVOID)req->Address,
+            (PVOID)req->BufferAddress,
+            (SIZE_T)req->Size);
+        break;
+    }
+
+    default:
+        status = STATUS_INVALID_DEVICE_REQUEST;
+        break;
+    }
+
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = info;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
+/* ========================================================================
+ *  Communication thread (runs at PASSIVE_LEVEL)
+ * ======================================================================== */
 VOID CommunicationThread(PVOID Context)
 {
     UNREFERENCED_PARAMETER(Context);
@@ -50,65 +247,115 @@ VOID CommunicationThread(PVOID Context)
 
     while (!g_DriverUnloading)
     {
+        LONG cbOp = InterlockedExchange(&g_PendingCallbackOp, 0);
+        if (cbOp == 1) {
+            SvmDebugPrint("[INFO] Processing deferred callback DISABLE at PASSIVE_LEVEL\n");
+            DisableAllProcessCallbacks();
+        }
+        else if (cbOp == 2) {
+            SvmDebugPrint("[INFO] Processing deferred callback RESTORE at PASSIVE_LEVEL\n");
+            RestoreAllProcessCallbacks();
+        }
+
         if (g_PendingProtectPID != (HANDLE)0 && g_PendingProtectPID != g_ProtectedPID)
         {
-            SvmDebugPrint("[INFO] New protection request, target PID: %I64d\n", (ULONG64)g_PendingProtectPID);
+            HANDLE targetPid = g_PendingProtectPID;
+            SvmDebugPrint("[INFO] New protection request, target PID: %I64d\n", (ULONG64)targetPid);
 
-            // 1. Disguise process as explorer.exe
-            DisguiseProcess(g_PendingProtectPID);
+            {
+                LARGE_INTEGER initDelay;
+                initDelay.QuadPart = -5000000LL; // 500ms
+                KeDelayExecutionThread(KernelMode, FALSE, &initDelay);
+            }
 
-            // 2. Activate intercept
-            g_ProtectedPID = g_PendingProtectPID;
+            __try {
+                DisguiseProcess(targetPid);
+                SvmDebugPrint("[INFO] Process PEB disguise complete.\n");
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                SvmDebugPrint("[WARN] DisguiseProcess exception 0x%X for PID %I64d (non-fatal)\n",
+                    GetExceptionCode(), (ULONG64)targetPid);
+            }
 
+            AddProtectedPid(targetPid);
+            SvmDebugPrint("[INFO] PID %I64d added to protected list (count=%ld).\n",
+                (ULONG64)targetPid, g_ProtectedPidCount);
+
+            g_ProtectedPID = targetPid;
             SvmDebugPrint("[INFO] Process disguise and SVM protection fully activated!\n");
         }
         KeDelayExecutionThread(KernelMode, FALSE, &timeout);
     }
 
-    // ---- 【新增】卸载清理流程 ----
+    // ================================================================
+    // 统一卸载清理流程
+    // ================================================================
     SvmDebugPrint("[INFO] CommunicationThread: Unload signal received, starting cleanup...\n");
 
-    // 1. 恢复进程回调
+    ClearAllProtectedTargets();
+    MemoryBarrier();
+
+    {
+        LARGE_INTEGER drainDelay;
+        drainDelay.QuadPart = -20000000LL; // 2s
+        KeDelayExecutionThread(KernelMode, FALSE, &drainDelay);
+    }
+    SvmDebugPrint("[INFO] Hook drain complete.\n");
+
     RestoreAllProcessCallbacks();
 
-    // 2. 恢复 DKOM 链接
-    RestoreProcessByDkom();
-
-    // 3. 广播 IPI 让所有核心退出 SVM
     KeIpiGenericCall(IpiUnloadBroadcastCallback, 0);
     SvmDebugPrint("[INFO] All cores exited SVM mode.\n");
 
-    // 4. 释放资源
+    {
+        LARGE_INTEGER drainDelay2;
+        drainDelay2.QuadPart = -20000000LL; // 2s
+        KeDelayExecutionThread(KernelMode, FALSE, &drainDelay2);
+    }
+
     HvFreeSharedContext();
-    // 注意：ReleaseDriverResources 应该在所有核心退出后才能安全调用
-    // 但由于我们是手动映射的，内存释放需要格外小心
+    CleanupAllNptHooks();
+    ReleaseDriverResources();
+    if (g_CsrssProcess) {
+        ObDereferenceObject(g_CsrssProcess);
+        g_CsrssProcess = NULL;
+    }
 
     SvmDebugPrint("[INFO] Cleanup complete. System is back to normal.\n");
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
-// ========================================================
-// Delayed hook activation thread
-// ========================================================
+/* ========================================================================
+ *  Delayed hook activation thread
+ * ======================================================================== */
 VOID DelayedHookWorkItemRoutine(PVOID Context)
 {
     UNREFERENCED_PARAMETER(Context);
     SvmDebugPrint("[INFO] Hook Install Thread Started...\n");
 
     NTSTATUS status = InitializeProcessHideHooks();
-    if (!NT_SUCCESS(status)) return;
+    if (!NT_SUCCESS(status)) {
+        SvmDebugPrint("[ERROR] InitializeProcessHideHooks failed: 0x%X\n", status);
+        PsTerminateSystemThread(status);
+        return;
+    }
 
     status = PrepareAllNptHookResources();
-    if (!NT_SUCCESS(status)) return;
+    if (!NT_SUCCESS(status)) {
+        SvmDebugPrint("[ERROR] PrepareAllNptHookResources failed: 0x%X\n", status);
+        PsTerminateSystemThread(status);
+        return;
+    }
 
-    // Link trampoline function pointers before activation
     LinkTrampolineAddresses();
+
+    ULONG n_cout = KeQueryActiveProcessorCount(0);
+    if (n_cout > 64) n_cout = 64;
 
     {
         KAPC_STATE paApcState;
         BOOLEAN attached = FALSE;
 
-        // Attach to CSRSS to resolve ALL physical addresses (including session pages)
         if (g_CsrssProcess != nullptr) {
             KeStackAttachProcess(g_CsrssProcess, &paApcState);
             attached = TRUE;
@@ -132,23 +379,41 @@ VOID DelayedHookWorkItemRoutine(PVOID Context)
 
     SvmDebugPrint("[INFO] SUCCESS! TargetPa All safely resolved.\n");
 
-    ULONG n_cout = KeQueryActiveProcessorCount(0);
-    if (n_cout > 64) n_cout = 64;
-
     for (ULONG cpu = 0; cpu < n_cout; cpu++) {
         for (int h = 0; h < HOOK_MAX_COUNT; h++) {
             if (g_HookList[h].IsUsed && g_HookList[h].ResourcesReady && g_HookList[h].TargetPa != 0) {
-                PreSplitLargePageByPa(&g_nVMCB[cpu], g_HookList[h].TargetPa);
+                NTSTATUS splitStatus = PreSplitLargePageByPa(g_nVMCB[cpu], g_HookList[h].TargetPa);
+                if (!NT_SUCCESS(splitStatus)) {
+                    SvmDebugPrint("[WARN] PreSplitLargePageByPa failed for hook %d on CPU %lu: 0x%X\n",
+                        h, cpu, splitStatus);
+                }
             }
         }
     }
+    SvmDebugPrint("[INFO] All large pages pre-split for %lu cores.\n", n_cout);
 
-    // Broadcast IPI to activate NPT hooks on all cores via CPUID hypercall
+    for (ULONG cpu = 0; cpu < n_cout; cpu++) {
+        PrewarmPtVaCache(g_nVMCB[cpu]);
+    }
+    SvmDebugPrint("[INFO] PT VA cache prewarmed for all %lu cores.\n", n_cout);
+
+    for (ULONG cpu = 0; cpu < n_cout; cpu++) {
+        status = ActivateAllNptHooks(g_nVMCB[cpu]);
+        if (!NT_SUCCESS(status)) {
+            SvmDebugPrint("[ERROR] ActivateAllNptHooks failed for CPU %lu: 0x%X\n", cpu, status);
+        }
+    }
+    SvmDebugPrint("[INFO] NPT entries prepared at PASSIVE_LEVEL for all %lu cores.\n", n_cout);
+
     KeIpiGenericCall(IpiActivateHookBroadcastCallback, 0);
     SvmDebugPrint("[INFO] SUCCESS! All NPT hooks safely activated.\n");
+
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
+/* ========================================================================
+ *  IPI 回调
+ * ======================================================================== */
 ULONG_PTR IpiActivateHookBroadcastCallback(ULONG_PTR Argument)
 {
     UNREFERENCED_PARAMETER(Argument);
@@ -163,7 +428,8 @@ ULONG_PTR IpiInstallBroadcastCallback(ULONG_PTR Argument)
     ULONG processorNumber = KeGetCurrentProcessorNumber();
     if (processorNumber >= 64) return 0;
 
-    PVCPU_CONTEXT vpData = &g_nVMCB[processorNumber];
+    PVCPU_CONTEXT vpData = g_nVMCB[processorNumber];
+    if (!vpData) return 0;
     BOOLEAN svmState = CommCheckAMDsupport();
     if (svmState == false) {
         return 0;
@@ -185,23 +451,35 @@ ULONG_PTR IpiUnloadBroadcastCallback(ULONG_PTR Argument)
     return 0;
 }
 
+/* ========================================================================
+ *  DriverUnload — 删除设备/符号链接, 通知 CommunicationThread 退出
+ * ======================================================================== */
 void UnloadDriver(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
 
+    SvmDebugPrint("[DrvMain] UnloadDriver called.\n");
+
     g_DriverUnloading = TRUE;
+    MemoryBarrier();
+
     if (g_WorkerThreadHandle) {
         ZwWaitForSingleObject(g_WorkerThreadHandle, FALSE, NULL);
         ZwClose(g_WorkerThreadHandle);
+        g_WorkerThreadHandle = NULL;
     }
 
-    RestoreProcessByDkom();
+    /* 删除符号链接和设备对象 */
+    UNICODE_STRING symLink;
+    RtlInitUnicodeString(&symLink, SVM_SYMLINK_NAME);
+    IoDeleteSymbolicLink(&symLink);
 
-    KeIpiGenericCall(IpiUnloadBroadcastCallback, 0);
-    SvmDebugPrint("[DrvMain] SVM unloaded\n");
+    if (g_DeviceObject) {
+        IoDeleteDevice(g_DeviceObject);
+        g_DeviceObject = NULL;
+    }
 
-    HvFreeSharedContext();
-    ReleaseDriverResources();
+    SvmDebugPrint("[DrvMain] Unload complete.\n");
 }
 
 static ULONG_PTR BroadcastHookActivation(ULONG_PTR Argument) {
@@ -212,25 +490,27 @@ static ULONG_PTR BroadcastHookActivation(ULONG_PTR Argument) {
 }
 
 VOID TriggerGlobalHookActivation() {
-    SvmDebugPrint("[INFO] 正在通过 IPI 广播向所有核心下发 NPT Hook 指令...\n");
+    SvmDebugPrint("[INFO] IPI broadcast NPT Hook activation...\n");
     KeIpiGenericCall(BroadcastHookActivation, 0);
-    SvmDebugPrint("[INFO] 全核心 NPT Hook 激活完毕！\n");
+    SvmDebugPrint("[INFO] All cores NPT Hook activated.\n");
 }
 
-ULONG64 g_SystemCr3 = 0;
-// ========================================================
-// 【新增】安全初始化系统线程：脱离 KDMapper 的 CR3 上下文
-// ========================================================
+/* ========================================================================
+ *  SVM 初始化系统线程
+ *  正常加载下 DriverEntry 已在 System 进程上下文,
+ *  仍用独立线程避免阻塞 DriverEntry 返回
+ * ======================================================================== */
 VOID SvmInitSystemThread(PVOID StartContext)
 {
     UNREFERENCED_PARAMETER(StartContext);
-    // 此时我们身处 System 进程中，这里的 CR3 是永恒不变的！
+
     SvmDebugPrint("[SVM] SvmInitSystemThread started in System process.\n");
     g_SystemCr3 = __readcr3() & ~0xFFF;
+
     if (!CommCheckAMDsupport()) {
         SvmDebugPrint("[ERROR] AMD SVM is not supported or locked by BIOS / Hyper-V.\n");
         PsTerminateSystemThread(STATUS_NOT_SUPPORTED);
-        return; // 必须 return
+        return;
     }
 
     LONG n_cout = KeQueryActiveProcessorCount(0);
@@ -238,19 +518,55 @@ VOID SvmInitSystemThread(PVOID StartContext)
 
     for (LONG i = 0; i < n_cout; i++)
     {
-        g_nVMCB[i].HostStackBase = ExAllocatePool2(POOL_FLAG_NON_PAGED, KERNEL_STACK_SIZE, 'HSTK');
-        g_nVMCB[i].ProcessorIndex = i;
-        g_nVMCB[i].NptCr3 = PrepareNPT(&g_nVMCB[i]);
-        g_nVMCB[i].HostStackTop = (UINT64)g_nVMCB[i].HostStackBase + KERNEL_STACK_SIZE;
+        g_nVMCB[i] = (PVCPU_CONTEXT)ExAllocatePool2(
+            POOL_FLAG_NON_PAGED, sizeof(VCPU_CONTEXT), 'VMCB');
+        if (!g_nVMCB[i]) {
+            SvmDebugPrint("[ERROR] Failed to allocate VCPU_CONTEXT for CPU %ld\n", i);
+            goto cleanup_alloc;
+        }
+        RtlZeroMemory(g_nVMCB[i], sizeof(VCPU_CONTEXT));
+
+        g_nVMCB[i]->HostStackBase = ExAllocatePool2(POOL_FLAG_NON_PAGED, KERNEL_STACK_SIZE, 'HSTK');
+        if (!g_nVMCB[i]->HostStackBase) {
+            SvmDebugPrint("[ERROR] Failed to allocate host stack for CPU %ld\n", i);
+            goto cleanup_alloc;
+        }
+        g_nVMCB[i]->ProcessorIndex = i;
+        g_nVMCB[i]->NptCr3 = PrepareNPT(g_nVMCB[i]);
+        if (g_nVMCB[i]->NptCr3 == 0) {
+            SvmDebugPrint("[ERROR] PrepareNPT failed for CPU %ld\n", i);
+            goto cleanup_alloc;
+        }
+        g_nVMCB[i]->HostStackTop = (UINT64)g_nVMCB[i]->HostStackBase + KERNEL_STACK_SIZE;
+
+        g_nVMCB[i]->ActiveHook = nullptr;
+        g_nVMCB[i]->SuspendedHook = nullptr;
+        g_nVMCB[i]->SplitPtCount = 0;
+        RtlZeroMemory(g_nVMCB[i]->SplitPtPas, sizeof(g_nVMCB[i]->SplitPtPas));
+        continue;
+
+    cleanup_alloc:
+        for (LONG j = 0; j <= i; j++) {
+            if (g_nVMCB[j]) {
+                if (g_nVMCB[j]->HostStackBase)
+                    ExFreePoolWithTag(g_nVMCB[j]->HostStackBase, 'HSTK');
+                ExFreePoolWithTag(g_nVMCB[j], 'VMCB');
+                g_nVMCB[j] = nullptr;
+            }
+        }
+        PsTerminateSystemThread(STATUS_INSUFFICIENT_RESOURCES);
+        return;
     }
 
+    SvmDebugPrint("[SVM] All CPU resources allocated. Initializing shared context...\n");
     HvInitSharedContext();
 
     g_SuccessfulSvmCores = 0;
     KeIpiGenericCall(IpiInstallBroadcastCallback, 0);
 
     if (g_SuccessfulSvmCores != n_cout) {
-        SvmDebugPrint("[ERROR] SVM initialization failed! Expected: %lu, Success: %ld\n", n_cout, g_SuccessfulSvmCores);
+        SvmDebugPrint("[ERROR] SVM initialization failed! Expected: %ld, Success: %ld\n",
+            n_cout, g_SuccessfulSvmCores);
 
         KeIpiGenericCall(IpiUnloadBroadcastCallback, 0);
         HvFreeSharedContext();
@@ -260,57 +576,149 @@ VOID SvmInitSystemThread(PVOID StartContext)
         return;
     }
 
-    SvmDebugPrint("[DrvMain] System is now running in SVM Guest mode on ALL %ld cores.\n", g_SuccessfulSvmCores);
+    SvmDebugPrint("[DrvMain] System is now running in SVM Guest mode on ALL %ld cores.\n",
+        g_SuccessfulSvmCores);
 
     OBJECT_ATTRIBUTES oa;
     InitializeObjectAttributes(&oa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
-    PsCreateSystemThread(&g_WorkerThreadHandle, THREAD_ALL_ACCESS, &oa, NULL, NULL, CommunicationThread, NULL);
 
-    // 【重要修改】因为我们是手动映射，根本没有 DriverObject，绝对不要调用 HideDriver！
-    // 否则一调就会抛出 0xC0000005 蓝屏
-    // HideDriver(DriverObject);
+    NTSTATUS status = PsCreateSystemThread(
+        &g_WorkerThreadHandle, THREAD_ALL_ACCESS,
+        &oa, NULL, NULL, CommunicationThread, NULL);
+    if (!NT_SUCCESS(status)) {
+        SvmDebugPrint("[ERROR] Failed to create CommunicationThread: 0x%X\n", status);
+    }
 
     HANDLE hThreadHook;
-    PsCreateSystemThread(&hThreadHook, THREAD_ALL_ACCESS, &oa, NULL, NULL, (PKSTART_ROUTINE)DelayedHookWorkItemRoutine, NULL);
-    if (hThreadHook) ZwClose(hThreadHook);
+    status = PsCreateSystemThread(
+        &hThreadHook, THREAD_ALL_ACCESS,
+        &oa, NULL, NULL, (PKSTART_ROUTINE)DelayedHookWorkItemRoutine, NULL);
+    if (NT_SUCCESS(status) && hThreadHook) {
+        ZwClose(hThreadHook);
+    }
+    else {
+        SvmDebugPrint("[ERROR] Failed to create hook installation thread: 0x%X\n", status);
+    }
 
-    // 系统线程的使命完成，功成身退
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
-// ========================================================
-// 【修改】KDMapper 专用入口点
-// ========================================================
-EXTERN_C NTSTATUS DriverEntry(PVOID pAllocationBase, PVOID pSize)
+/* ========================================================================
+ *  DriverEntry — 标准 WDM 入口点
+ *
+ *  加载方式:
+ *    sc create SvmDebug type= kernel binPath= C:\path\SvmDebug.sys
+ *    sc start  SvmDebug
+ *    sc stop   SvmDebug
+ *    sc delete SvmDebug
+ * ======================================================================== */
+EXTERN_C NTSTATUS DriverEntry(
+    _In_ PDRIVER_OBJECT  DriverObject,
+    _In_ PUNICODE_STRING RegistryPath)
 {
-    UNREFERENCED_PARAMETER(pAllocationBase);
-    UNREFERENCED_PARAMETER(pSize);
+    UNREFERENCED_PARAMETER(RegistryPath);
 
-    // 参数不再是 DriverObject 和 RegistryPath！不要碰它们！
+    SvmDebugPrint("[DrvMain] DriverEntry (standard loading).\n");
 
+    /* ---- 创建设备对象 ---- */
+    UNICODE_STRING devName;
+    RtlInitUnicodeString(&devName, SVM_DEVICE_NAME);
+
+    NTSTATUS status = IoCreateDevice(
+        DriverObject,
+        0,
+        &devName,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        FALSE,
+        &g_DeviceObject);
+
+    if (!NT_SUCCESS(status)) {
+        SvmDebugPrint("[ERROR] IoCreateDevice failed: 0x%X\n", status);
+        return status;
+    }
+
+    /* ---- 创建符号链接 (R3 通过 \\\\.\\SvmDebug 打开) ---- */
+    UNICODE_STRING symLink;
+    RtlInitUnicodeString(&symLink, SVM_SYMLINK_NAME);
+
+    status = IoCreateSymbolicLink(&symLink, &devName);
+    if (!NT_SUCCESS(status)) {
+        SvmDebugPrint("[ERROR] IoCreateSymbolicLink failed: 0x%X\n", status);
+        IoDeleteDevice(g_DeviceObject);
+        g_DeviceObject = NULL;
+        return status;
+    }
+
+    /* ---- IRP 派发表 ---- */
+    DriverObject->MajorFunction[IRP_MJ_CREATE]         = DispatchCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE]          = DispatchCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
+    DriverObject->DriverUnload                         = UnloadDriver;
+
+    /* ---- 启动 SVM 初始化线程 (不阻塞 DriverEntry 返回) ---- */
     HANDLE hThread;
-
-    // 参数3传NULL，代表这个线程挂靠在 System 进程身上
-    NTSTATUS status = PsCreateSystemThread(
+    status = PsCreateSystemThread(
         &hThread,
         THREAD_ALL_ACCESS,
-        NULL,
-        NULL,
-        NULL,
+        NULL, NULL, NULL,
         SvmInitSystemThread,
-        NULL
-    );
+        NULL);
 
     if (NT_SUCCESS(status)) {
         ZwClose(hThread);
     }
     else {
-        SvmDebugPrint("[ERROR] Failed to create SVM init thread! Status: 0x%X\n", status);
+        SvmDebugPrint("[ERROR] Failed to create SVM init thread: 0x%X\n", status);
+        IoDeleteSymbolicLink(&symLink);
+        IoDeleteDevice(g_DeviceObject);
+        g_DeviceObject = NULL;
         return status;
     }
 
-    // 【神之一手】主函数立即返回成功！
-    // 这样 KDMapper 就可以安全退出，销毁它的内存和临时 CR3。
-    // 而我们的 SvmInitSystemThread 已经挂在 System 进程下，开始接管 CPU 硬件了！
+    SvmDebugPrint("[DrvMain] DriverEntry completed, SVM init in progress.\n");
     return STATUS_SUCCESS;
 }
+
+/* ========================================================================
+ *  [原始代码备份] KDMapper 专用入口点
+ *
+ *  KDMapper 以 (PVOID, PVOID) 签名调用 DriverEntry,
+ *  不创建设备对象, 不注册 DriverUnload, 也没有 IRP 通信。
+ *  R3 只能通过 CPUID hypercall 下发命令。
+ *
+ *  如需恢复 KDMapper 加载方式:
+ *    1. 注释掉上方的 DriverEntry(PDRIVER_OBJECT, PUNICODE_STRING)
+ *    2. 取消注释以下代码
+ *    3. 可删除 DispatchCreateClose / DispatchDeviceControl / g_DeviceObject
+ * ========================================================================
+ *
+ * EXTERN_C NTSTATUS DriverEntry(PVOID pAllocationBase, PVOID pSize)
+ * {
+ *     UNREFERENCED_PARAMETER(pAllocationBase);
+ *     UNREFERENCED_PARAMETER(pSize);
+ *
+ *     HANDLE hThread;
+ *
+ *     NTSTATUS status = PsCreateSystemThread(
+ *         &hThread,
+ *         THREAD_ALL_ACCESS,
+ *         NULL,
+ *         NULL,
+ *         NULL,
+ *         SvmInitSystemThread,
+ *         NULL
+ *     );
+ *
+ *     if (NT_SUCCESS(status)) {
+ *         ZwClose(hThread);
+ *     }
+ *     else {
+ *         SvmDebugPrint("[ERROR] Failed to create SVM init thread! Status: 0x%X\n", status);
+ *         return status;
+ *     }
+ *
+ *     return STATUS_SUCCESS;
+ * }
+ *
+ * ======================================================================== */

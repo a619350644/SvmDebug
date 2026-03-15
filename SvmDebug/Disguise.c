@@ -304,17 +304,16 @@ void resetProcessImageName(PEPROCESS fakeProcess, PEPROCESS srcProcess)
 	PCHAR imageName = PsGetProcessImageFileName(fakeProcess);
 	PCHAR targetName = PsGetProcessImageFileName(srcProcess);
 
-	// 计算源字符串长度（不包括终止符）
+	// 【FIX】先清零整个缓冲区，防止残留导致 "explorer.exe.exe"
+	RtlZeroMemory(imageName, PROCESS_NAME_BUFFER_SIZE);
+
 	SIZE_T length = 0;
 	while (length < PROCESS_NAME_BUFFER_SIZE - 1 && targetName[length] != '\0') {
 		length++;
 	}
 
-	// 复制字符串（包括终止符）
-	RtlCopyMemory(imageName, targetName, length + 1);
-
-	// 确保字符串以NULL结尾（防止异常情况）
-	imageName[PROCESS_NAME_BUFFER_SIZE - 1] = '\0';
+	RtlCopyMemory(imageName, targetName, length);
+	imageName[length] = '\0';
 }
 
 
@@ -756,25 +755,39 @@ void resetProcessPeb64Moudle(PEPROCESS fakeProcess, PEPROCESS srcProcess)
 
 	KeStackAttachProcess(srcProcess, &srcApcState);
 
+	/* 【修复】__try 包裹所有用户态PEB/LDR访问 —— 进程可能正在退出,结构被部分拆除 */
+	__try {
+		SIZE_T pro = NULL;
+		MmCopyVirtualMemory(srcProcess, srcPeb, srcProcess, srcPeb, 1, UserMode, &pro);
 
-	SIZE_T pro = NULL;
-	MmCopyVirtualMemory(srcProcess, srcPeb, srcProcess, srcPeb, 1, UserMode, &pro);
+		if (!srcPeb->Ldr) {
+			KeUnstackDetachProcess(&srcApcState);
+			return;
+		}
 
-	MmCopyVirtualMemory(srcProcess, srcPeb->Ldr, srcProcess, srcPeb->Ldr, 1, UserMode, &pro);
+		MmCopyVirtualMemory(srcProcess, srcPeb->Ldr, srcProcess, srcPeb->Ldr, 1, UserMode, &pro);
 
-	PMLDR_DATA_TABLE_ENTRY list = (PMLDR_DATA_TABLE_ENTRY)srcPeb->Ldr->InLoadOrderModuleList.Flink;
+		PMLDR_DATA_TABLE_ENTRY list = (PMLDR_DATA_TABLE_ENTRY)srcPeb->Ldr->InLoadOrderModuleList.Flink;
 
-	if (list->FullDllName.Length)
-	{
-		FullDllName.Buffer = ExAllocatePool(NonPagedPool, list->FullDllName.MaximumLength);
+		if (!list) {
+			KeUnstackDetachProcess(&srcApcState);
+			return;
+		}
 
-		memcpy(FullDllName.Buffer, list->FullDllName.Buffer, list->FullDllName.Length);
-
-		FullDllName.Length = list->FullDllName.Length;
-
-		FullDllName.MaximumLength = list->FullDllName.MaximumLength;
-
-		baseLen = (PUCHAR)list->BaseDllName.Buffer - (PUCHAR)list->FullDllName.Buffer;
+		if (list->FullDllName.Length && list->FullDllName.Buffer)
+		{
+			FullDllName.Buffer = ExAllocatePool(NonPagedPool, list->FullDllName.MaximumLength);
+			if (FullDllName.Buffer) {
+				memcpy(FullDllName.Buffer, list->FullDllName.Buffer, list->FullDllName.Length);
+				FullDllName.Length = list->FullDllName.Length;
+				FullDllName.MaximumLength = list->FullDllName.MaximumLength;
+				baseLen = (ULONG)((PUCHAR)list->BaseDllName.Buffer - (PUCHAR)list->FullDllName.Buffer);
+			}
+		}
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		KeUnstackDetachProcess(&srcApcState);
+		return;
 	}
 
 	KeUnstackDetachProcess(&srcApcState);
@@ -782,45 +795,63 @@ void resetProcessPeb64Moudle(PEPROCESS fakeProcess, PEPROCESS srcProcess)
 
 	KeStackAttachProcess(fakeProcess, &fakeApcState);
 
-	MmCopyVirtualMemory(fakeProcess, fakePeb, fakeProcess, fakePeb, 1, UserMode, &pro);
+	__try {
+		SIZE_T pro = NULL;
+		MmCopyVirtualMemory(fakeProcess, fakePeb, fakeProcess, fakePeb, 1, UserMode, &pro);
 
-	MmCopyVirtualMemory(fakeProcess, fakePeb->Ldr, fakeProcess, fakePeb->Ldr, 1, UserMode, &pro);
+		if (!fakePeb->Ldr) {
+			KeUnstackDetachProcess(&fakeApcState);
+			if (FullDllName.Buffer) ExFreePool(FullDllName.Buffer);
+			return;
+		}
 
-	PMLDR_DATA_TABLE_ENTRY fakeList = (PMLDR_DATA_TABLE_ENTRY)fakePeb->Ldr->InLoadOrderModuleList.Flink;
+		MmCopyVirtualMemory(fakeProcess, fakePeb->Ldr, fakeProcess, fakePeb->Ldr, 1, UserMode, &pro);
 
-	if (fakeList->FullDllName.Length >= FullDllName.Length)
-	{
-		memset(fakeList->FullDllName.Buffer, 0, fakeList->FullDllName.MaximumLength);
+		PMLDR_DATA_TABLE_ENTRY fakeList = (PMLDR_DATA_TABLE_ENTRY)fakePeb->Ldr->InLoadOrderModuleList.Flink;
 
-		memcpy(fakeList->FullDllName.Buffer, FullDllName.Buffer, FullDllName.Length);
+		if (!fakeList) {
+			KeUnstackDetachProcess(&fakeApcState);
+			if (FullDllName.Buffer) ExFreePool(FullDllName.Buffer);
+			return;
+		}
 
-		fakeList->FullDllName.Length = FullDllName.Length;
+		if (FullDllName.Length == 0 || !FullDllName.Buffer) {
+			/* src 端没有拿到有效的 DLL 名, 跳过 */
+		}
+		else if (fakeList->FullDllName.Length >= FullDllName.Length)
+		{
+			memset(fakeList->FullDllName.Buffer, 0, fakeList->FullDllName.MaximumLength);
+			memcpy(fakeList->FullDllName.Buffer, FullDllName.Buffer, FullDllName.Length);
+			fakeList->FullDllName.Length = FullDllName.Length;
+
+			fakeList->BaseDllName.Buffer = (PUCHAR)fakeList->FullDllName.Buffer + baseLen;
+			fakeList->BaseDllName.Length = fakeList->FullDllName.Length - (USHORT)baseLen;
+			fakeList->BaseDllName.MaximumLength = (USHORT)baseLen + 2;
+		}
+		else
+		{
+			PVOID BaseAddr = NULL;
+			SIZE_T size = PAGE_SIZE;
+			NTSTATUS status = ZwAllocateVirtualMemory(NtCurrentProcess(), &BaseAddr, 0, &size, MEM_COMMIT, PAGE_READWRITE);
+			if (NT_SUCCESS(status) && BaseAddr) {
+				memcpy(BaseAddr, FullDllName.Buffer, FullDllName.Length);
+				fakeList->FullDllName.Length = FullDllName.Length;
+				fakeList->FullDllName.MaximumLength = FullDllName.MaximumLength;
+				fakeList->FullDllName.Buffer = BaseAddr;
+
+				fakeList->BaseDllName.Buffer = (PUCHAR)fakeList->FullDllName.Buffer + baseLen;
+				fakeList->BaseDllName.Length = fakeList->FullDllName.Length - (USHORT)baseLen;
+				fakeList->BaseDllName.MaximumLength = (USHORT)baseLen + 2;
+			}
+		}
 	}
-	else
-	{
-		PVOID BaseAddr = NULL;
-
-		SIZE_T size = PAGE_SIZE;
-
-		NTSTATUS status = ZwAllocateVirtualMemory(NtCurrentProcess(), &BaseAddr, 0, &size, MEM_COMMIT, PAGE_READWRITE);
-
-		memcpy(BaseAddr, FullDllName.Buffer, FullDllName.Length);
-
-		fakeList->FullDllName.Length = FullDllName.Length;
-
-		fakeList->FullDllName.MaximumLength = FullDllName.MaximumLength;
-
-		fakeList->FullDllName.Buffer = BaseAddr;
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		/* 用户态 PEB 结构被部分拆除, 静默失败 */
 	}
-
-	fakeList->BaseDllName.Buffer = (PUCHAR)fakeList->FullDllName.Buffer + baseLen;
-	fakeList->BaseDllName.Length = fakeList->FullDllName.Length - baseLen;
-	fakeList->BaseDllName.MaximumLength = baseLen + 2;
 
 	KeUnstackDetachProcess(&fakeApcState);
 
-
-	if (FullDllName.Length) ExFreePool(FullDllName.Buffer);
+	if (FullDllName.Buffer) ExFreePool(FullDllName.Buffer);
 }
 
 void resetProcessPeb32Param(PEPROCESS fakeProcess)
@@ -980,57 +1011,77 @@ void resetProcessPeb32Moudle(PEPROCESS fakeProcess)
 
 	KAPC_STATE fakeApcState = { 0 };
 
-
 	ULONG baseLen = 0;
-
-
 
 	KeStackAttachProcess(fakeProcess, &fakeApcState);
 
-	SIZE_T pro = NULL;
+	/* 【修复】__try 包裹所有用户态PEB/LDR访问 */
+	__try {
+		SIZE_T pro = NULL;
 
-	MmCopyVirtualMemory(fakeProcess, fakePeb, fakeProcess, fakePeb, 1, UserMode, &pro);
+		MmCopyVirtualMemory(fakeProcess, fakePeb, fakeProcess, fakePeb, 1, UserMode, &pro);
 
-	MmCopyVirtualMemory(fakeProcess, fakePeb->Ldr, fakeProcess, fakePeb->Ldr, 1, UserMode, &pro);
+		if (!fakePeb->Ldr) {
+			KeUnstackDetachProcess(&fakeApcState);
+			return;
+		}
 
-	MmCopyVirtualMemory(fakeProcess, peb32, fakeProcess, peb32, 1, UserMode, &pro);
+		MmCopyVirtualMemory(fakeProcess, fakePeb->Ldr, fakeProcess, fakePeb->Ldr, 1, UserMode, &pro);
 
-	PPEB_LDR_DATA32 pldr32 = (PPEB_LDR_DATA32)ULongToPtr(peb32->Ldr);
+		MmCopyVirtualMemory(fakeProcess, peb32, fakeProcess, peb32, 1, UserMode, &pro);
 
-	MmCopyVirtualMemory(fakeProcess, pldr32, fakeProcess, pldr32, 1, UserMode, &pro);
+		PPEB_LDR_DATA32 pldr32 = (PPEB_LDR_DATA32)ULongToPtr(peb32->Ldr);
+
+		if (!pldr32) {
+			KeUnstackDetachProcess(&fakeApcState);
+			return;
+		}
+
+		MmCopyVirtualMemory(fakeProcess, pldr32, fakeProcess, pldr32, 1, UserMode, &pro);
 
 
-	PMLDR_DATA_TABLE_ENTRY fakeList = (PMLDR_DATA_TABLE_ENTRY)fakePeb->Ldr->InLoadOrderModuleList.Flink;
-	PLDR_DATA_TABLE_ENTRY32 fakeList32 = (PLDR_DATA_TABLE_ENTRY32)ULongToPtr(pldr32->InLoadOrderModuleList.Flink);
+		PMLDR_DATA_TABLE_ENTRY fakeList = (PMLDR_DATA_TABLE_ENTRY)fakePeb->Ldr->InLoadOrderModuleList.Flink;
+		PLDR_DATA_TABLE_ENTRY32 fakeList32 = (PLDR_DATA_TABLE_ENTRY32)ULongToPtr(pldr32->InLoadOrderModuleList.Flink);
 
-	if (fakeList32->FullDllName.Length >= fakeList->FullDllName.Length)
-	{
-		memset(fakeList32->FullDllName.Buffer, 0, fakeList32->FullDllName.MaximumLength);
+		if (!fakeList || !fakeList32) {
+			KeUnstackDetachProcess(&fakeApcState);
+			return;
+		}
 
-		memcpy(fakeList32->FullDllName.Buffer, fakeList->FullDllName.Buffer, fakeList->FullDllName.Length);
+		if (fakeList32->FullDllName.Length >= fakeList->FullDllName.Length)
+		{
+			memset(fakeList32->FullDllName.Buffer, 0, fakeList32->FullDllName.MaximumLength);
 
-		fakeList32->FullDllName.Length = fakeList->FullDllName.Length;
+			memcpy(fakeList32->FullDllName.Buffer, fakeList->FullDllName.Buffer, fakeList->FullDllName.Length);
+
+			fakeList32->FullDllName.Length = fakeList->FullDllName.Length;
+		}
+		else
+		{
+			PVOID BaseAddr = NULL;
+
+			SIZE_T size = PAGE_SIZE;
+
+			NTSTATUS status = ZwAllocateVirtualMemory(NtCurrentProcess(), &BaseAddr, 0, &size, MEM_COMMIT, PAGE_READWRITE);
+
+			if (NT_SUCCESS(status) && BaseAddr) {
+				memcpy(BaseAddr, fakeList->FullDllName.Buffer, fakeList->FullDllName.Length);
+
+				fakeList32->FullDllName.Length = fakeList->FullDllName.Length;
+
+				fakeList32->FullDllName.MaximumLength = fakeList->FullDllName.MaximumLength;
+
+				fakeList32->FullDllName.Buffer = BaseAddr;
+			}
+		}
+
+		fakeList32->BaseDllName.Buffer = (PUCHAR)fakeList->FullDllName.Buffer + baseLen;
+		fakeList32->BaseDllName.Length = fakeList->FullDllName.Length - baseLen;
+		fakeList32->BaseDllName.MaximumLength = baseLen + 2;
 	}
-	else
-	{
-		PVOID BaseAddr = NULL;
-
-		SIZE_T size = PAGE_SIZE;
-
-		NTSTATUS status = ZwAllocateVirtualMemory(NtCurrentProcess(), &BaseAddr, 0, &size, MEM_COMMIT, PAGE_READWRITE);
-
-		memcpy(BaseAddr, fakeList->FullDllName.Buffer, fakeList->FullDllName.Length);
-
-		fakeList32->FullDllName.Length = fakeList->FullDllName.Length;
-
-		fakeList32->FullDllName.MaximumLength = fakeList->FullDllName.MaximumLength;
-
-		fakeList32->FullDllName.Buffer = BaseAddr;
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		/* 用户态 PEB 结构被部分拆除, 静默失败 */
 	}
-
-	fakeList32->BaseDllName.Buffer = (PUCHAR)fakeList->FullDllName.Buffer + baseLen;
-	fakeList32->BaseDllName.Length = fakeList->FullDllName.Length - baseLen;
-	fakeList32->BaseDllName.MaximumLength = baseLen + 2;
 
 	KeUnstackDetachProcess(&fakeApcState);
 
@@ -1053,23 +1104,26 @@ BOOLEAN FakeProcessByPid(PEPROCESS fakeProcess, HANDLE SrcPid)
 		return FALSE;
 	}
 
-	resetProcessImageName(fakeProcess, Process);
-
-	resetProcessFullName(fakeProcess, Process);
-
-	resetProcessFileObjectName(fakeProcess, Process);
-
-	resetProcessFileObjectNameWin10(fakeProcess, Process);
-
-	resetProcessTokenGroup(fakeProcess, Process);
-
-	resetProcessPeb64Param(fakeProcess, Process);
-
-	resetProcessPeb64Moudle(fakeProcess, Process);
-
-	resetProcessPeb32Param(fakeProcess);
-
-	resetProcessPeb32Moudle(fakeProcess);
+	/*
+	 * [BUGFIX] Wrap all PEB manipulation in __try/__except.
+	 * User-mode PEB/LDR structures can be partially torn down during
+	 * process exit or not yet initialized during early creation.
+	 * Any access violation here should not BSOD the system.
+	 */
+	__try {
+		resetProcessImageName(fakeProcess, Process);
+		resetProcessFullName(fakeProcess, Process);
+		resetProcessFileObjectName(fakeProcess, Process);
+		resetProcessFileObjectNameWin10(fakeProcess, Process);
+		resetProcessTokenGroup(fakeProcess, Process);
+		resetProcessPeb64Param(fakeProcess, Process);
+		resetProcessPeb64Moudle(fakeProcess, Process);
+		resetProcessPeb32Param(fakeProcess);
+		resetProcessPeb32Moudle(fakeProcess);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER) {
+		/* PEB access failed - process may be exiting, skip silently */
+	}
 
 	return TRUE;
 }

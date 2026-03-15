@@ -1,15 +1,17 @@
+﻿/**
+ * @file HvMemory.h
+ * @brief 超级调用内存操作头文件 - 通信结构体与接口声明
+ * @author yewilliam
+ * @date 2026/02/06
+ */
+
 #pragma once
 #include <ntifs.h>
 #include "Common.h"
 
-// ================================================================
-// Hypervisor Memory R/W Interface
-//
-// Architecture:
-//   CE (R3) -> IOCTL -> Driver (R0) -> CPUID hypercall -> VMM (Host)
-//   VMM walks target CR3 page tables, does physical memory copy
-//   ACE cannot see any of this - no syscall, no kernel API called
-// ================================================================
+/* ========================================================================
+ *  Hypervisor Memory R/W Interface *   *  Architecture: *  CE (R3) -> IOCTL -> Driver (R0) -> CPUID hypercall -> VMM (Host) *  VMM walks target CR3 page tables, does physical memory copy *  ACE cannot see any of this - no syscall, no kernel API called
+ * ======================================================================== */
 
 // CPUID leaf for memory operations
 #define CPUID_HV_MEMORY_OP          0x41414150

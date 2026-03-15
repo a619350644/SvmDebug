@@ -1,14 +1,31 @@
-﻿#include "HvMemory.h"
+﻿/**
+ * @file HvMemory.cpp
+ * @brief 超级调用内存操作 - 基于物理内存的跨进程读写
+ * @author yewilliam
+ * @date 2026/02/06
+ *
+ * 提供绕过所有内核API的进程内存读写能力：
+ * Guest侧: 获取目标CR3 → 填充共享上下文 → CPUID触发超级调用
+ * VMM侧: 遍历x64四级页表翻译VA→PA → 物理内存间拷贝
+ * 对ACE等反作弊系统完全透明。
+ */
+
+#include "HvMemory.h"
 #include "SVM.h"
 
-// ================================================================
-// Shared context for Guest <-> VMM communication
-// Allocated as contiguous physical memory so VMM can access it
-// ================================================================
+/* ========================================================================
+ *  Shared context for Guest <-> VMM communication *  Allocated as contiguous physical memory so VMM can access it
+ * ======================================================================== */
 PHV_RW_CONTEXT g_HvSharedContext = nullptr;
 ULONG64 g_HvSharedContextPa = 0;
 FAST_MUTEX g_HvMutex;
 
+/**
+ * @brief 初始化Guest-VMM共享上下文页 - 分配连续物理内存供超级调用通信
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return 成功返回STATUS_SUCCESS, 分配失败返回STATUS_INSUFFICIENT_RESOURCES
+ */
 NTSTATUS HvInitSharedContext()
 {
     ExInitializeFastMutex(&g_HvMutex); // 初始化锁
@@ -32,6 +49,11 @@ NTSTATUS HvInitSharedContext()
     return STATUS_SUCCESS;
 }
 
+/**
+ * @brief 释放共享上下文页
+ * @author yewilliam
+ * @date 2026/02/06
+ */
 VOID HvFreeSharedContext()
 {
     if (g_HvSharedContext) {
@@ -41,10 +63,9 @@ VOID HvFreeSharedContext()
     }
 }
 
-// ================================================================
-// Guest VA -> Guest PA translation by walking x64 page tables
-// Runs in VMM (Host) context - reads physical memory directly
-// ================================================================
+/* ========================================================================
+ *  Guest VA -> Guest PA translation by walking x64 page tables *  Runs in VMM (Host) context - reads physical memory directly
+ * ======================================================================== */
 static PVOID MapPhysicalPage(ULONG64 PhysAddr, SIZE_T Size)
 {
     UNREFERENCED_PARAMETER(Size);
@@ -59,8 +80,15 @@ static VOID UnmapPhysicalPage(PVOID Va, SIZE_T Size)
     UNREFERENCED_PARAMETER(Size);
 }
 
-// Walk x64 4-level page tables to translate Guest VA to Guest PA
-// This reads physical memory directly - no kernel API, invisible to ACE
+/**
+ * @brief 遍历x64四级页表将Guest VA翻译为Guest PA - 支持1GB/2MB/4KB页面
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] GuestCr3 - 目标进程的CR3(PML4基址)
+ * @param [in] GuestVa  - 要翻译的虚拟地址
+ * @return 物理地址, 页面不存在返回0
+ * @note 直接读物理内存, 不调用任何内核API, 对ACE完全透明
+ */
 static ULONG64 TranslateGuestVaToPa(ULONG64 GuestCr3, ULONG64 GuestVa)
 {
     ULONG64 pml4Idx = (GuestVa >> 39) & 0x1FF;
@@ -125,11 +153,16 @@ static ULONG64 TranslateGuestVaToPa(ULONG64 GuestCr3, ULONG64 GuestVa)
     return pageBase | offset;
 }
 
-// ================================================================
-// Physical memory copy - the core operation
-// Copies data between physical addresses by mapping them
-// No kernel API involved - completely invisible
-// ================================================================
+/**
+ * @brief 物理地址间内存拷贝 - 通过MmGetVirtualForPhysical映射后拷贝
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] DestPa  - 目标物理地址
+ * @param [in] SrcPa   - 源物理地址
+ * @param [in] Size    - 拷贝字节数(不超过PAGE_SIZE)
+ * @param [in] IsWrite - 是否为写操作(预留参数)
+ * @return TRUE表示拷贝成功, FALSE表示映射失败
+ */
 static BOOLEAN PhysicalMemoryCopy(
     ULONG64 DestPa,
     ULONG64 SrcPa,
@@ -169,10 +202,13 @@ static BOOLEAN PhysicalMemoryCopy(
     return TRUE;
 }
 
-// ================================================================
-// VMM Handler - called from VMEXIT when CPUID_HV_MEMORY_OP is hit
-// Reads shared context, performs physical memory operations
-// ================================================================
+/**
+ * @brief VMM侧内存操作处理器 - VMEXIT时读取共享上下文执行物理内存操作
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData - VCPU上下文(RBX=共享上下文PA, RAX=返回值)
+ * @note 按页遍历目标VA, 翻译PA后逐页拷贝, 支持最大1MB单次请求
+ */
 VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData)
 {
     if (!vpData) return;
@@ -254,10 +290,9 @@ VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData)
     vpData->Guest_gpr.Rax = (resultStatus == 0) ? bytesProcessed : (UINT64)resultStatus;
 }
 
-// ================================================================
-// Guest-side functions - called from IOCTL handler
-// These set up the shared context and fire the hypercall
-// ================================================================
+/* ========================================================================
+ *  Guest-side functions - called from IOCTL handler *  These set up the shared context and fire the hypercall
+ * ======================================================================== */
 
 // Get CR3 of target process
 static ULONG64 GetProcessCr3(ULONG64 TargetPid)
@@ -277,6 +312,16 @@ static ULONG64 GetProcessCr3(ULONG64 TargetPid)
     return cr3;
 }
 
+/**
+ * @brief Guest侧读取目标进程内存 - 通过CPUID超级调用触发VMM执行物理拷贝
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in]  TargetPid - 目标进程PID
+ * @param [in]  Address   - 目标进程中的虚拟地址
+ * @param [out] Buffer    - 读取数据的输出缓冲区
+ * @param [in]  Size      - 读取字节数
+ * @return 成功返回STATUS_SUCCESS
+ */
 NTSTATUS HvReadProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZE_T Size)
 {
     if (!g_HvSharedContext || !Buffer || Size == 0) {
@@ -340,6 +385,16 @@ NTSTATUS HvReadProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZ
     return status;
 }
 
+/**
+ * @brief Guest侧写入目标进程内存 - 通过CPUID超级调用触发VMM执行物理拷贝
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] TargetPid - 目标进程PID
+ * @param [in] Address   - 目标进程中的虚拟地址
+ * @param [in] Buffer    - 要写入的数据缓冲区
+ * @param [in] Size      - 写入字节数
+ * @return 成功返回STATUS_SUCCESS
+ */
 NTSTATUS HvWriteProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZE_T Size)
 {
     if (!g_HvSharedContext || !Buffer || Size == 0) {

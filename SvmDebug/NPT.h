@@ -1,4 +1,11 @@
-﻿#pragma once
+﻿/**
+ * @file NPT.h
+ * @brief 嵌套页表(NPT)管理头文件 - NPT条目结构体与函数声明
+ * @author yewilliam
+ * @date 2026/02/06
+ */
+
+#pragma once
 #include "Common.h"
 
 typedef struct _VCPU_CONTEXT* PVCPU_CONTEXT;
@@ -65,3 +72,8 @@ NTSTATUS SetNptPagePermissions(PVCPU_CONTEXT vpData, ULONG64 TargetPa, ULONG Per
 NTSTATUS GPaToHostPa(PNPT_CONTEXT npt_context);
 PNPT_ENTRY GetNptPteByHostPa(PVCPU_CONTEXT vpData, ULONG64 TargetPa);
 NTSTATUS PreSplitLargePageByPa(PVCPU_CONTEXT vpData, ULONG64 TargetPa);
+
+// 【新增】预热 PT 虚拟地址缓存 - 在 Hook 激活前调用
+// 确保所有 VMEXIT 中需要访问的 PT 表 VA 都已缓存
+_IRQL_requires_max_(PASSIVE_LEVEL)
+VOID PrewarmPtVaCache(PVCPU_CONTEXT vpData);

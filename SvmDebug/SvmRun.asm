@@ -1,94 +1,93 @@
+; =========================================================================
+; @file SvmRun.asm
+; @brief SVM VM Launch Assembly - VMRUN/VMSAVE/VMLOAD and stack switching
+; @author yewilliam
+; @date 2026/02/06
+;
+; Core routines:
+;   SvLaunchVm        - Save Host -> Load Guest -> VMRUN -> Save Guest -> Restore Host
+;   SvEnterVmmOnNewStack - Switch to Host independent stack then enter HostLoop
+;   SvSwitchStack     - Exit SVM: switch from Host stack back to Guest stack via IRETQ
+;
+; Macros:
+;   PUSHAQ / POPAQ    - Push/pop all 16 general purpose registers
+;   SAVEGPR / LOADGPR - Save/load GPRs to/from GUEST_GPR structure
+; =========================================================================
 OPTION CASEMAP:NONE
 
-;常量定义
-GuestVmcbPaOffset EQU 30F0h
-GuestGPR EQU 3000h
-GuestStateSaveAreaRSP EQU 5D8h
-HostStackTopOffset EQU 5020h
-
-HostVmcbPaOffset EQU 30F8h
-
+; =========================================================================
+; VCPU_CONTEXT field offsets (must match C++ struct layout)
+; =========================================================================
+GuestVmcbPaOffset   EQU 30F0h
+HostVmcbPaOffset    EQU 30F8h
+GuestGPR            EQU 3000h
+GuestStateSaveRSP   EQU 5D8h
+HostStackTopOffset  EQU 5020h
 
 PUBLIC SvLaunchVm
 PUBLIC SvEnterVmmOnNewStack
 PUBLIC SvSwitchStack
 EXTERN HostLoop:PROC
 
-
 .CODE
 
-
-
-;---------------------------------------------------------------------
-; 定义一个宏，保存通用寄存器
-;---------------------------------------------------------------------
+; =========================================================================
+; @brief PUSHAQ macro - push all 16 general purpose registers
+; @note Pushes a dummy value for RSP (will be discarded on POPAQ)
+; =========================================================================
 PUSHAQ macro
-        push    rax
-        push    rcx
-        push    rdx
-        push    rbx
-        push    -1      ; Dummy for rsp.
-        push    rbp
-        push    rsi
-        push    rdi
-        push    r8
-        push    r9
-        push    r10
-        push    r11
-        push    r12
-        push    r13
-        push    r14
-        push    r15
-        endm
+    push    rax
+    push    rcx
+    push    rdx
+    push    rbx
+    push    -1          ; Dummy for RSP
+    push    rbp
+    push    rsi
+    push    rdi
+    push    r8
+    push    r9
+    push    r10
+    push    r11
+    push    r12
+    push    r13
+    push    r14
+    push    r15
+endm
 
-;---------------------------------------------------------------------
-; 定义一个宏，保存通用寄存器
-;---------------------------------------------------------------------
+; =========================================================================
+; @brief POPAQ macro - pop all 16 general purpose registers
+; @note The dummy RSP slot is consumed by a redundant RBX pop
+; =========================================================================
 POPAQ macro
-        pop     r15
-        pop     r14
-        pop     r13
-        pop     r12
-        pop     r11
-        pop     r10
-        pop     r9
-        pop     r8
-        pop     rdi
-        pop     rsi
-        pop     rbp
-        pop     rbx    ; Dummy for rsp (this value is destroyed by the next pop).
-        pop     rbx
-        pop     rdx
-        pop     rcx
-        pop     rax
-        endm
+    pop     r15
+    pop     r14
+    pop     r13
+    pop     r12
+    pop     r11
+    pop     r10
+    pop     r9
+    pop     r8
+    pop     rdi
+    pop     rsi
+    pop     rbp
+    pop     rbx         ; Dummy RSP slot (value discarded)
+    pop     rbx
+    pop     rdx
+    pop     rcx
+    pop     rax
+endm
 
-;---------------------------------------------------------------------
-; 定义一个宏，将通用寄存器保存到guest State
-;typedef struct _GUEST_GPR
-;{
-;    UINT64 Rax;   // 0x00
-;    UINT64 Rbx;   // 0x08
-;    UINT64 Rcx;   // 0x10
-;    UINT64 Rdx;   // 0x18
-;    UINT64 Rsi;   // 0x20
-;    UINT64 Rdi;   // 0x28
-;    UINT64 Rbp;   // 0x30
-;    UINT64 R8;    // 0x38
-;    UINT64 R9;    // 0x40
-;    UINT64 R10;   // 0x48
-;    UINT64 R11;   // 0x50
-;    UINT64 R12;   // 0x58
-;    UINT64 R13;   // 0x60
-;    UINT64 R14;   // 0x68
-;    UINT64 R15;   // 0x70
-;} GUEST_GPR, * PGUEST_GPR;
-;---------------------------------------------------------------------
-
+; =========================================================================
+; @brief SAVEGPR macro - save Guest GPRs from CPU registers to GUEST_GPR struct
+; @note RAX on stack at [RSP+88h] points to GUEST_GPR base
+;
+; GUEST_GPR layout:
+;   +00h RAX, +08h RBX, +10h RCX, +18h RDX, +20h RSI, +28h RDI,
+;   +30h RBP, +38h R8,  +40h R9,  +48h R10, +50h R11, +58h R12,
+;   +60h R13, +68h R14, +70h R15
+; =========================================================================
 SAVEGPR macro
-    ;PUSH RDX
-    ;MOV [RSP+00H],RAX
-    MOV RAX,[RSP+88H]
+    MOV RAX,[RSP+88H]       ; RAX = pointer to GUEST_GPR struct
     MOV [RAX+08H],RBX
     MOV [RAX+10H],RCX
     MOV [RAX+18H],RDX
@@ -103,80 +102,76 @@ SAVEGPR macro
     MOV [RAX+60H],R13
     MOV [RAX+68H],R14
     MOV [RAX+70H],R15
-    ;POP RDX
-    endm
+endm
 
-;---------------------------------------------------------------------
-; 定义一个宏，将host/guest加载到通用寄存器
-;---------------------------------------------------------------------
+; =========================================================================
+; @brief LOADGPR macro - load GPRs from GUEST_GPR struct into CPU registers
+; @note RAX must point to GUEST_GPR base on entry; RAX loaded last
+; =========================================================================
 LOADGPR macro
-         
-    MOV RBX, [RAX+08H]          ; 加载 RBX
-    MOV RCX, [RAX+10H]          ; 加载 RCX
-    MOV RDX, [RAX+18H]          ; 加载 RDX
-    MOV RSI, [RAX+20H]          ; 加载 RSI
-    MOV RDI, [RAX+28H]          ; 加载 RDI
-    MOV RBP, [RAX+30H]          ; 加载 RBP
-    MOV R8,  [RAX+38H]          ; 加载 R8
-    MOV R9,  [RAX+40H]          ; 加载 R9
-    MOV R10, [RAX+48H]          ; 加载 R10
-    MOV R11, [RAX+50H]          ; 加载 R11
-    MOV R12, [RAX+58H]          ; 加载 R12
-    MOV R13, [RAX+60H]          ; 加载 R13
-    MOV R14, [RAX+68H]          ; 加载 R14
-    MOV R15, [RAX+70H]          ; 加载 R15
+    MOV RBX, [RAX+08H]
+    MOV RCX, [RAX+10H]
+    MOV RDX, [RAX+18H]
+    MOV RSI, [RAX+20H]
+    MOV RDI, [RAX+28H]
+    MOV RBP, [RAX+30H]
+    MOV R8,  [RAX+38H]
+    MOV R9,  [RAX+40H]
+    MOV R10, [RAX+48H]
+    MOV R11, [RAX+50H]
+    MOV R12, [RAX+58H]
+    MOV R13, [RAX+60H]
+    MOV R14, [RAX+68H]
+    MOV R15, [RAX+70H]
+    MOV RAX, [RAX+00H]      ; Load RAX last
+endm
 
-    MOV RAX, [RAX+00H]          ; 最后加载 RAX
-    endm
-;---------------------------------------------------------------------
-; VOID SvEnterVmmOnNewStack(PVCPU_CONTEXT VpData);
-;
-; 切换到 Host 独立栈，然后调用 SVMLoop(VpData)
-; 此函数永远不会返回
-;---------------------------------------------------------------------
+; =========================================================================
+; @brief Switch to Host independent stack then enter SVM Host loop
+; @param RCX = PVCPU_CONTEXT VpData
+; @note This function NEVER returns
+; =========================================================================
 SvEnterVmmOnNewStack PROC
-    ; 切换到 Host 独立栈
     MOV RSP, [RCX+HostStackTopOffset]
-    ; 按 x64 ABI 对齐 RSP 到 16 字节
-    AND RSP, 0FFFFFFFFFFFFFFF0H
-    SUB RSP, 28H 
+    AND RSP, 0FFFFFFFFFFFFFFF0H   ; 16-byte align per x64 ABI
+    SUB RSP, 28H                  ; Shadow space + alignment
     CALL HostLoop
-    ; 永远不会到这里
-    INT 3
+    INT 3                         ; Should never reach here
 SvEnterVmmOnNewStack ENDP
 
-;---------------------------------------------------------------------
-; VOID SvSwitchStack(PVCPU_CONTEXT VpData);
-; 从 Host 栈切换回 Guest 栈，关闭 SVM，并恢复系统执行流
-;---------------------------------------------------------------------
+; =========================================================================
+; @brief Exit SVM: switch from Host stack to Guest stack and IRETQ
+; @param RCX = PVCPU_CONTEXT VpData
+; @note Restores Guest segment state, disables EFER.SVME, then IRETQ
+; =========================================================================
 SvSwitchStack PROC
-    MOV R15, RCX                ; 暂存 VpData (RCX) 到 R15
+    MOV R15, RCX                 ; Save VpData in R15
 
-    ; 1. 开中断并恢复不可见寄存器 (接替之前在 C 语言里的工作)
+    ; Step 1: Enable interrupts and restore Guest hidden state
     STGI
     MOV RAX, [R15 + GuestVmcbPaOffset]
     VMLOAD RAX
 
-    ; 2. 关闭 SVM (接替之前在 C 语言里的工作)
-    MOV ECX, 0C0000080h         
+    ; Step 2: Disable SVM (clear EFER.SVME bit 12)
+    MOV ECX, 0C0000080h
     RDMSR
-    BTR EAX, 12                 
+    BTR EAX, 12
     WRMSR
 
-    ; 3. 构造 IRETQ 返回栈 (严格按 SS, RSP, RFLAGS, CS, RIP 顺序压栈)
-    MOVZX RAX, word ptr [R15 + 1420h]   ; 压入 SS
+    ; Step 3: Build IRETQ frame (SS, RSP, RFLAGS, CS, RIP)
+    MOVZX RAX, word ptr [R15 + 1420h]    ; Push SS
     PUSH RAX
-    MOV RAX, [R15 + 15D8h]              ; 压入 RSP
+    MOV RAX, [R15 + 15D8h]               ; Push RSP
     PUSH RAX
-    MOV RAX, [R15 + 1570h]              ; 压入 RFLAGS
+    MOV RAX, [R15 + 1570h]               ; Push RFLAGS
     PUSH RAX
-    MOVZX RAX, word ptr [R15 + 1410h]   ; 压入 CS
+    MOVZX RAX, word ptr [R15 + 1410h]    ; Push CS
     PUSH RAX
-    MOV RAX, [R15 + 1578h]              ; 压入 RIP
+    MOV RAX, [R15 + 1578h]               ; Push RIP
     PUSH RAX
 
-    ; 4. 恢复通用寄存器 (手动展开以防破坏刚建好的栈)
-    LEA RAX, [R15 + GuestGPR]              
+    ; Step 4: Restore Guest GPRs (manual expansion to preserve IRETQ frame)
+    LEA RAX, [R15 + GuestGPR]
     MOV RBX, [RAX+08H]
     MOV RCX, [RAX+10H]
     MOV RDX, [RAX+18H]
@@ -193,36 +188,54 @@ SvSwitchStack PROC
     MOV R15, [RAX+70H]
     MOV RAX, [RAX+00H]
 
-    ; 5. 起飞落地
+    ; Step 5: Return to Guest
     IRETQ
 SvSwitchStack ENDP
-;---------------------------------------------------------------------
-; VOID SvLaunchVm(VCPU_CONTEXT vpData);
+
+; =========================================================================
+; @brief Execute one VMRUN cycle: save Host, load+run Guest, save Guest, restore Host
+; @param RCX = PVCPU_CONTEXT VpData
 ;
-; RCX = Guestvmcb
-; 
-;---------------------------------------------------------------------
+; Flow: PUSHAQ -> VMSAVE(Host) -> VMLOAD(Guest) -> LOADGPR -> VMRUN
+;       -> SAVEGPR -> VMSAVE(Guest) -> VMLOAD(Host) -> POPAQ -> RET
+; =========================================================================
 SvLaunchVm PROC
     PUSHAQ
-    SUB RSP,100H
-    MOV RAX,[RCX+HostVmcbPaOffset]
-    MOV [RSP+78H],RAX                   ;HostVmcbPa
+    SUB RSP, 100H
+
+    ; Save Host VMCB state
+    MOV RAX, [RCX+HostVmcbPaOffset]
+    MOV [RSP+78H], RAX               ; Store HostVmcbPa on stack
     VMSAVE RAX
-    MOV RAX,[RCX+GuestVmcbPaOffset]     ;GuestVmcbPa
-    MOV [RSP+80H],RAX                   ;GuestVmcbPa
+
+    ; Load Guest VMCB state
+    MOV RAX, [RCX+GuestVmcbPaOffset]
+    MOV [RSP+80H], RAX               ; Store GuestVmcbPa on stack
     VMLOAD RAX
-    LEA RAX,[RCX+GuestGPR]              ;GuestGPR
-    MOV [RSP+88H],RAX                   ;GuestGPR
+
+    ; Load Guest GPRs from GUEST_GPR struct
+    LEA RAX, [RCX+GuestGPR]
+    MOV [RSP+88H], RAX               ; Store GuestGPR pointer on stack
     LOADGPR
-    MOV RAX,[RSP+80H]                   ;GuestVmcbPa
+
+    ; Execute Guest (VMRUN blocks until VMEXIT)
+    MOV RAX, [RSP+80H]               ; GuestVmcbPa
     VMRUN RAX
-    ;被拦截到这个地方
+
+    ; --- VMEXIT occurred, now back in Host ---
+
+    ; Save Guest GPRs back to GUEST_GPR struct
     SAVEGPR
-    MOV RAX,[RSP+80H]
+
+    ; Save Guest VMCB hidden state
+    MOV RAX, [RSP+80H]
     VMSAVE RAX
-    MOV RAX,[RSP+78H]
+
+    ; Restore Host VMCB hidden state
+    MOV RAX, [RSP+78H]
     VMLOAD RAX
-    ADD RSP,100H
+
+    ADD RSP, 100H
     POPAQ
     RET
 

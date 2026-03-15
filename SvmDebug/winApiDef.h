@@ -1,3 +1,14 @@
+﻿/**
+ * @file winApiDef.h
+ * @brief Windows API定义 - 函数指针typedef、系统信息结构体、Win32k窗口结构体
+ * @author yewilliam
+ * @date 2026/02/06
+ *
+ * 包含所有Hook目标函数的函数指针类型定义，
+ * SystemProcessInformation/HandleInformation等系统信息结构体，
+ * 以及Win32k tagWND/THREADINFO等最小窗口结构体定义。
+ */
+
 #pragma once
 #include <ntifs.h>
 
@@ -7,6 +18,17 @@ _sgdt(
     _Out_ PVOID Descriptor
 );
 
+/* ========================================================================
+ *  SVM_HWND ���� �� ȫ��Ψһ����
+ * ======================================================================== */
+#ifndef SVM_HWND_DEFINED
+#define SVM_HWND_DEFINED
+typedef HANDLE SVM_HWND;
+#endif
+
+/* ========================================================================
+ *  ϵͳ��Ϣö��
+ * ======================================================================== */
 typedef enum _SYSTEM_INFORMATION_CLASS {
     SystemBasicInformation = 0,
     SystemProcessInformation = 5,
@@ -14,18 +36,9 @@ typedef enum _SYSTEM_INFORMATION_CLASS {
     SystemExtendedHandleInformation = 64,
 } SYSTEM_INFORMATION_CLASS;
 
-typedef enum _PROCESSINFOCLASS_EX {
-    ProcessBasicInformation_Ex = 0,
-    ProcessDebugPort_Ex = 7,
-    ProcessWow64Information_Ex = 26,
-    ProcessImageFileName_Ex = 27,
-    ProcessBreakOnTermination_Ex = 29,
-    ProcessDebugObjectHandle_Ex = 30,
-    ProcessDebugFlags_Ex = 31,
-    ProcessHandleInformation_Ex = 51,
-    ProcessImageFileNameWin32_Ex = 43,
-} PROCESSINFOCLASS_EX;
-
+/* ========================================================================
+ *  ϵͳ������Ϣ�ṹ��
+ * ======================================================================== */
 typedef struct _SYSTEM_PROCESS_INFORMATION {
     ULONG NextEntryOffset;
     ULONG NumberOfThreads;
@@ -97,165 +110,133 @@ typedef struct _SVM_HANDLE_INFO_EX {
     SVM_HANDLE_ENTRY_EX Handles[1];
 } SVM_HANDLE_INFO_EX, * PSVM_HANDLE_INFO_EX;
 
-// ================================================================
-// SSDT function pointer typedefs
-// ================================================================
-
+/* ========================================================================
+ *  SSDT ����ָ��
+ * ======================================================================== */
 typedef NTSTATUS(NTAPI* FnNtQuerySystemInformation)(
     SYSTEM_INFORMATION_CLASS SystemInformationClass,
-    PVOID SystemInformation,
-    ULONG SystemInformationLength,
-    PULONG ReturnLength
-    );
+    PVOID SystemInformation, ULONG SystemInformationLength, PULONG ReturnLength);
 
 typedef NTSTATUS(NTAPI* FnNtOpenProcess)(
-    PHANDLE ProcessHandle,
-    ACCESS_MASK DesiredAccess,
-    POBJECT_ATTRIBUTES ObjectAttributes,
-    PCLIENT_ID ClientId
-    );
-
-typedef NTSTATUS(NTAPI* FnNtReadVirtualMemory)(
-    HANDLE ProcessHandle,
-    PVOID BaseAddress,
-    PVOID Buffer,
-    SIZE_T BufferSize,
-    PSIZE_T NumberOfBytesRead
-    );
-
-typedef NTSTATUS(NTAPI* FnNtWriteVirtualMemory)(
-    HANDLE ProcessHandle,
-    PVOID BaseAddress,
-    PVOID Buffer,
-    SIZE_T BufferSize,
-    PSIZE_T NumberOfBytesWritten
-    );
+    PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId);
 
 typedef NTSTATUS(NTAPI* FnNtQueryInformationProcess)(
-    HANDLE ProcessHandle,
-    ULONG ProcessInformationClass,
-    PVOID ProcessInformation,
-    ULONG ProcessInformationLength,
-    PULONG ReturnLength
-    );
+    HANDLE ProcessHandle, ULONG ProcessInformationClass,
+    PVOID ProcessInformation, ULONG ProcessInformationLength, PULONG ReturnLength);
 
 typedef NTSTATUS(NTAPI* FnNtQueryVirtualMemory)(
-    HANDLE ProcessHandle,
-    PVOID BaseAddress,
-    ULONG MemoryInformationClass,
-    PVOID MemoryInformation,
-    SIZE_T MemoryInformationLength,
-    PSIZE_T ReturnLength
-    );
+    HANDLE ProcessHandle, PVOID BaseAddress, ULONG MemoryInformationClass,
+    PVOID MemoryInformation, SIZE_T MemoryInformationLength, PSIZE_T ReturnLength);
 
 typedef NTSTATUS(NTAPI* FnNtDuplicateObject)(
-    HANDLE SourceProcessHandle,
-    HANDLE SourceHandle,
-    HANDLE TargetProcessHandle,
-    PHANDLE TargetHandle,
-    ACCESS_MASK DesiredAccess,
-    ULONG HandleAttributes,
-    ULONG Options
-    );
+    HANDLE SourceProcessHandle, HANDLE SourceHandle,
+    HANDLE TargetProcessHandle, PHANDLE TargetHandle,
+    ACCESS_MASK DesiredAccess, ULONG HandleAttributes, ULONG Options);
 
 typedef NTSTATUS(NTAPI* FnNtGetNextProcess)(
-    HANDLE ProcessHandle,
-    ACCESS_MASK DesiredAccess,
-    ULONG HandleAttributes,
-    ULONG Flags,
-    PHANDLE NewProcessHandle
-    );
+    HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
+    ULONG HandleAttributes, ULONG Flags, PHANDLE NewProcessHandle);
 
 typedef NTSTATUS(NTAPI* FnNtGetNextThread)(
-    HANDLE ProcessHandle,
-    HANDLE ThreadHandle,
-    ACCESS_MASK DesiredAccess,
-    ULONG HandleAttributes,
-    ULONG Flags,
-    PHANDLE NewThreadHandle
-    );
+    HANDLE ProcessHandle, HANDLE ThreadHandle,
+    ACCESS_MASK DesiredAccess, ULONG HandleAttributes,
+    ULONG Flags, PHANDLE NewThreadHandle);
 
+typedef NTSTATUS(NTAPI* FnNtReadVirtualMemory)(
+    HANDLE ProcessHandle, PVOID BaseAddress,
+    PVOID Buffer, SIZE_T Size, PSIZE_T NumberOfBytesRead);
+
+typedef NTSTATUS(NTAPI* FnNtWriteVirtualMemory)(
+    HANDLE ProcessHandle, PVOID BaseAddress,
+    PVOID Buffer, SIZE_T Size, PSIZE_T NumberOfBytesWritten);
+
+typedef NTSTATUS(NTAPI* FnNtProtectVirtualMemory)(
+    HANDLE ProcessHandle, PVOID* BaseAddress,
+    PSIZE_T RegionSize, ULONG NewProtect, PULONG OldProtect);
+
+typedef NTSTATUS(NTAPI* FnNtTerminateProcess)(
+    HANDLE ProcessHandle, NTSTATUS ExitStatus);
+
+typedef NTSTATUS(NTAPI* FnNtCreateThreadEx)(
+    PHANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
+    POBJECT_ATTRIBUTES ObjectAttributes, HANDLE ProcessHandle,
+    PVOID StartRoutine, PVOID Argument,
+    ULONG CreateFlags, SIZE_T ZeroBits,
+    SIZE_T StackSize, SIZE_T MaximumStackSize,
+    PVOID AttributeList);
+
+/* ========================================================================
+ *  �ں˵�������ָ��
+ * ======================================================================== */
 typedef NTSTATUS(NTAPI* FnPsLookupProcessByProcessId)(
-    _In_ HANDLE ProcessId,
-    _Out_ PEPROCESS* Process
-    );
+    HANDLE ProcessId, PEPROCESS* Process);
 
 typedef NTSTATUS(NTAPI* FnPsLookupThreadByThreadId)(
-    _In_ HANDLE ThreadId,
-    _Out_ PETHREAD* Thread
-    );
+    HANDLE ThreadId, PETHREAD* Thread);
 
 typedef NTSTATUS(NTAPI* FnObReferenceObjectByHandle)(
-    _In_ HANDLE Handle,
-    _In_ ACCESS_MASK DesiredAccess,
-    _In_opt_ POBJECT_TYPE ObjectType,
-    _In_ KPROCESSOR_MODE AccessMode,
-    _Out_ PVOID* Object,
-    _Out_opt_ POBJECT_HANDLE_INFORMATION HandleInformation
-    );
+    HANDLE Handle, ACCESS_MASK DesiredAccess,
+    POBJECT_TYPE ObjectType, KPROCESSOR_MODE AccessMode,
+    PVOID* Object, POBJECT_HANDLE_INFORMATION HandleInformation);
 
 typedef NTSTATUS(NTAPI* FnMmCopyVirtualMemory)(
-    _In_ PEPROCESS FromProcess,
-    _In_ PVOID FromAddress,
-    _In_ PEPROCESS ToProcess,
-    _Out_ PVOID ToAddress,
-    _In_ SIZE_T BufferSize,
-    _In_ KPROCESSOR_MODE PreviousMode,
-    _Out_ PSIZE_T NumberOfBytesCopied
-    );
-
-typedef VOID(NTAPI* FnKeStackAttachProcess)(
-    _Inout_ PRKPROCESS Process,
-    _Out_ PRKAPC_STATE ApcState
-    );
+    PEPROCESS FromProcess, PVOID FromAddress,
+    PEPROCESS ToProcess, PVOID ToAddress,
+    SIZE_T BufferSize, KPROCESSOR_MODE PreviousMode,
+    PSIZE_T NumberOfBytesCopied);
 
 typedef PETHREAD(NTAPI* FnPsGetNextProcessThread)(
-    _In_ PEPROCESS Process,
-    _In_opt_ PETHREAD Thread
-    );
+    PEPROCESS Process, PETHREAD Thread);
 
-// ================================================================
-// SSSDT (Shadow SSDT / Win32k) function pointer typedefs
-// ================================================================
-#ifndef SVM_HWND_DEFINED
-#define SVM_HWND_DEFINED
-typedef HANDLE SVM_HWND;
-#endif
+typedef VOID(NTAPI* FnKeStackAttachProcess)(
+    PEPROCESS Process, PKAPC_STATE ApcState);
 
-// NtUserFindWindowEx - shadow syscall for window enumeration
+/* ========================================================================
+ *  SSSDT (Win32k) ����ָ��
+ * ======================================================================== */
 typedef SVM_HWND(NTAPI* FnNtUserFindWindowEx)(
-    _In_opt_ SVM_HWND hwndParent,
-    _In_opt_ SVM_HWND hwndChildAfter,
-    _In_opt_ PUNICODE_STRING lpszClass,
-    _In_opt_ PUNICODE_STRING lpszWindow,
-    _In_ ULONG dwType
-    );
+    SVM_HWND hwndParent, SVM_HWND hwndChildAfter,
+    PUNICODE_STRING lpszClass, PUNICODE_STRING lpszWindow, ULONG dwType);
 
-// NtUserWindowFromPoint - shadow syscall for point-to-window lookup
 typedef SVM_HWND(NTAPI* FnNtUserWindowFromPoint)(
-    _In_ LONG x,
-    _In_ LONG y
-    );
+    LONG x, LONG y);
 
-// ValidateHwnd - win32k internal, validates HWND and returns tagWND*
 typedef PVOID(NTAPI* FnValidateHwnd)(
-    _In_ SVM_HWND hwnd
-    );
+    SVM_HWND hwnd);
 
-// ================================================================
-// Unexported ntoskrnl function typedefs
-// ================================================================
+// NtUserBuildHwndList (Win10 8������)
+typedef NTSTATUS(NTAPI* FnNtUserBuildHwndList)(
+    HANDLE hdesk, SVM_HWND hwndNext, ULONG fEnumChildren,
+    ULONG bRemoveImmersive, ULONG idThread,
+    ULONG cHwndMax, SVM_HWND* phwndFirst, ULONG* pcHwndNeeded);
 
-// PspReferenceCidTableEntry - internal CID table lookup
-// Used by PsLookupProcessByProcessId / PsLookupThreadByThreadId internally
+/* ========================================================================
+ *  �ڲ�δ��������ָ��
+ * ======================================================================== */
 typedef PVOID(NTAPI* FnPspReferenceCidTableEntry)(
-    _In_ HANDLE Id,
-    _In_ BOOLEAN IsThread
-    );
+    HANDLE Id, BOOLEAN IsThread);
 
-// ================================================================
-// Extern declarations
-// ================================================================
+/* ========================================================================
+ *  Extern ����
+ * ======================================================================== */
+
+/* ========================================================================
+ *  Win32k minimal structures for ValidateHwnd Hook *  tagWND+0x10 -> pti (THREADINFO*), pti+0x00 -> pEThread
+ * ======================================================================== */
+#pragma pack(push, 8)
+typedef struct _SVM_W32THREAD {
+    PETHREAD pEThread;           // +0x00
+} SVM_W32THREAD, *PSVM_W32THREAD;
+
+typedef struct _SVM_WND {
+    PVOID           hHandle;     // +0x00 HEAD.h
+    ULONG           cLockObj;    // +0x08 HEAD.cLockObj
+    ULONG           _pad;        // +0x0C
+    PSVM_W32THREAD  pti;         // +0x10 THROBJHEAD.pti
+} SVM_WND, *PSVM_WND;
+#pragma pack(pop)
+
 EXTERN_C NTSTATUS NTAPI NtQuerySystemInformation(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
 EXTERN_C NTSTATUS NTAPI NtReadVirtualMemory(HANDLE, PVOID, PVOID, SIZE_T, PSIZE_T);
 EXTERN_C NTKERNELAPI PVOID NTAPI PsGetProcessWow64Process(PEPROCESS Process);

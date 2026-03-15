@@ -1,141 +1,192 @@
-﻿#include "Common.h"
+﻿/**
+ * @file Common.cpp
+ * @brief CPU硬件支持检测实现 - AMD/Intel虚拟化能力检查
+ * @author yewilliam
+ * @date 2026/02/06
+ *
+ * 实现CPU厂商检测、BIOS开关检查、SVM/VMX硬件支持验证等功能。
+ * 在启用SVM前，软件应按AMD APM规定的算法检测SVM可用性。
+ */
 
-//在启用SVM前，软件应通过以下算法检测是否可启用SVM：
-//如果 CPUID Fn8000_0001_ECX[SVM] == 0
-//则返回 SVM_NOT_AVAIL；
-//如果 VM_CR.SVMDIS == 0
-//返回 SVM_ALLOWED;
-//如果 CPUID Fn8000_000A_EDX[SVML] == 0
-//返回 SVM_BIOS_未解锁时禁用
-// 用户必须更改平台固件设置以启用SVM，否则返回SVM_DISABLED_WITH_KEY；
-// SVMLock可能可解锁；请咨询平台固件或TPM以获取密钥。
+#include "Common.h"
 
-//获得cpu型号
-void CommGetCPUName(char* vendor, SIZE_T size) {
+/* ========================================================================
+ *  SVM 可用性检测算法 (AMD APM Vol.2 Section 15.4):
+ *    1. CPUID Fn8000_0001_ECX[SVM] == 0  -> SVM_NOT_AVAIL
+ *    2. VM_CR.SVMDIS == 0                -> SVM_ALLOWED
+ *    3. CPUID Fn8000_000A_EDX[SVML] == 0 -> SVM_DISABLED_BY_BIOS
+ *    4. else                              -> SVM_DISABLED_WITH_KEY
+ * ======================================================================== */
+
+/**
+ * @brief 获取CPU厂商名称字符串 - 通过CPUID leaf 0读取12字节Vendor ID
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [out] vendor - 输出厂商名称缓冲区 (如"AuthenticAMD"或"GenuineIntel")
+ * @param [in]  size   - 缓冲区大小(建议>=13字节)
+ */
+void CommGetCPUName(char* vendor, SIZE_T size)
+{
 	int cpuinfo[4] = { 0 };
 	char tmp[13] = { 0 };
 	__cpuidex(cpuinfo, 0, 0);
 
+	/* CPUID leaf 0 返回: EBX+EDX+ECX 拼成12字节厂商字符串 */
 	memcpy(tmp, &cpuinfo[1], 4);
 	memcpy(tmp + 4, &cpuinfo[3], 4);
 	memcpy(tmp + 8, &cpuinfo[2], 4);
 	memcpy(vendor, tmp, size);
-
-	return;
 }
-//检查intel固件开关
+
+/**
+ * @brief 检查Intel BIOS是否启用VMX - 读取IA32_FEATURE_CONTROL MSR
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return TRUE表示bit0(Lock)和bit2(VMX outside SMX)均为1, FALSE表示未启用
+ */
 BOOLEAN CommCheckIntelBios()
 {
-	//BIOS 检测：当第 0 位和第 2 位都为 1 时通过
 	ULONG64 bios = __readmsr(MSR_IA32_INTEL_FEATURE_CONTROL);
-	ULONG64 result = bios & 5;
+	ULONG64 result = bios & 5;  /* 检查 bit0(Lock) + bit2(VMXON) */
 	return (result == 5);
 }
-//检查AMD固件开关
+
+/**
+ * @brief 检查AMD VM_CR.SVMDIS位 - 判断SVM是否被固件禁用
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return TRUE表示SVMDIS=0(SVM可用), FALSE表示SVMDIS=1(SVM被禁用)
+ */
 BOOLEAN CommCheckAMDLock()
 {
-	// 1. 读取 AMD 虚拟机控制寄存器 (VM_CR)
 	ULONG64 VmCr = __readmsr(SVM_MSR_VM_CR);
 
-	// 2. 检查 SVMDIS (Bit 4)
-	// 如果 SVMDIS 为 0，说明 SVM 是完全开启且允许使用的！
+	/* SVMDIS = bit4, 为0表示SVM未被禁用 */
 	if ((VmCr & (1ULL << 4)) == 0) {
-		return TRUE; // 安全，放行！
+		return TRUE;
 	}
 
-	// 如果 SVMDIS 为 1，说明 SVM 确实被禁用了。此时才需要去区分是被 BIOS 禁用，还是被 Key 锁定。
+	/* SVMDIS=1, SVM被禁用, 需进一步区分是BIOS禁用还是Key锁定 */
 	return FALSE;
 }
 
-//检查intel cpu硬件是否支持
+/**
+ * @brief 检查Intel CPU硬件VMX支持 - 读取CPUID.1:ECX[5]
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return TRUE表示CPU支持VMX, FALSE表示不支持
+ */
 BOOLEAN CommCheckIntelCpuid()
 {
-	//Intel CPUID 检测
 	int cpuinfo[4] = { 0 };
 	__cpuidex(cpuinfo, 1, 0);
 	ULONG64 result = (cpuinfo[2] >> 5) & 1;
 	return (result == 1);
 }
 
-//检查amd cpu硬件是否支持
+/**
+ * @brief 检查AMD CPU硬件SVM支持 - 读取CPUID Fn8000_0001_ECX[SVM] (bit2)
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return TRUE表示CPU支持SVM, FALSE表示不支持
+ */
 BOOLEAN CommCheckAMDCpuid()
 {
 	int CPUinfo[4] = { 0 };
-	//检测 CPUID Fn8000_0001_ECX[SVM] == 0
 	__cpuidex(CPUinfo, CPUID_PROCESSOR_AND_PROCESSOR_FEATURE_IDENTIFIERS_EX, 0);
 	BOOLEAN bCpu = (CPUinfo[2] >> 2) & 1;
 	return bCpu;
 }
 
-//检查系统是否支持
+/**
+ * @brief 检查CR4.VMXE位 - 确认系统未被其他Hypervisor占用
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return TRUE表示CR4.VMXE(bit13)未置位(可用), FALSE表示已被占用
+ */
 BOOLEAN CommCheckCr4()
 {
 	ULONG64 cr4 = __readcr4();
 	cr4 = cr4 >> 13;
-
 	return !(cr4 & 1);
 }
-//检查AMD是否锁住SVM
+
+/**
+ * @brief 检查AMD SVM锁定状态 - 读取CPUID Fn8000_000A_EDX[SVML] (bit2)
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return TRUE表示SVM未被BIOS锁定, FALSE表示已锁定
+ * @note SVML=0表示不支持SVM锁定(即未被锁), 取反后返回TRUE统一接口语义
+ */
 BOOLEAN CommCheckAMDBios()
 {
 	int CPUinfo[4] = { 0 };
-	//检测 CPUID Fn8000_000A_EDX[SVML] == 0
 	__cpuidex(CPUinfo, CPUID_SVM_FEATURES, 0);
-	//SVM锁定。表示支持SVM锁定。参见“启用SVM”。
 	BOOLEAN bBios = (CPUinfo[3] >> 2) & 1;
-	//如果等于0的话说明svm没有锁定，取反的原因就是要统一返回true;
-	return !bBios;
+	return !bBios;  /* 取反: SVML=0 -> 未锁定 -> 返回TRUE */
 }
 
+/**
+ * @brief 获取AMD SVML特征位原始值 - 不做取反, 返回硬件实际值
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return 1表示支持SVM锁定特征, 0表示不支持
+ */
 BOOLEAN CommCheckAMDSvmlFeature()
 {
 	int CPUinfo[4] = { 0 };
 	__cpuidex(CPUinfo, CPUID_SVM_FEATURES, 0);
-	return (CPUinfo[3] >> 2) & 1; // 直接返回真实的 SVML 位的值，不需要取反
+	return (CPUinfo[3] >> 2) & 1;
 }
 
+/**
+ * @brief Intel平台综合虚拟化支持检查 - BIOS + CPUID + CR4 三重验证
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return TRUE表示Intel平台完全支持虚拟化, FALSE表示任一检查未通过
+ */
 BOOLEAN CommCheckIntelsupport()
 {
 	char vendor[13] = { 0 };
-	BOOLEAN bBios = 0;
+	BOOLEAN bBios  = 0;
 	BOOLEAN bCpuid = 0;
-	BOOLEAN bCr4 = 0;
+	BOOLEAN bCr4   = 0;
+
 	CommGetCPUName(vendor, sizeof(vendor));
-	bBios = CommCheckIntelBios();
+	bBios  = CommCheckIntelBios();
 	bCpuid = CommCheckIntelCpuid();
-	bCr4 = CommCheckCr4();
-	DbgPrint("current cpu number:%d, cpu name :%s,bBios:%d,bCpuid:%d,bCr4:%d \n"
-		, KeGetCurrentProcessorNumber(), vendor, bBios, bCpuid, bCr4);
+	bCr4   = CommCheckCr4();
+
+	DbgPrint("current cpu number:%d, cpu name:%s, bBios:%d, bCpuid:%d, bCr4:%d\n",
+		KeGetCurrentProcessorNumber(), vendor, bBios, bCpuid, bCr4);
 	return (bBios && bCpuid && bCr4);
 }
+
+/**
+ * @brief AMD平台综合SVM支持检查 - 按AMD APM规定算法逐步验证
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return TRUE表示AMD SVM完全可用, FALSE表示不支持或被禁用
+ * @note 检查顺序: CPUID硬件支持 -> VM_CR.SVMDIS -> SVML锁定特征
+ */
 BOOLEAN CommCheckAMDsupport()
 {
-	// 1. 检查 CPU 硬件是否支持 SVM
+	/* Step 1: 检查CPU硬件是否支持SVM */
 	if (!CommCheckAMDCpuid()) {
-		//DbgPrint("SVM is not supported by this CPU.\n");
-		return FALSE; // 修改：返回 FALSE
+		return FALSE;
 	}
 
-	// 2. 检查 VM_CR 寄存器
+	/* Step 2: 检查VM_CR.SVMDIS, 为0则SVM畅通无阻 */
 	if (CommCheckAMDLock()) {
-		// VM_CR.SVMDIS == 0，说明 SVM 畅通无阻，直接返回可用！
-		//DbgPrint("SVM is enabled and ready to use.\n");
-		return TRUE;  // 修改：完美通过，必须返回 TRUE！
+		return TRUE;
 	}
 
-	// 3. 只有走到这里，才说明 SVM 被禁用了 (VM_CR.SVMDIS == 1)。
+	/* Step 3: SVMDIS=1, 区分BIOS禁用 vs Key锁定 */
 	BOOLEAN bSvml = CommCheckAMDSvmlFeature();
-
 	if (bSvml == 0) {
-		//DbgPrint("SVM disabled by BIOS. User must change firmware settings.\n");
-		return FALSE; // 修改：返回 FALSE
+		return FALSE;  /* SVML=0: 被BIOS禁用, 需用户修改固件设置 */
 	}
 	else {
-		//DbgPrint("SVM disabled with key. May be unlockable via SKINIT/TPM.\n");
-		return FALSE; // 修改：返回 FALSE
+		return FALSE;  /* SVML=1: 被Key锁定, 可能需SKINIT/TPM解锁 */
 	}
 }
-
-
-
-
