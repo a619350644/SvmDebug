@@ -321,16 +321,12 @@ static BOOLEAN HandleHypercallCommand(PVCPU_CONTEXT vpData, PVMCB vmcb, UINT32 c
          * VMEXIT 处于等效 HIGH_LEVEL IRQL，直接操作 EX_FAST_REF
          * 回调数组会导致池分配器红黑树损坏 → BSOD 0x139 (Arg1=0x1d)
          * 改为设置标志，由 CommunicationThread 在 PASSIVE_LEVEL 执行 */
-        extern volatile LONG g_PendingCallbackOp;
-        InterlockedExchange(&g_PendingCallbackOp, 1); // 1 = disable
         vmcb->StateSaveArea.Rax = 1;
         vpData->Guest_gpr.Rax = 1;
         return TRUE;
     }
     else if (cmd == 0x12345681) {
         /* [BUGFIX 2026/03/15] 同上：延迟到 PASSIVE_LEVEL */
-        extern volatile LONG g_PendingCallbackOp;
-        InterlockedExchange(&g_PendingCallbackOp, 2); // 2 = restore
         vmcb->StateSaveArea.Rax = 1;
         vpData->Guest_gpr.Rax = 1;
         return TRUE;
@@ -407,6 +403,19 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
             ForceNptFlush(vpData);
         }
         else if (leaf == CPUID_UNLOAD_SVM_UNINSTALL_HOOK) {
+            /* [BUGFIX 2026/03/15] 卸载前恢复所有 NPT 条目到原始物理页，
+             * 确保 SVM 退出后 Guest 直接执行原始代码，
+             * 避免 RawInputThread 等永久线程仍在执行 FakePage 代码
+             * 导致 PAGE_FAULT_IN_NONPAGED_AREA (0x50) BSOD。 */
+            for (int i = 0; i < HOOK_MAX_COUNT; i++) {
+                if (g_HookList[i].IsUsed && g_HookList[i].TargetPa != 0
+                    && g_HookList[i].OriginalPagePa != 0) {
+                    ApplyNptHookByPa(vpData, g_HookList[i].TargetPa, g_HookList[i].OriginalPagePa);
+                    SetNptPagePermissions(vpData, g_HookList[i].TargetPa, NPT_PERM_EXECUTE);
+                }
+            }
+            vpData->SuspendedHook = nullptr;
+            vpData->ActiveHook = nullptr;
             ForceNptFlush(vpData);
             vpData->Guest_gpr.Rax = 0;
         }

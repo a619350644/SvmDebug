@@ -167,6 +167,26 @@ typedef NTSTATUS(NTAPI* FnNtCreateThreadEx)(
     PVOID AttributeList);
 
 /* ========================================================================
+ *  线程保护函数指针 (参考 EptHook demo)
+ * ======================================================================== */
+typedef NTSTATUS(NTAPI* FnNtSuspendThread)(
+    HANDLE ThreadHandle, PULONG PreviousSuspendCount);
+
+typedef NTSTATUS(NTAPI* FnNtResumeThread)(
+    HANDLE ThreadHandle, PULONG PreviousSuspendCount);
+
+typedef NTSTATUS(NTAPI* FnNtGetContextThread)(
+    HANDLE ThreadHandle, PCONTEXT ThreadContext);
+
+typedef NTSTATUS(NTAPI* FnNtSetContextThread)(
+    HANDLE ThreadHandle, PCONTEXT ThreadContext);
+
+typedef NTSTATUS(NTAPI* FnNtQueryInformationThread)(
+    HANDLE ThreadHandle, ULONG ThreadInformationClass,
+    PVOID ThreadInformation, ULONG ThreadInformationLength,
+    PULONG ReturnLength);
+
+/* ========================================================================
  *  �ں˵�������ָ��
  * ======================================================================== */
 typedef NTSTATUS(NTAPI* FnPsLookupProcessByProcessId)(

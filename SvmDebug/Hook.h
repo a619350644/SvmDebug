@@ -126,6 +126,13 @@ typedef enum _HOOK_INDEX {
     HOOK_NtTerminateProcess,
     HOOK_NtCreateThreadEx,
 
+    // ---- 线程保护 (参考 EptHook demo) ----
+    HOOK_NtSuspendThread,
+    HOOK_NtResumeThread,
+    HOOK_NtGetContextThread,
+    HOOK_NtSetContextThread,
+    HOOK_NtQueryInformationThread,
+
     // ---- 内核导出函数 ----
     HOOK_PsLookupProcessByProcessId,
     HOOK_PsLookupThreadByThreadId,

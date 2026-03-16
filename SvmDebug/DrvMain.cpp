@@ -45,6 +45,7 @@ ULONG64 g_SystemCr3 = 0;
 ULONG_PTR IpiActivateHookBroadcastCallback(ULONG_PTR Argument);
 ULONG_PTR IpiInstallBroadcastCallback(ULONG_PTR Argument);
 ULONG_PTR IpiUnloadBroadcastCallback(ULONG_PTR Argument);
+ULONG_PTR IpiUninstallHookBroadcastCallback(ULONG_PTR Argument);
 
 VOID SvmInitSystemThread(PVOID StartContext);
 VOID CommunicationThread(PVOID Context);
@@ -71,6 +72,19 @@ static VOID ReleaseDriverResources()
         g_nVMCB[i] = nullptr;
     }
     CleanupAllNptHooks();
+
+    /* [BUGFIX 2026/03/15] 最终释放 TrampolinePage。
+     * CleanupAllNptHooks 故意不释放 TrampolinePage，因为 SVM 退出后
+     * 仍有线程可能在执行 trampoline 代码。
+     * 但在 ReleaseDriverResources 调用时，已经过 drain 等待，
+     * 所有 NPT 条目已恢复为原始页，不会再有执行流进入 trampoline。
+     * 此处统一释放防止内存泄漏（26 个 Hook × 4KB = 104KB/次）。 */
+    for (int i = 0; i < HOOK_MAX_COUNT; i++) {
+        if (g_HookList[i].TrampolinePage) {
+            MmFreeContiguousMemory(g_HookList[i].TrampolinePage);
+            g_HookList[i].TrampolinePage = nullptr;
+        }
+    }
 }
 
 /* ========================================================================
@@ -247,15 +261,8 @@ VOID CommunicationThread(PVOID Context)
 
     while (!g_DriverUnloading)
     {
-        LONG cbOp = InterlockedExchange(&g_PendingCallbackOp, 0);
-        if (cbOp == 1) {
-            SvmDebugPrint("[INFO] Processing deferred callback DISABLE at PASSIVE_LEVEL\n");
-            DisableAllProcessCallbacks();
-        }
-        else if (cbOp == 2) {
-            SvmDebugPrint("[INFO] Processing deferred callback RESTORE at PASSIVE_LEVEL\n");
-            RestoreAllProcessCallbacks();
-        }
+        /* [BUGFIX 2026/03/15] 移除 g_PendingCallbackOp 处理。
+         * DisableAllProcessCallbacks 写只读内核页导致 0xBE BSOD，已禁用。 */
 
         if (g_PendingProtectPID != (HANDLE)0 && g_PendingProtectPID != g_ProtectedPID)
         {
@@ -302,14 +309,24 @@ VOID CommunicationThread(PVOID Context)
     }
     SvmDebugPrint("[INFO] Hook drain complete.\n");
 
-    RestoreAllProcessCallbacks();
+    /* [BUGFIX 2026/03/15] 不再调用 RestoreAllProcessCallbacks()，
+     * 因为从未修改过回调。 */
+
+    KeIpiGenericCall(IpiUninstallHookBroadcastCallback, 0);
+    SvmDebugPrint("[INFO] All NPT hooks deactivated (original pages restored).\n");
+
+    {
+        LARGE_INTEGER hookDrainDelay;
+        hookDrainDelay.QuadPart = -30000000LL; // 3s — 增加等待，确保 win32k 永久线程完成
+        KeDelayExecutionThread(KernelMode, FALSE, &hookDrainDelay);
+    }
 
     KeIpiGenericCall(IpiUnloadBroadcastCallback, 0);
     SvmDebugPrint("[INFO] All cores exited SVM mode.\n");
 
     {
         LARGE_INTEGER drainDelay2;
-        drainDelay2.QuadPart = -20000000LL; // 2s
+        drainDelay2.QuadPart = -30000000LL; // 3s
         KeDelayExecutionThread(KernelMode, FALSE, &drainDelay2);
     }
 
@@ -324,6 +341,7 @@ VOID CommunicationThread(PVOID Context)
     SvmDebugPrint("[INFO] Cleanup complete. System is back to normal.\n");
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
+
 
 /* ========================================================================
  *  Delayed hook activation thread
@@ -378,6 +396,19 @@ VOID DelayedHookWorkItemRoutine(PVOID Context)
     }
 
     SvmDebugPrint("[INFO] SUCCESS! TargetPa All safely resolved.\n");
+
+    /* [BUGFIX 2026/03/15] 二次校验：禁用 OriginalPagePa 或 TargetPa 为 0 的 Hook，
+     * 避免 ActivateAllNptHooks 传递无效参数给 ApplyNptHookByPa。
+     * ZwGetNextProcess 等函数在某些内核版本中 MmGetPhysicalAddress 返回 0。 */
+    for (int h = 0; h < HOOK_MAX_COUNT; h++) {
+        if (g_HookList[h].IsUsed && g_HookList[h].ResourcesReady) {
+            if (g_HookList[h].OriginalPagePa == 0 || g_HookList[h].TargetPa == 0) {
+                SvmDebugPrint("[WARN] Disabling hook %d: OrigPa=0x%llX, TargetPa=0x%llX\n",
+                    h, g_HookList[h].OriginalPagePa, g_HookList[h].TargetPa);
+                g_HookList[h].ResourcesReady = FALSE;
+            }
+        }
+    }
 
     for (ULONG cpu = 0; cpu < n_cout; cpu++) {
         for (int h = 0; h < HOOK_MAX_COUNT; h++) {
@@ -448,6 +479,15 @@ ULONG_PTR IpiUnloadBroadcastCallback(ULONG_PTR Argument)
     UNREFERENCED_PARAMETER(Argument);
     int regs[4] = { 0 };
     __cpuid(regs, CPUID_UNLOAD_SVM_DEBUG);
+    return 0;
+}
+
+/* [BUGFIX 2026/03/15] 新增：卸载前通过 IPI 让所有 CPU 恢复 NPT 映射 */
+ULONG_PTR IpiUninstallHookBroadcastCallback(ULONG_PTR Argument)
+{
+    UNREFERENCED_PARAMETER(Argument);
+    int regs[4] = { 0 };
+    __cpuid(regs, CPUID_UNLOAD_SVM_UNINSTALL_HOOK);
     return 0;
 }
 

@@ -191,14 +191,35 @@ NTSTATUS ActivateAllNptHooks(PVCPU_CONTEXT vpData)
 {
     if (vpData == nullptr) return STATUS_INVALID_PARAMETER;
 
-    NTSTATUS status = STATUS_SUCCESS;
+    ULONG okCount = 0, failCount = 0;
     for (int i = 0; i < HOOK_MAX_COUNT; ++i)
     {
-        if (g_HookList[i].IsUsed && g_HookList[i].ResourcesReady)
-        {
-            status = ActivateNptHookInNpt(vpData, &g_HookList[i]);
-            if (!NT_SUCCESS(status)) return status;
+        if (!g_HookList[i].IsUsed || !g_HookList[i].ResourcesReady)
+            continue;
+
+        /* [BUGFIX 2026/03/15] 璺宠繃 OriginalPagePa==0 鎴?TargetPa==0 鐨勬棤鏁?Hook锛?         * 閬垮厤浼犻�?0 缁?ApplyNptHookByPa 瀵艰嚧 STATUS_INVALID_PARAMETER 杩斿洖
+         * 骞朵腑鏂悗缁墍鏈?Hook 鐨勬縺娲汇�?*/
+        if (g_HookList[i].OriginalPagePa == 0 || g_HookList[i].TargetPa == 0) {
+            SvmDebugPrint("[WARN] Skipping hook slot %d: OrigPa=0x%llX, TargetPa=0x%llX\n",
+                i, g_HookList[i].OriginalPagePa, g_HookList[i].TargetPa);
+            failCount++;
+            continue;
         }
+
+        NTSTATUS status = ActivateNptHookInNpt(vpData, &g_HookList[i]);
+        if (!NT_SUCCESS(status)) {
+            SvmDebugPrint("[WARN] ActivateNptHookInNpt failed for slot %d: 0x%X (continue)\n",
+                i, status);
+            failCount++;
+            /* [BUGFIX] 涓嶅啀 return锛岀户缁縺娲诲叾浣?Hook */
+        }
+        else {
+            okCount++;
+        }
+    }
+
+    if (failCount > 0) {
+        SvmDebugPrint("[WARN] ActivateAllNptHooks: %lu ok, %lu failed\n", okCount, failCount);
     }
     return STATUS_SUCCESS;
 }
@@ -214,12 +235,35 @@ VOID CleanupAllNptHooks()
 
     for (int i = 0; i < HOOK_MAX_COUNT; ++i)
     {
-        if (g_HookList[i].IsUsed || g_HookList[i].ResourcesReady)
-            FreeNptHook(&g_HookList[i]);
+        if (!g_HookList[i].IsUsed && !g_HookList[i].ResourcesReady) continue;
+
+        /* FakePage 可以安全释放 — SVM 退出后 NPT 不再引用它 */
+        if (g_HookList[i].FakePage != nullptr) {
+            BOOLEAN shared = FALSE;
+            for (int j = 0; j < HOOK_MAX_COUNT; j++) {
+                if (j != i && g_HookList[j].IsUsed &&
+                    g_HookList[j].FakePage == g_HookList[i].FakePage) {
+                    shared = TRUE;
+                    break;
+                }
+            }
+            if (!shared) MmFreeContiguousMemory(g_HookList[i].FakePage);
+            g_HookList[i].FakePage = nullptr;
+        }
+
+        /* [BUGFIX] TrampolinePage 不释放！
+         * SVM 退出后 win32k 线程（如 RawInputThread）可能仍在执行 trampoline 代码
+         * trampoline 中的 JMP 回原函数需要 trampoline 页面存在
+         * 释放 → PAGE_FAULT 0x50 at win32kbase
+         * 泄漏 26 × 4KB = 104KB，远好过 BSOD */
+         /* g_HookList[i].TrampolinePage 故意不释放 */
+
+        g_HookList[i].IsUsed = FALSE;
+        g_HookList[i].ResourcesReady = FALSE;
     }
 
     KeReleaseSpinLock(&g_HookCleanupLock, oldIrql);
-    SvmDebugPrint("[INFO] All NPT hook resources cleaned up safely.\n");
+    SvmDebugPrint("[INFO] All NPT hook resources cleaned up (trampolines kept alive).\n");
 }
 
 PNPT_HOOK_CONTEXT FindHookByFaultPa(ULONG64 FaultPa)
@@ -614,6 +658,14 @@ NTSTATUS PrepareNptHookResources(PVOID TargetAddress, PVOID ProxyFunction, PNPT_
     HookContext->ProxyFunction = ProxyFunction;
     HookContext->OriginalPageBase = (PVOID)((UINT64)TargetAddress & ~(PAGE_SIZE - 1));
     HookContext->OriginalPagePa = MmGetPhysicalAddress(HookContext->OriginalPageBase).QuadPart;
+
+    /* [BUGFIX] OriginalPagePa=0 → 页面不在物理内存（paged out 或 session 空间未映射）
+     * 不能继续，否则 ActivateNptHookInNpt 用 NewPagePa=0 → STATUS_INVALID_PARAMETER */
+    if (HookContext->OriginalPagePa == 0) {
+        SvmDebugPrint("[WARN] OriginalPagePa=0 for %p, skipping\n", TargetAddress);
+        RtlZeroMemory(HookContext, sizeof(NPT_HOOK_CONTEXT));
+        return STATUS_UNSUCCESSFUL;
+    }
 
     // Check for same-physical-page sharing
     PNPT_HOOK_CONTEXT pSharedHook = nullptr;

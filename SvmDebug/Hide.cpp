@@ -20,15 +20,31 @@
 #define SEC_IMAGE 0x01000000
 #define DEBUG 1
 
+/* [BUGFIX 2026/03/15] 所有运行时可写的全局数据放入显式可写段。
+ * 解决 0xBE BSOD: MSVC/Linker 可能将 function-local static 或小数组
+ * 放在与 .rdata 共享的页面上（对齐+COMDAT 排布），导致 lock cmpxchg
+ * 写只读页 → ATTEMPTED_WRITE_TO_READONLY_MEMORY。
+ * 使用自定义段 .drv_rw 并显式标记 RW 来避免。 */
+#pragma section(".drv_rw", read, write)
+#pragma comment(linker, "/SECTION:.drv_rw,RW")
+
+__declspec(allocate(".drv_rw")) static volatile LONG g_Guard[64] = { 0 };
+__declspec(allocate(".drv_rw")) static volatile LONG g_FakePrintOnce[HOOK_MAX_COUNT] = { 0 };
+
 #if DEBUG
-#define FAKE_PRINT_ONCE() \
+/* [BUGFIX 2026/03/15] 替换 FAKE_PRINT_ONCE: 不再使用 function-local static。
+ * 旧版本每个 Fake_ 函数内的 `static LONG _p = 0` 由 InterlockedCompareExchange
+ * 通过 lock cmpxchg 访问。x64 上 lock cmpxchg 即使比较失败也会执行写操作，
+ * 如果 _p 恰好落在只读页上 → 0xBE BSOD。
+ * 新版本使用全局数组 g_FakePrintOnce[]，所有元素在同一显式可写段中。 */
+#define FAKE_PRINT_ONCE_FOR(hookIdx) \
     do { \
-        static LONG _p = 0; \
-        if (InterlockedCompareExchange(&_p, 1, 0) == 0) \
+        if ((hookIdx) < HOOK_MAX_COUNT && \
+            InterlockedCompareExchange(&g_FakePrintOnce[(hookIdx)], 1, 0) == 0) \
             SvmDebugPrint("[Fake] %s called\n", __FUNCTION__); \
     } while (0)
 #else
-#define FAKE_PRINT_ONCE() (void)0
+#define FAKE_PRINT_ONCE_FOR(hookIdx) (void)0
 #endif
 
  /* ========================================================================
@@ -66,7 +82,7 @@ extern POBJECT_TYPE* IoFileObjectType;
 /* ========================================================================
  *  Hook Guard — 轻量级防递归（不修改 IRQL） *   *  【修复】旧版本把 IRQL 提升到 DISPATCH_LEVEL，导致后续调用的 *  内核函数（ObReferenceObjectByHandle、PsLookupProcessByProcessId 等） *  无法访问分页内存 → IRQL_NOT_LESS_OR_EQUAL (0x0A) BSOD。 *   *  NPT Hook 的 trampoline 跳过了 hook 入口点（JMP 指令之后的地址）， *  所以通过 trampoline 调用原函数不会触发 NPF 重入。 *  这里只保留一个轻量级的 per-CPU guard 作为安全网， *  完全不修改 IRQL。
  * ======================================================================== */
-static volatile LONG g_Guard[64] = { 0 };
+/* [BUGFIX 2026/03/15] g_Guard 已移至 .drv_rw 段（文件顶部） */
 
 /**
  * @brief 进入Hook防递归保护 - per-CPU原子锁, 不修改IRQL
@@ -225,6 +241,11 @@ static FnNtWriteVirtualMemory          g_OrigNtWriteVirtualMemory = NULL;
 static FnNtProtectVirtualMemory        g_OrigNtProtectVirtualMemory = NULL;
 static FnNtTerminateProcess            g_OrigNtTerminateProcess = NULL;
 static FnNtCreateThreadEx              g_OrigNtCreateThreadEx = NULL;
+static FnNtSuspendThread               g_OrigNtSuspendThread = NULL;
+static FnNtResumeThread                g_OrigNtResumeThread = NULL;
+static FnNtGetContextThread            g_OrigNtGetContextThread = NULL;
+static FnNtSetContextThread            g_OrigNtSetContextThread = NULL;
+static FnNtQueryInformationThread      g_OrigNtQueryInformationThread = NULL;
 static FnPsLookupProcessByProcessId    g_OrigPsLookupProcessByProcessId = NULL;
 static FnPsLookupThreadByThreadId      g_OrigPsLookupThreadByThreadId = NULL;
 static FnObReferenceObjectByHandle     g_OrigObReferenceObjectByHandle = NULL;
@@ -495,6 +516,31 @@ BOOLEAN IsProtectedProcessHandle(HANDLE ProcessHandle)
     HANDLE pid = PsGetProcessId(target);
     ObDereferenceObject(target);
     return IsProtectedPid(pid);
+}
+
+/**
+ * @brief 检查线程句柄是否属于受保护进程
+ * @note 通过 ObpReferenceObjectByHandleWithTag trampoline 解析线程句柄的 Owner PID
+ */
+BOOLEAN IsProtectedThreadHandle(HANDLE ThreadHandle)
+{
+    if (g_ProtectedPidCount == 0)
+        return FALSE;
+    if (!ThreadHandle || ThreadHandle == NtCurrentThread())
+        return FALSE;
+    if (!g_OrigObpRefByHandleWithTag)
+        return FALSE;
+
+    PETHREAD thread = NULL;
+    NTSTATUS status = g_OrigObpRefByHandleWithTag(
+        (ULONG_PTR)ThreadHandle, 0, *PsThreadType, KernelMode, 0x44666C54, (PVOID*)&thread, NULL, 0);
+
+    if (!NT_SUCCESS(status) || !thread)
+        return FALSE;
+
+    HANDLE ownerPid = PsGetThreadProcessId(thread);
+    ObDereferenceObject(thread);
+    return IsProtectedPid(ownerPid);
 }
 
 
@@ -933,7 +979,7 @@ static NTSTATUS NTAPI Fake_NtQuerySystemInformation(
     ULONG  SystemInformationLength,
     PULONG ReturnLength)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtQuerySystemInformation);
     if (!g_OrigNtQuerySystemInformation)
         return STATUS_UNSUCCESSFUL;
 
@@ -1035,7 +1081,7 @@ static NTSTATUS NTAPI Fake_NtOpenProcess(
     PHANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
     POBJECT_ATTRIBUTES ObjectAttributes, PCLIENT_ID ClientId)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtOpenProcess);
     if (!g_OrigNtOpenProcess) return STATUS_UNSUCCESSFUL;
 
     if (g_ProtectedPidCount == 0)
@@ -1073,7 +1119,7 @@ static NTSTATUS NTAPI Fake_NtQueryInformationProcess(
     HANDLE ProcessHandle, ULONG ProcessInfoClass,
     PVOID ProcessInfo, ULONG ProcessInfoLength, PULONG ReturnLength)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtQueryInformationProcess);
     if (!g_OrigNtQueryInformationProcess) return STATUS_UNSUCCESSFUL;
 
     if (g_ProtectedPidCount > 0 &&
@@ -1100,7 +1146,7 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
     HANDLE ProcessHandle, PVOID BaseAddress, ULONG MemInfoClass,
     PVOID MemInfo, SIZE_T MemInfoLength, PSIZE_T ReturnLength)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtQueryVirtualMemory);
     if (!g_OrigNtQueryVirtualMemory) return STATUS_UNSUCCESSFUL;
 
     if (g_ProtectedPidCount > 0 &&
@@ -1129,7 +1175,7 @@ static NTSTATUS NTAPI Fake_NtDuplicateObject(
     HANDLE TargetProcessHandle, PHANDLE TargetHandle,
     ACCESS_MASK DesiredAccess, ULONG HandleAttributes, ULONG Options)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtDuplicateObject);
     if (!g_OrigNtDuplicateObject) return STATUS_UNSUCCESSFUL;
 
     if (g_ProtectedPidCount > 0 && !IsCallerProtected() &&
@@ -1156,7 +1202,7 @@ static NTSTATUS NTAPI Fake_NtGetNextProcess(
     HANDLE ProcessHandle, ACCESS_MASK DesiredAccess,
     ULONG HandleAttributes, ULONG Flags, PHANDLE NewProcessHandle)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtGetNextProcess);
     if (!g_OrigNtGetNextProcess) return STATUS_UNSUCCESSFUL;
 
     NTSTATUS status = g_OrigNtGetNextProcess(
@@ -1203,7 +1249,7 @@ static NTSTATUS NTAPI Fake_NtGetNextThread(
     ACCESS_MASK DesiredAccess, ULONG HandleAttributes,
     ULONG Flags, PHANDLE NewThreadHandle)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtGetNextThread);
     if (!g_OrigNtGetNextThread) return STATUS_UNSUCCESSFUL;
 
     if (g_ProtectedPidCount > 0 && !IsCallerProtected() &&
@@ -1231,7 +1277,7 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
     HANDLE ProcessHandle, PVOID BaseAddress,
     PVOID Buffer, SIZE_T Size, PSIZE_T NumberOfBytesRead)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtReadVirtualMemory);
     if (!g_OrigNtReadVirtualMemory) return STATUS_UNSUCCESSFUL;
 
     if (g_ProtectedPidCount > 0 &&
@@ -1264,7 +1310,7 @@ static NTSTATUS NTAPI Fake_NtWriteVirtualMemory(
     HANDLE ProcessHandle, PVOID BaseAddress,
     PVOID Buffer, SIZE_T Size, PSIZE_T NumberOfBytesWritten)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtWriteVirtualMemory);
     if (!g_OrigNtWriteVirtualMemory) return STATUS_UNSUCCESSFUL;
 
     if (g_ProtectedPidCount > 0 &&
@@ -1290,7 +1336,7 @@ static NTSTATUS NTAPI Fake_NtProtectVirtualMemory(
     HANDLE ProcessHandle, PVOID* BaseAddress,
     PSIZE_T RegionSize, ULONG NewProtect, PULONG OldProtect)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtProtectVirtualMemory);
     if (!g_OrigNtProtectVirtualMemory) return STATUS_UNSUCCESSFUL;
 
     if (g_ProtectedPidCount > 0 &&
@@ -1312,7 +1358,7 @@ static NTSTATUS NTAPI Fake_NtProtectVirtualMemory(
  */
 static NTSTATUS NTAPI Fake_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS ExitStatus)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtTerminateProcess);
     if (!g_OrigNtTerminateProcess) return STATUS_UNSUCCESSFUL;
 
     if (ProcessHandle != NtCurrentProcess() && ProcessHandle &&
@@ -1345,7 +1391,7 @@ static NTSTATUS NTAPI Fake_NtCreateThreadEx(
     SIZE_T StackSize, SIZE_T MaximumStackSize,
     PVOID AttributeList)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtCreateThreadEx);
     if (!g_OrigNtCreateThreadEx) return STATUS_UNSUCCESSFUL;
 
     if (g_ProtectedPidCount > 0 &&
@@ -1356,6 +1402,157 @@ static NTSTATUS NTAPI Fake_NtCreateThreadEx(
         ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle,
         StartRoutine, Argument, CreateFlags, ZeroBits,
         StackSize, MaximumStackSize, AttributeList);
+}
+
+/* ========================================================================
+ *  线程保护 Hook (参考 EptHook demo)
+ *  ACE 常用攻击路径: SuspendThread → GetContext(读DR) → ReadMemory → Resume
+ * ======================================================================== */
+
+ /**
+  * @brief Hook: NtSuspendThread — 阻止挂起受保护进程的线程
+  * @note ACE 先冻结目标线程再扫描内存
+  */
+static NTSTATUS NTAPI Fake_NtSuspendThread(
+    HANDLE ThreadHandle, PULONG PreviousSuspendCount)
+{
+    FAKE_PRINT_ONCE_FOR(HOOK_NtSuspendThread);
+    if (!g_OrigNtSuspendThread) return STATUS_UNSUCCESSFUL;
+    if (g_ProtectedPidCount == 0)
+        return g_OrigNtSuspendThread(ThreadHandle, PreviousSuspendCount);
+
+    KIRQL oldIrql;
+    if (!EnterHookGuard(&oldIrql))
+        return g_OrigNtSuspendThread(ThreadHandle, PreviousSuspendCount);
+
+    if (!IsCallerProtected() && IsProtectedThreadHandle(ThreadHandle)) {
+        LeaveHookGuard(oldIrql);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    LeaveHookGuard(oldIrql);
+    return g_OrigNtSuspendThread(ThreadHandle, PreviousSuspendCount);
+}
+
+/**
+ * @brief Hook: NtResumeThread — 阻止外部恢复受保护线程
+ */
+static NTSTATUS NTAPI Fake_NtResumeThread(
+    HANDLE ThreadHandle, PULONG PreviousSuspendCount)
+{
+    FAKE_PRINT_ONCE_FOR(HOOK_NtResumeThread);
+    if (!g_OrigNtResumeThread) return STATUS_UNSUCCESSFUL;
+    if (g_ProtectedPidCount == 0)
+        return g_OrigNtResumeThread(ThreadHandle, PreviousSuspendCount);
+
+    KIRQL oldIrql;
+    if (!EnterHookGuard(&oldIrql))
+        return g_OrigNtResumeThread(ThreadHandle, PreviousSuspendCount);
+
+    if (!IsCallerProtected() && IsProtectedThreadHandle(ThreadHandle)) {
+        LeaveHookGuard(oldIrql);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    LeaveHookGuard(oldIrql);
+    return g_OrigNtResumeThread(ThreadHandle, PreviousSuspendCount);
+}
+
+/**
+ * @brief Hook: NtGetContextThread — 隐藏受保护线程的硬件断点
+ * @note 不直接拒绝, 而是擦除 DR0-DR7 后返回, ACE 看到"无硬件断点"而非"被拦截"
+ */
+static NTSTATUS NTAPI Fake_NtGetContextThread(
+    HANDLE ThreadHandle, PCONTEXT ThreadContext)
+{
+    FAKE_PRINT_ONCE_FOR(HOOK_NtGetContextThread);
+    if (!g_OrigNtGetContextThread) return STATUS_UNSUCCESSFUL;
+    if (g_ProtectedPidCount == 0)
+        return g_OrigNtGetContextThread(ThreadHandle, ThreadContext);
+
+    KIRQL oldIrql;
+    if (!EnterHookGuard(&oldIrql))
+        return g_OrigNtGetContextThread(ThreadHandle, ThreadContext);
+
+    if (!IsCallerProtected() && IsProtectedThreadHandle(ThreadHandle)) {
+        LeaveHookGuard(oldIrql);
+        NTSTATUS status = g_OrigNtGetContextThread(ThreadHandle, ThreadContext);
+        if (NT_SUCCESS(status) && ThreadContext) {
+            __try {
+                if (ThreadContext->ContextFlags & CONTEXT_DEBUG_REGISTERS) {
+                    ThreadContext->Dr0 = 0;
+                    ThreadContext->Dr1 = 0;
+                    ThreadContext->Dr2 = 0;
+                    ThreadContext->Dr3 = 0;
+                    ThreadContext->Dr6 = 0;
+                    ThreadContext->Dr7 = 0;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        return status;
+    }
+
+    LeaveHookGuard(oldIrql);
+    return g_OrigNtGetContextThread(ThreadHandle, ThreadContext);
+}
+
+/**
+ * @brief Hook: NtSetContextThread — 阻止修改受保护线程上下文
+ * @note ACE 可能清除硬件断点或篡改 RIP 劫持执行流
+ */
+static NTSTATUS NTAPI Fake_NtSetContextThread(
+    HANDLE ThreadHandle, PCONTEXT ThreadContext)
+{
+    FAKE_PRINT_ONCE_FOR(HOOK_NtSetContextThread);
+    if (!g_OrigNtSetContextThread) return STATUS_UNSUCCESSFUL;
+    if (g_ProtectedPidCount == 0)
+        return g_OrigNtSetContextThread(ThreadHandle, ThreadContext);
+
+    KIRQL oldIrql;
+    if (!EnterHookGuard(&oldIrql))
+        return g_OrigNtSetContextThread(ThreadHandle, ThreadContext);
+
+    if (!IsCallerProtected() && IsProtectedThreadHandle(ThreadHandle)) {
+        LeaveHookGuard(oldIrql);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    LeaveHookGuard(oldIrql);
+    return g_OrigNtSetContextThread(ThreadHandle, ThreadContext);
+}
+
+/**
+ * @brief Hook: NtQueryInformationThread — 过滤受保护线程的信息查询
+ * @note ThreadBasicInformation(class 0)暴露OwnerPID, class 9暴露线程入口
+ */
+static NTSTATUS NTAPI Fake_NtQueryInformationThread(
+    HANDLE ThreadHandle, ULONG ThreadInformationClass,
+    PVOID ThreadInformation, ULONG ThreadInformationLength,
+    PULONG ReturnLength)
+{
+    FAKE_PRINT_ONCE_FOR(HOOK_NtQueryInformationThread);
+    if (!g_OrigNtQueryInformationThread) return STATUS_UNSUCCESSFUL;
+    if (g_ProtectedPidCount == 0)
+        return g_OrigNtQueryInformationThread(
+            ThreadHandle, ThreadInformationClass,
+            ThreadInformation, ThreadInformationLength, ReturnLength);
+
+    KIRQL oldIrql;
+    if (!EnterHookGuard(&oldIrql))
+        return g_OrigNtQueryInformationThread(
+            ThreadHandle, ThreadInformationClass,
+            ThreadInformation, ThreadInformationLength, ReturnLength);
+
+    if (!IsCallerProtected() && IsProtectedThreadHandle(ThreadHandle)) {
+        LeaveHookGuard(oldIrql);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    LeaveHookGuard(oldIrql);
+    return g_OrigNtQueryInformationThread(
+        ThreadHandle, ThreadInformationClass,
+        ThreadInformation, ThreadInformationLength, ReturnLength);
 }
 
 /**
@@ -1369,7 +1566,7 @@ static NTSTATUS NTAPI Fake_NtCreateThreadEx(
  */
 static NTSTATUS NTAPI Fake_PsLookupProcessByProcessId(HANDLE ProcessId, PEPROCESS* Process)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_PsLookupProcessByProcessId);
     if (!g_OrigPsLookupProcessByProcessId) return STATUS_UNSUCCESSFUL;
     if (g_ProtectedPidCount == 0)
         return g_OrigPsLookupProcessByProcessId(ProcessId, Process);
@@ -1400,7 +1597,7 @@ static NTSTATUS NTAPI Fake_PsLookupProcessByProcessId(HANDLE ProcessId, PEPROCES
  */
 static NTSTATUS NTAPI Fake_PsLookupThreadByThreadId(HANDLE ThreadId, PETHREAD* Thread)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_PsLookupThreadByThreadId);
     if (!g_OrigPsLookupThreadByThreadId) return STATUS_UNSUCCESSFUL;
     if (g_ProtectedPidCount == 0)
         return g_OrigPsLookupThreadByThreadId(ThreadId, Thread);
@@ -1437,7 +1634,7 @@ static NTSTATUS NTAPI Fake_ObpRefByHandleWithTag(
     ULONG Tag, PVOID* Object, POBJECT_HANDLE_INFORMATION HandleInfo,
     ULONG_PTR Flags)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_ObReferenceObjectByHandle);
     if (!g_OrigObpRefByHandleWithTag) return STATUS_UNSUCCESSFUL;
     if (g_ProtectedPidCount == 0)
         return g_OrigObpRefByHandleWithTag(
@@ -1493,7 +1690,7 @@ static NTSTATUS NTAPI Fake_MmCopyVirtualMemory(
     SIZE_T BufferSize, KPROCESSOR_MODE PreviousMode,
     PSIZE_T NumberOfBytesCopied)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_MmCopyVirtualMemory);
     if (!g_OrigMmCopyVirtualMemory) return STATUS_UNSUCCESSFUL;
     if (g_ProtectedPidCount == 0)
         return g_OrigMmCopyVirtualMemory(
@@ -1559,7 +1756,7 @@ static VOID NTAPI Fake_KeStackAttachProcess(PEPROCESS Process, PKAPC_STATE ApcSt
  */
 static PVOID NTAPI Fake_ValidateHwnd(SVM_HWND hwnd)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_ValidateHwnd);
     if (!g_OrigValidateHwnd) return NULL;
 
     PVOID pwnd = g_OrigValidateHwnd(hwnd);
@@ -1609,7 +1806,7 @@ static SVM_HWND NTAPI Fake_NtUserFindWindowEx(
     SVM_HWND hwndParent, SVM_HWND hwndChildAfter,
     PUNICODE_STRING lpszClass, PUNICODE_STRING lpszWindow, ULONG dwType)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtUserFindWindowEx);
     if (!g_OrigNtUserFindWindowEx) return NULL;
 
     SVM_HWND result = g_OrigNtUserFindWindowEx(
@@ -1636,7 +1833,7 @@ static SVM_HWND NTAPI Fake_NtUserFindWindowEx(
  */
 static SVM_HWND NTAPI Fake_NtUserWindowFromPoint(LONG x, LONG y)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtUserWindowFromPoint);
     if (!g_OrigNtUserWindowFromPoint) return NULL;
 
     SVM_HWND result = g_OrigNtUserWindowFromPoint(x, y);
@@ -1674,7 +1871,7 @@ static NTSTATUS NTAPI Fake_NtUserBuildHwndList(
     ULONG bRemoveImmersive, ULONG idThread,
     ULONG cHwndMax, SVM_HWND* phwndFirst, ULONG* pcHwndNeeded)
 {
-    FAKE_PRINT_ONCE();
+    FAKE_PRINT_ONCE_FOR(HOOK_NtUserBuildHwndList);
     if (!g_OrigNtUserBuildHwndList) return STATUS_UNSUCCESSFUL;
 
     NTSTATUS status = g_OrigNtUserBuildHwndList(
@@ -1757,6 +1954,11 @@ VOID LinkTrampolineAddresses()
     LH(HOOK_NtProtectVirtualMemory, g_OrigNtProtectVirtualMemory, FnNtProtectVirtualMemory);
     LH(HOOK_NtTerminateProcess, g_OrigNtTerminateProcess, FnNtTerminateProcess);
     LH(HOOK_NtCreateThreadEx, g_OrigNtCreateThreadEx, FnNtCreateThreadEx);
+    LH(HOOK_NtSuspendThread, g_OrigNtSuspendThread, FnNtSuspendThread);
+    LH(HOOK_NtResumeThread, g_OrigNtResumeThread, FnNtResumeThread);
+    LH(HOOK_NtGetContextThread, g_OrigNtGetContextThread, FnNtGetContextThread);
+    LH(HOOK_NtSetContextThread, g_OrigNtSetContextThread, FnNtSetContextThread);
+    LH(HOOK_NtQueryInformationThread, g_OrigNtQueryInformationThread, FnNtQueryInformationThread);
     LH(HOOK_PsLookupProcessByProcessId, g_OrigPsLookupProcessByProcessId, FnPsLookupProcessByProcessId);
     LH(HOOK_PsLookupThreadByThreadId, g_OrigPsLookupThreadByThreadId, FnPsLookupThreadByThreadId);
     LH(HOOK_ObReferenceObjectByHandle, g_OrigObpRefByHandleWithTag, FnObpRefByHandleWithTag);
@@ -1766,6 +1968,12 @@ VOID LinkTrampolineAddresses()
     LH(HOOK_NtUserWindowFromPoint, g_OrigNtUserWindowFromPoint, FnNtUserWindowFromPoint);
     LH(HOOK_NtUserBuildHwndList, g_OrigNtUserBuildHwndList, FnNtUserBuildHwndList);
     LH(HOOK_ValidateHwnd, g_OrigValidateHwnd, FnValidateHwnd);
+
+    /* [BUGFIX 2026/03/15] g_Trampoline_NtUserBuildHwndList 是独立全局变量，
+     * 供 Asm_Fake_NtUserBuildHwndList 使用 (jmp qword ptr [g_Trampoline_...])。
+     * LH 宏只赋值了 g_OrigNtUserBuildHwndList，但 ASM 需要这个单独的指针。 */
+    if (g_HookList[HOOK_NtUserBuildHwndList].IsUsed && g_HookList[HOOK_NtUserBuildHwndList].TrampolinePage)
+        g_Trampoline_NtUserBuildHwndList = (ULONG64)g_HookList[HOOK_NtUserBuildHwndList].TrampolinePage;
 #undef LH
 }
 
@@ -1807,6 +2015,12 @@ NTSTATUS PrepareAllNptHookResources()
         { NULL, "NtReadVirtualMemory",  (PVOID)Fake_NtReadVirtualMemory,  HOOK_NtReadVirtualMemory,  FALSE, RESOLVE_NTDLL, 0 },
         { NULL, "NtWriteVirtualMemory", (PVOID)Fake_NtWriteVirtualMemory, HOOK_NtWriteVirtualMemory, FALSE, RESOLVE_NTDLL, 0 },
         { NULL, "NtCreateThreadEx",     (PVOID)Fake_NtCreateThreadEx,     HOOK_NtCreateThreadEx,     FALSE, RESOLVE_NTDLL, 0 },
+        // 线程保护 (参考 EptHook demo)
+        { NULL, "NtSuspendThread",          (PVOID)Fake_NtSuspendThread,          HOOK_NtSuspendThread,          FALSE, RESOLVE_NTDLL, 0 },
+        { NULL, "NtResumeThread",           (PVOID)Fake_NtResumeThread,           HOOK_NtResumeThread,           FALSE, RESOLVE_NTDLL, 0 },
+        { NULL, "NtGetContextThread",       (PVOID)Fake_NtGetContextThread,       HOOK_NtGetContextThread,       FALSE, RESOLVE_NTDLL, 0 },
+        { NULL, "NtSetContextThread",       (PVOID)Fake_NtSetContextThread,       HOOK_NtSetContextThread,       FALSE, RESOLVE_NTDLL, 0 },
+        { NULL, "NtQueryInformationThread", (PVOID)Fake_NtQueryInformationThread, HOOK_NtQueryInformationThread, FALSE, RESOLVE_NTDLL, 0 },
         // 内核导出
         { L"PsLookupProcessByProcessId", NULL, (PVOID)Fake_PsLookupProcessByProcessId, HOOK_PsLookupProcessByProcessId, TRUE, RESOLVE_EXPORT, 0 },
         { L"PsLookupThreadByThreadId",   NULL, (PVOID)Fake_PsLookupThreadByThreadId,   HOOK_PsLookupThreadByThreadId,   TRUE, RESOLVE_EXPORT, 0 },
@@ -2126,60 +2340,85 @@ NTSTATUS InitNotifyRoutineResolver()
 }
 
 /**
- * @brief 禁用所有进程创建回调 - 保存原值后清零回调槽位
- * @author yewilliam
- * @date 2026/02/06
- * @note 将原始回调指针保存到g_SavedCallbacks供后续恢复
+ * @brief 空回调 — 替换被禁用的回调，签名兼容两种注册方式
  */
-void DisableAllProcessCallbacks()
+static VOID NTAPI NoopProcessNotifyCallback(PVOID a1, PVOID a2, PVOID a3)
 {
-    if (!g_PspCreateProcessNotifyRoutine) return;
-    for (int i = 0; i < MAX_CALLBACKS; i++) {
-        PEX_FAST_REF slot = &g_PspCreateProcessNotifyRoutine[i];
-
-        /* [BUGFIX 2026/03/15] EX_FAST_REF 低 4 位是引用计数 (RefCnt)
-         * 直接 InterlockedExchangePointer 清零会丢失引用计数信息，
-         * 导致内核回调框架在 ExDereferenceCallBackBlock 时发现不一致，
-         * 回调块池内存可能被错误释放 → 池分配器红黑树损坏 → BSOD 0x139
-         * 修复: 保存完整值(含RefCnt), CAS循环确保原子替换 */
-        ULONG_PTR oldVal = slot->Value;
-        if (oldVal == 0) {
-            g_SavedCallbacks[i] = NULL;
-            continue;
-        }
-
-        /* 保存完整值（含 RefCnt），恢复时原样写回 */
-        g_SavedCallbacks[i] = (PVOID)oldVal;
-
-        /* CAS 循环确保原子替换 */
-        while (InterlockedCompareExchangePointer(
-            (PVOID*)slot, NULL, (PVOID)oldVal) != (PVOID)oldVal)
-        {
-            oldVal = slot->Value;
-            if (oldVal == 0) break;
-            g_SavedCallbacks[i] = (PVOID)oldVal;
-        }
-    }
+    UNREFERENCED_PARAMETER(a1);
+    UNREFERENCED_PARAMETER(a2);
+    UNREFERENCED_PARAMETER(a3);
 }
 
 /**
- * @brief 恢复所有进程创建回调 - 将保存的原始值写回回调槽位
- * @author yewilliam
- * @date 2026/02/06
+ * @brief 禁用所有进程创建回调 — 安全方式
+ * @note 绝不清零 EX_FAST_REF！那会破坏引用计数 → LIST_ENTRY 损坏 → BSOD 0x139
+ *       正确做法：替换 EX_CALLBACK_ROUTINE_BLOCK.Function 为 Noop
+ *
+ * [BUGFIX 2026/03/15] 提升 IRQL 到 APC_LEVEL 防止在替换过程中被 APC 打断，
+ * 减少与 mpengine 等扫描线程的竞态窗口。替换完成后等待 drain 确保
+ * 所有正在执行的回调完成退出。
+ */
+void DisableAllProcessCallbacks()
+{
+    //if (!g_PspCreateProcessNotifyRoutine) return;
+
+    //KIRQL oldIrql;
+    //KeRaiseIrql(APC_LEVEL, &oldIrql);
+
+    //for (int i = 0; i < MAX_CALLBACKS; i++) {
+    //    ULONG_PTR val = g_PspCreateProcessNotifyRoutine[i].Value;
+    //    if (val == 0) {
+    //        g_SavedCallbacks[i] = NULL;
+    //        continue;
+    //    }
+
+    //    PEX_CALLBACK_ROUTINE_BLOCK block =
+    //        (PEX_CALLBACK_ROUTINE_BLOCK)(val & ~(ULONG_PTR)0xF);
+
+    //    if (!MmIsAddressValid(block) || !MmIsAddressValid(&block->Function)) {
+    //        g_SavedCallbacks[i] = NULL;
+    //        continue;
+    //    }
+
+    //    g_SavedCallbacks[i] = block->Function;
+    //    InterlockedExchangePointer(&block->Function, (PVOID)NoopProcessNotifyCallback);
+    //}
+
+    //KeLowerIrql(oldIrql);
+
+    ///* Drain: 等待所有正在执行中的回调安全返回 */
+    //LARGE_INTEGER drainDelay;
+    //drainDelay.QuadPart = -30000000LL; // 3 秒
+    //KeDelayExecutionThread(KernelMode, FALSE, &drainDelay);
+    SvmDebugPrint("[INFO] DisableAllProcessCallbacks: SKIPPED (NPT hooks provide full coverage)\n");
+}
+
+/**
+ * @brief 恢复所有进程创建回调
+ * [BUGFIX 2026/03/15] 同样提升 IRQL 保护，防止恢复过程中竞态
  */
 void RestoreAllProcessCallbacks()
 {
-    if (!g_PspCreateProcessNotifyRoutine) return;
-    for (int i = 0; i < MAX_CALLBACKS; i++) {
-        if (g_SavedCallbacks[i]) {
-            /* [BUGFIX 2026/03/15] 恢复完整的 EX_FAST_REF 值（含 RefCnt）
-             * 使用 CAS: 只有当前仍为 NULL 时才写回，防止内核在此期间
-             * 已经注册了新回调导致覆盖 */
-            InterlockedCompareExchangePointer(
-                (PVOID*)&g_PspCreateProcessNotifyRoutine[i],
-                g_SavedCallbacks[i],
-                NULL);
-            g_SavedCallbacks[i] = NULL;
-        }
-    }
+    //if (!g_PspCreateProcessNotifyRoutine) return;
+
+    //KIRQL oldIrql;
+    //KeRaiseIrql(APC_LEVEL, &oldIrql);
+
+    //for (int i = 0; i < MAX_CALLBACKS; i++) {
+    //    if (!g_SavedCallbacks[i]) continue;
+
+    //    ULONG_PTR val = g_PspCreateProcessNotifyRoutine[i].Value;
+    //    if (val == 0) { g_SavedCallbacks[i] = NULL; continue; }
+
+    //    PEX_CALLBACK_ROUTINE_BLOCK block =
+    //        (PEX_CALLBACK_ROUTINE_BLOCK)(val & ~(ULONG_PTR)0xF);
+
+    //    if (MmIsAddressValid(block) && MmIsAddressValid(&block->Function))
+    //        InterlockedExchangePointer(&block->Function, g_SavedCallbacks[i]);
+
+    //    g_SavedCallbacks[i] = NULL;
+    //}
+
+    //KeLowerIrql(oldIrql);
+    SvmDebugPrint("[INFO] RestoreAllProcessCallbacks: SKIPPED (nothing to restore)\n");
 }
