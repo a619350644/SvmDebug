@@ -3,22 +3,23 @@
 
 /**
  * @file NPT.cpp
- * @brief Nested Page Table (NPT) management - init, large page split, permissions, PFN swap
+ * @brief 嵌套页表(NPT)管理 - 初始化、大页拆分、权限控制、PFN替换
  * @author yewilliam
  * @date 2026/02/06
  *
- * [BUGFIX 2026/03/15] pd_linear calculation fixed globally:
- *   Old: pd_linear = pdpt_idx * 512 + pd_idx
- *   Only correct for PML4[0] (< 512GB). Physical machine MMIO devices
- *   mapped above 512GB caused pdpt_idx wrap-around, corrupting NPT
- *   entries for kernel code pages -> wrong content executed -> BSOD.
- *   New: pd_linear = (pml4_idx * 512 + pdpt_idx) * 512 + pd_idx
+ * 实现AMD NPT(Nested Page Table)的完整管理:
+ *   - 四级页表构建(PML4/PDPT/PD/PT), 覆盖2TB物理地址空间
+ *   - 2MB大页动态拆分为4KB小页(支持精确Hook)
+ *   - PT虚拟地址缓存(消除VMEXIT高IRQL路径中的API调用)
+ *   - 紧急PT页池(预分配, 避免高IRQL下内存分配失败)
+ *   - PFN替换实现NPT Hook(执行页/数据页分离)
  *
- * [BUGFIX preserved] PrepareNPT covers 2TB (PML4[0..3])
- * [BUGFIX preserved] SplitPtPas[] eliminates MmGetPhysicalAddress in VMEXIT
- * [BUGFIX preserved] GetNptPteByHostPa_Cached PA-based lookup
+ * pd_linear统一计算公式:
+ *   pml4_idx  = (PA >> 39) & (NPT_PML4_COUNT-1)
+ *   pdpt_idx  = (PA >> 30) & 0x1FF
+ *   pd_idx    = (PA >> 21) & 0x1FF
+ *   pd_linear = (pml4_idx * 512 + pdpt_idx) * 512 + pd_idx
  */
-
 #pragma once
 #include "NPT.h"
 #include "SVM.h"
@@ -45,7 +46,6 @@ static volatile LONG g_PtVaCacheCount = 0;
 #define NPT_PML4_COUNT  4
 
 /* ========================================================================
- *  [BUGFIX 2026/03/15] Unified pd_linear calculation
  *
  *  Old formula (missing PML4 index):
  *    pd_linear = pdpt_idx * 512 + pd_idx
@@ -65,11 +65,24 @@ static __forceinline ULONG64 CalcPdLinear(ULONG64 PhysAddr)
     ULONG64 pd_idx = (PhysAddr >> 21) & 0x1FF;
     return (pml4_idx * 512 + pdpt_idx) * 512 + pd_idx;
 }
+/**
+ * @brief 计算物理地址在PT页内的索引 - 提取bit[12:20]
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] PhysAddr - 物理地址
+ * @return PT表内索引(0-511)
+ */
 
 static __forceinline ULONG64 CalcPtIdx(ULONG64 PhysAddr)
 {
     return (PhysAddr >> 12) & 0x1FF;
 }
+/**
+ * @brief 检查CPU是否支持NPT - 读取CPUID Fn8000_000A_EDX[NP](bit0)
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return TRUE表示支持NPT, FALSE表示不支持
+ */
 
 BOOLEAN IsSupportNPT()
 {
@@ -78,6 +91,13 @@ BOOLEAN IsSupportNPT()
     BOOLEAN bNTP = vector[3] & 1;
     return bNTP;
 }
+/**
+ * @brief 初始化NPT - 检查硬件支持并将NCR3写入VMCB控制区
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData - VCPU上下文(NptCr3必须已由PrepareNPT设置)
+ * @return STATUS_SUCCESS, STATUS_NOT_SUPPORTED(无NPT), STATUS_NOT_FOUND(NptCr3未初始化)
+ */
 
 NTSTATUS InitNPT(PVCPU_CONTEXT vpData)
 {
@@ -94,6 +114,13 @@ NTSTATUS InitNPT(PVCPU_CONTEXT vpData)
     vpData->Guestvmcb.ControlArea.NCr3 = vpData->NptCr3;
     return STATUS_SUCCESS;
 }
+/**
+ * @brief 缓存PT页的物理地址→虚拟地址映射 - 避免高IRQL下调用MmGetVirtualForPhysical
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] PtPa - PT页的物理地址
+ * @return PT页的虚拟地址, 缓存满时回退到MmGetVirtualForPhysical
+ */
 
 static PULONG64 CachePtVa(ULONG64 PtPa)
 {
@@ -120,6 +147,13 @@ static PULONG64 CachePtVa(ULONG64 PtPa)
 
     return g_PtVaCache[idx].PtVa;
 }
+/**
+ * @brief 从缓存中查找PT页虚拟地址 - 纯查询不分配, 适用于任意IRQL
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] PtPa - PT页的物理地址
+ * @return 缓存命中返回VA, 未命中返回NULL
+ */
 
 static PULONG64 LookupPtVaFromCache(ULONG64 PtPa)
 {
@@ -131,6 +165,14 @@ static PULONG64 LookupPtVaFromCache(ULONG64 PtPa)
     }
     return NULL;
 }
+/**
+ * @brief 构建NPT四级页表 - 分配PML4/PDPT/PD, 初始化为2MB大页恒等映射
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData - VCPU上下文(页表指针存入其中)
+ * @return PML4表的物理地址(用于NCR3), 失败返回0
+ * @note 覆盖NPT_PML4_COUNT*512GB物理地址空间, PD表用ExAllocatePool2分配(虚拟连续)
+ */
 
 ULONG64 PrepareNPT(PVCPU_CONTEXT vpData)
 {
@@ -140,10 +182,8 @@ ULONG64 PrepareNPT(PVCPU_CONTEXT vpData)
     /* pdpt_table: NPT_PML4_COUNT pages (16KB) — MmAllocateContiguousMemory OK */
     vpData->pdpt_table = (ULONG64*)AllocateAlignedZeroedMemory(NPT_PML4_COUNT * PAGE_SIZE);
 
-    /* [BUGFIX] pd_tables: NPT_PML4_COUNT * 512 pages (8MB)
-     * MmAllocateContiguousMemory 要求 8MB 物理连续内存, 在 VM 或内存碎片化时几乎必定失败。
-     * 改用 ExAllocatePool2(NON_PAGED): 虚拟地址连续, 物理地址不要求连续。
-     * 每个 PD page (4KB) 内物理连续(页本身的属性), PDPT 条目逐页查 PA 即可。 */
+    /* pd_tables: NPT_PML4_COUNT * 512 pages (8MB), 使用NonPaged池分配
+     * 虚拟地址连续即可, 每个PD page(4KB)内物理连续, PDPT条目逐页查PA */
     SIZE_T pdTablesSize = (SIZE_T)NPT_PML4_COUNT * 512 * PAGE_SIZE;
     vpData->pd_tables = (ULONG64*)ExAllocatePool2(POOL_FLAG_NON_PAGED, pdTablesSize, 'NPDT');
 
@@ -187,7 +227,6 @@ ULONG64 PrepareNPT(PVCPU_CONTEXT vpData)
         for (UINT64 i = 0; i < 512; i++) {
             UINT64 pdpt_slot = pml4_idx * 512 + i;
 
-            /* [BUGFIX] 逐页查物理地址, 不假设物理连续 */
             ULONG64 pd_page_va = (ULONG64)vpData->pd_tables + pdpt_slot * PAGE_SIZE;
             ULONG64 pd_page_pa = MmGetPhysicalAddress((PVOID)pd_page_va).QuadPart;
 
@@ -218,6 +257,16 @@ ULONG64 PrepareNPT(PVCPU_CONTEXT vpData)
 
     return pml4_pa;
 }
+/**
+ * @brief 将2MB大页拆分为512个4KB小页 - 支持精确的NPT Hook
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData      - VCPU上下文(SplitPtPages/SplitPtPas记录拆分历史)
+ * @param [in]     pd_index    - PD表中的线性索引
+ * @param [out]    OutPtTableVa - 输出拆分后PT页的虚拟地址
+ * @return STATUS_SUCCESS, STATUS_INVALID_PARAMETER, STATUS_INSUFFICIENT_RESOURCES
+ * @note 已拆分的页直接返回缓存的VA; 新拆分优先从紧急池分配, 回退到动态分配
+ */
 
 NTSTATUS SpliteLargePage(PVCPU_CONTEXT vpData, UINT64 pd_index, PULONG64* OutPtTableVa)
 {
@@ -304,6 +353,14 @@ NTSTATUS SpliteLargePage(PVCPU_CONTEXT vpData, UINT64 pd_index, PULONG64* OutPtT
     *OutPtTableVa = new_pt_table;
     return STATUS_SUCCESS;
 }
+/**
+ * @brief 为指定目标VA预拆分大页 - 必须在PASSIVE_LEVEL且进入虚拟化之前调用
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData        - VCPU上下文
+ * @param [in]     TargetAddress  - Hook目标虚拟地址
+ * @return STATUS_SUCCESS, 或GPaToHostPa/SpliteLargePage的错误码
+ */
 
 NTSTATUS PreSplitLargePageForHook(PVCPU_CONTEXT vpData, PVOID TargetAddress)
 {
@@ -324,7 +381,14 @@ NTSTATUS PreSplitLargePageForHook(PVCPU_CONTEXT vpData, PVOID TargetAddress)
     return status;
 }
 
-/* [BUGFIX 2026/03/15] Uses CalcPdLinear() */
+/**
+ * @brief 根据物理地址预拆分大页 - 适用于TargetPa已知的场景
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData   - VCPU上下文
+ * @param [in]     TargetPa - 目标物理地址
+ * @return STATUS_SUCCESS或SpliteLargePage的错误码
+ */
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTSTATUS PreSplitLargePageByPa(PVCPU_CONTEXT vpData, ULONG64 TargetPa)
 {
@@ -337,8 +401,16 @@ NTSTATUS PreSplitLargePageByPa(PVCPU_CONTEXT vpData, ULONG64 TargetPa)
     PULONG64 dummy = nullptr;
     return SpliteLargePage(vpData, pd_linear, &dummy);
 }
+/**
+ * @brief 通过PA查找NPT PTE - 优先使用VA缓存, 回退到SplitPtPages数组
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] vpData   - VCPU上下文
+ * @param [in] TargetPa - 目标物理地址
+ * @return PTE指针, 大页未拆分或查找失败返回nullptr
+ * @note 设计为VMEXIT高IRQL路径安全, 不调用任何可能阻塞的API
+ */
 
-/* [BUGFIX 2026/03/15] Uses CalcPdLinear() / CalcPtIdx() */
 static PNPT_ENTRY GetNptPteByHostPa_Cached(PVCPU_CONTEXT vpData, ULONG64 TargetPa)
 {
     ULONG64 pd_linear = CalcPdLinear(TargetPa);
@@ -369,8 +441,16 @@ static PNPT_ENTRY GetNptPteByHostPa_Cached(PVCPU_CONTEXT vpData, ULONG64 TargetP
     if (!pt_va) return nullptr;
     return (PNPT_ENTRY)&pt_va[pt_idx];
 }
+/**
+ * @brief 通过物理地址替换NPT PTE的PFN - 实现页面替换(Hook核心操作)
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData    - VCPU上下文
+ * @param [in]     TargetPa  - 目标页的物理地址
+ * @param [in]     NewPagePa - 替换页(FakePage/OriginalPage)的物理地址
+ * @return STATUS_SUCCESS, STATUS_INVALID_PARAMETER, STATUS_UNSUCCESSFUL
+ */
 
-/* [BUGFIX 2026/03/15] Uses CalcPdLinear() */
 NTSTATUS ApplyNptHookByPa(PVCPU_CONTEXT vpData, ULONG64 TargetPa, ULONG64 NewPagePa)
 {
     if (TargetPa == 0 || NewPagePa == 0 || !vpData) {
@@ -408,6 +488,15 @@ NTSTATUS ApplyNptHookByPa(PVCPU_CONTEXT vpData, ULONG64 TargetPa, ULONG64 NewPag
     pte->Bits.PageFrameNumber = NewPagePa >> 12;
     return STATUS_SUCCESS;
 }
+/**
+ * @brief 替换NPT PTE的PFN但不修改权限 - 适用于初始化阶段
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData        - VCPU上下文
+ * @param [in]     TargetAddress  - 目标虚拟地址
+ * @param [in]     PagePa         - 新页面的物理地址
+ * @return STATUS_SUCCESS或错误码
+ */
 
 NTSTATUS ApplyNptHook_NoPerm(PVCPU_CONTEXT vpData, PVOID TargetAddress, ULONG64 PagePa)
 {
@@ -431,6 +520,14 @@ NTSTATUS ApplyNptHook_NoPerm(PVCPU_CONTEXT vpData, PVOID TargetAddress, ULONG64 
     pte->Bits.PageFrameNumber = PagePa >> 12;
     return STATUS_SUCCESS;
 }
+/**
+ * @brief 在NPT中激活单个Hook - 替换PFN + 设置ReadOnly + 刷新TLB
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData      - VCPU上下文
+ * @param [in]     HookContext  - Hook上下文(包含Target/Original/Fake页信息)
+ * @return STATUS_SUCCESS或错误码
+ */
 
 NTSTATUS ActivateNptHookInNpt(PVCPU_CONTEXT vpData, PNPT_HOOK_CONTEXT HookContext)
 {
@@ -453,6 +550,16 @@ NTSTATUS ActivateNptHookInNpt(PVCPU_CONTEXT vpData, PNPT_HOOK_CONTEXT HookContex
     vpData->Guestvmcb.ControlArea.TlbControl = 1;
     return STATUS_SUCCESS;
 }
+/**
+ * @brief 设置NPT PTE权限 - ReadOnly(触发执行故障)/Execute(正常执行)/NotPresent
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData         - VCPU上下文
+ * @param [in]     TargetPa       - 目标页的物理地址
+ * @param [in]     PermissionType - 权限类型(NPT_PERM_READ_ONLY/EXECUTE/NOT_PRESENT)
+ * @return STATUS_SUCCESS, STATUS_INVALID_PARAMETER, STATUS_UNSUCCESSFUL
+ * @note READ_ONLY: Valid+Write+User+NX, EXECUTE: Valid+Write+User+!NX
+ */
 
 NTSTATUS SetNptPagePermissions(PVCPU_CONTEXT vpData, ULONG64 TargetPa, ULONG PermissionType)
 {
@@ -482,8 +589,15 @@ NTSTATUS SetNptPagePermissions(PVCPU_CONTEXT vpData, ULONG64 TargetPa, ULONG Per
 
     return STATUS_SUCCESS;
 }
+/**
+ * @brief 将Guest VA翻译为Host PA并计算NPT索引 - 填充NPT_CONTEXT结构体
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] npt_context - NPT上下文(输入TargetAddress, 输出TargetPa和各级索引)
+ * @return STATUS_SUCCESS, STATUS_INVALID_PARAMETER, STATUS_UNSUCCESSFUL
+ * @note 先尝试MmGetPhysicalAddress, 失败则通过MDL锁定页面获取PFN
+ */
 
-/* [BUGFIX 2026/03/15] Uses CalcPdLinear() / CalcPtIdx() */
 NTSTATUS GPaToHostPa(PNPT_CONTEXT npt_context)
 {
     if (npt_context == nullptr || npt_context->TargetAddress == nullptr) {
@@ -523,6 +637,14 @@ NTSTATUS GPaToHostPa(PNPT_CONTEXT npt_context)
 
     return STATUS_SUCCESS;
 }
+/**
+ * @brief 通过PA获取NPT PTE - 带缓存的完整版本, 低IRQL时可动态缓存
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] vpData   - VCPU上下文
+ * @param [in] TargetPa - 目标物理地址
+ * @return PTE指针, 失败返回nullptr
+ */
 
 PNPT_ENTRY GetNptPteByHostPa(PVCPU_CONTEXT vpData, ULONG64 TargetPa)
 {
@@ -555,12 +677,17 @@ PNPT_ENTRY GetNptPteByHostPa(PVCPU_CONTEXT vpData, ULONG64 TargetPa)
 
     return (PNPT_ENTRY)&pt_va[pt_idx];
 }
+/**
+ * @brief 释放VCPU的NPT页表资源 - PML4/PDPT/PD表和所有拆分的PT页
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData - VCPU上下文
+ */
 
 VOID FreePvCPUNPT(PVCPU_CONTEXT vpData)
 {
     if (vpData->pml4_table) MmFreeContiguousMemory(vpData->pml4_table);
     if (vpData->pdpt_table) MmFreeContiguousMemory(vpData->pdpt_table);
-    /* [BUGFIX] pd_tables 现在用 ExAllocatePool2 分配 */
     if (vpData->pd_tables)  ExFreePoolWithTag(vpData->pd_tables, 'NPDT');
 
     for (ULONG i = 0; i < vpData->SplitPtCount; i++) {
@@ -573,6 +700,13 @@ VOID FreePvCPUNPT(PVCPU_CONTEXT vpData)
     vpData->SplitPtCount = 0;
     vpData->pml4_table = vpData->pdpt_table = vpData->pd_tables = nullptr;
 }
+/**
+ * @brief 分配物理连续且清零的内存 - 用于页表页分配
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] NumberOfBytes - 分配字节数
+ * @return 虚拟地址, 失败返回NULL
+ */
 
 PVOID AllocateAlignedZeroedMemory(SIZE_T NumberOfBytes)
 {
@@ -585,6 +719,13 @@ PVOID AllocateAlignedZeroedMemory(SIZE_T NumberOfBytes)
     }
     return pMemory;
 }
+/**
+ * @brief 预热PT虚拟地址缓存 - 将所有已拆分PT页的PA→VA映射加入缓存
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] vpData - VCPU上下文
+ * @note 必须在Hook激活前调用, 确保VMEXIT路径中所有PT表VA已缓存
+ */
 
 VOID PrewarmPtVaCache(PVCPU_CONTEXT vpData)
 {

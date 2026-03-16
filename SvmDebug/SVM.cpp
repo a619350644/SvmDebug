@@ -3,22 +3,28 @@
 
 /**
  * @file SVM.cpp
- * @brief SVM Virtualization Engine - VMCB config, VMEXIT dispatch, hypercall handling
+ * @brief SVM虚拟化引擎 - VMCB配置、VMEXIT分派、超级调用处理
  * @author yewilliam
  * @date 2026/02/06
  *
- * [BUGFIX 2026/03/15] NPF handler: check ApplyNptHookByPa/SetNptPagePermissions
- *   return values. On failure, ForceNptFlush for consistency. Don't set
- *   SuspendedHook if page table ops failed, preventing bad restoration.
- *
- * [BUGFIX preserved] Removed RDTSC/RDTSCP interception
- * [BUGFIX preserved] NPF handler for unknown pages
+ * 实现AMD SVM核心功能:
+ *   - VMCB控制区/状态保存区初始化
+ *   - VMEXIT退出事件分派(CPUID/NPF/GP/VMMCALL等)
+ *   - NPT Hook执行/读写分离处理
+ *   - 自定义超级调用命令(进程保护/内存操作)
+ *   - CR寄存器读写模拟(#GP处理 + VMMCALL中转)
  */
-
 #include "SVM.h"
 #include "HvMemory.h"
 
 extern ULONG64 g_SystemCr3;
+/**
+ * @brief 强制刷新NPT TLB - 清除VMCB缓存并重新加载NPT CR3
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData - VCPU上下文
+ * @note 设置VmcbClean=0强制处理器重新读取所有VMCB字段, TlbControl=1触发TLB全刷新
+ */
 
 static inline VOID ForceNptFlush(PVCPU_CONTEXT vpData)
 {
@@ -26,11 +32,30 @@ static inline VOID ForceNptFlush(PVCPU_CONTEXT vpData)
     vpData->Guestvmcb.ControlArea.NCr3 = vpData->NptCr3;
     vpData->Guestvmcb.ControlArea.TlbControl = 1;
 }
+/**
+ * @brief 快速判断地址是否在内核空间范围内 - 检查高16位canonical形式
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] Address - 待检查的64位虚拟地址
+ * @return TRUE表示地址在内核空间(0xFFFF8000_00000000以上), FALSE表示不在
+ */
 
 static __forceinline BOOLEAN IsKernelAddressLikely(UINT64 Address)
 {
     return (Address >= 0xFFFF800000000000ULL && Address <= 0xFFFFFFFFFFFFFFFFULL);
 }
+/**
+ * @brief 从Guest RIP解码MOV CRn指令 - 解析REX前缀、操作码和ModRM字段
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in]  GuestRip - Guest当前指令指针
+ * @param [out] crNum    - 解码出的CR寄存器编号(0/2/3/4)
+ * @param [out] gprNum   - 解码出的通用寄存器编号(0-15)
+ * @param [out] instrLen - 指令总长度(含前缀)
+ * @param [out] isWrite  - TRUE表示MOV CRn,GPR(写CR), FALSE表示MOV GPR,CRn(读CR)
+ * @return TRUE表示成功解码为CR指令, FALSE表示非CR指令或解码失败
+ * @note 用于#GP异常处理, 模拟被拦截的CR寄存器访问
+ */
 
 static BOOLEAN DecodeCrInstructionFromRip(
     UINT64 GuestRip,
@@ -79,6 +104,15 @@ static BOOLEAN DecodeCrInstructionFromRip(
 
     return FALSE;
 }
+/**
+ * @brief 读取Guest通用寄存器值 - 根据寄存器索引从VMCB或GPR结构体读取
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] vpData   - VCPU上下文(GPR保存区)
+ * @param [in] vmcb     - VMCB(RAX/RSP保存在StateSaveArea中)
+ * @param [in] gprIndex - 寄存器索引(0=RAX, 1=RCX, ..., 15=R15)
+ * @return 指定寄存器的64位值
+ */
 
 static UINT64 ReadGuestGpr(PVCPU_CONTEXT vpData, PVMCB vmcb, ULONG gprIndex)
 {
@@ -102,6 +136,15 @@ static UINT64 ReadGuestGpr(PVCPU_CONTEXT vpData, PVMCB vmcb, ULONG gprIndex)
     default: return 0;
     }
 }
+/**
+ * @brief 写入Guest通用寄存器值 - 根据寄存器索引写入VMCB或GPR结构体
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData   - VCPU上下文(GPR保存区)
+ * @param [in,out] vmcb     - VMCB(RAX/RSP保存在StateSaveArea中)
+ * @param [in]     gprIndex - 寄存器索引(0=RAX, 1=RCX, ..., 15=R15)
+ * @param [in]     value    - 要写入的64位值
+ */
 
 static VOID WriteGuestGpr(PVCPU_CONTEXT vpData, PVMCB vmcb, ULONG gprIndex, UINT64 value)
 {
@@ -124,6 +167,22 @@ static VOID WriteGuestGpr(PVCPU_CONTEXT vpData, PVMCB vmcb, ULONG gprIndex, UINT
     case 15: vpData->Guest_gpr.R15 = value; break;
     }
 }
+/**
+ * @brief 初始化当前CPU的SVM核心 - 捕获上下文、配置VMCB、进入VMM
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData - 当前CPU的VCPU上下文(已预分配)
+ * @return STATUS_SUCCESS表示成功进入SVM Guest模式
+ * @note 调用RtlCaptureContext获取当前寄存器状态作为Guest初始状态,
+/**
+ * @brief 检测自研Hypervisor是否已安装 - 通过CPUID 0x40000000读取Vendor ID
+ * @author yewilliam
+ * @date 2026/02/06
+ * @return TRUE表示CPUID返回"VtDebugView "(自定义签名), FALSE表示未安装
+ * @note 用于InitSVMCORE中避免重复虚拟化(VMRUN后CPUID被拦截返回自定义签名)
+ */
+ /*       IsSvmHypervisorInstalled()在VMRUN后返回TRUE实现"回溯"检测
+ */
 
 NTSTATUS InitSVMCORE(PVCPU_CONTEXT vpData)
 {
@@ -140,6 +199,16 @@ NTSTATUS InitSVMCORE(PVCPU_CONTEXT vpData)
     SvEnterVmmOnNewStack(vpData);
     return STATUS_SUCCESS;
 }
+/**
+ * @brief 配置VMCB控制区和状态保存区 - 填充段寄存器、控制寄存器、拦截位
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData        - VCPU上下文(包含Guest/Host VMCB)
+ * @param [in]     contextRecord - RtlCaptureContext捕获的CPU寄存器快照
+ * @return STATUS_SUCCESS表示VMCB配置完成, STATUS_NOT_SUPPORTED表示NPT不可用
+ * @note 配置拦截项: CPUID + VMRUN + VMMCALL + #DB + #GP
+ *       启用EFER.SVME, 设置ASID=1, 初始化Host Save Area
+ */
 
 NTSTATUS PrepareVMCB(PVCPU_CONTEXT vpData, CONTEXT contextRecord)
 {
@@ -245,6 +314,14 @@ NTSTATUS PrepareVMCB(PVCPU_CONTEXT vpData, CONTEXT contextRecord)
     __svm_vmsave(vpData->HostVmcbPa);
     return STATUS_SUCCESS;
 }
+/**
+ * @brief 从GDT获取段描述符属性 - 解析Type/DPL/Present/LongMode等字段
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] SegmentSelector - 段选择子(CS/DS/SS等)
+ * @param [in] GdtBase         - GDT基地址
+ * @return VMCB格式的16位段属性值
+ */
 
 UINT16 GetSegmentAttribute(UINT16 SegmentSelector, UINT64 GdtBase)
 {
@@ -262,6 +339,14 @@ UINT16 GetSegmentAttribute(UINT16 SegmentSelector, UINT64 GdtBase)
     attribute.Fields.Reserved1 = 0;
     return attribute.AsUInt16;
 }
+/**
+ * @brief 从GDT获取段基地址 - 拼接BaseLow/BaseMiddle/BaseHigh
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] SegmentSelector - 段选择子
+ * @param [in] GdtBase         - GDT基地址
+ * @return 段基地址(x64长模式下通常为0, FS/GS例外)
+ */
 
 UINT64 GetSegmentBase(UINT16 SegmentSelector, UINT64 GdtBase)
 {
@@ -284,6 +369,15 @@ BOOLEAN IsSvmHypervisorInstalled()
     vendorId[12] = ANSI_NULL;
     return (strcmp(vendorId, "VtDebugView ") == 0);
 }
+/**
+ * @brief 处理自定义超级调用命令 - 在VMEXIT(CPUID/VMMCALL)中执行保护操作
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData - VCPU上下文
+ * @param [in,out] vmcb   - Guest VMCB
+ * @param [in]     cmd    - 命令码(0x12345678=保护PID, 0x12345679=保护HWND等)
+ * @return TRUE表示命令已处理, FALSE表示未识别的命令
+ */
 
 static BOOLEAN HandleHypercallCommand(PVCPU_CONTEXT vpData, PVMCB vmcb, UINT32 cmd)
 {
@@ -317,16 +411,11 @@ static BOOLEAN HandleHypercallCommand(PVCPU_CONTEXT vpData, PVMCB vmcb, UINT32 c
         return TRUE;
     }
     else if (cmd == 0x12345680) {
-        /* [BUGFIX 2026/03/15] 不在 VMEXIT 上下文执行回调操作！
-         * VMEXIT 处于等效 HIGH_LEVEL IRQL，直接操作 EX_FAST_REF
-         * 回调数组会导致池分配器红黑树损坏 → BSOD 0x139 (Arg1=0x1d)
-         * 改为设置标志，由 CommunicationThread 在 PASSIVE_LEVEL 执行 */
         vmcb->StateSaveArea.Rax = 1;
         vpData->Guest_gpr.Rax = 1;
         return TRUE;
     }
     else if (cmd == 0x12345681) {
-        /* [BUGFIX 2026/03/15] 同上：延迟到 PASSIVE_LEVEL */
         vmcb->StateSaveArea.Rax = 1;
         vpData->Guest_gpr.Rax = 1;
         return TRUE;
@@ -335,11 +424,20 @@ static BOOLEAN HandleHypercallCommand(PVCPU_CONTEXT vpData, PVMCB vmcb, UINT32 c
 }
 
 /**
- * @brief VMEXIT dispatch center
+ * @brief VMEXIT分派中心 - 根据退出码分发到对应处理器
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData - VCPU上下文
  *
- * [BUGFIX 2026/03/15] NPF handler checks return values of
- *   ApplyNptHookByPa / SetNptPagePermissions. On failure, still
- *   flushes TLB for consistency. SuspendedHook only set on success.
+ * 处理的VMEXIT类型:
+ *   - CPUID: Hypervisor签名/卸载/Hook激活/内存操作/透传
+ *   - VMRUN: 跳过(推进RIP)
+ *   - NPF: 执行故障→切换FakePage, 读写故障→恢复OriginalPage
+ *   - #DB: 重注入调试异常
+ *   - #GP: 解码CR指令模拟/重注入
+ *   - VMMCALL: CR读写模拟/超级调用命令
+ *
+ * SuspendedHook恢复逻辑: 当RIP离开Hook页面时, 恢复NPT为ReadOnly触发态
  */
 void SvHandleVmExit(PVCPU_CONTEXT vpData)
 {
@@ -353,8 +451,6 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
         ULONG64 hookVaPage = ((ULONG64)suspCtx->TargetAddress) & ~0xFFFULL;
 
         if (ripPage != hookVaPage) {
-            /* [BUGFIX 2026/03/15] 检查 RIP 是否落在同物理页的另一个 Hook 上
-             * 如果是，切换 SuspendedHook 而不是恢复原始页 */
             BOOLEAN switchedToOtherHook = FALSE;
             ULONG64 suspPagePa = suspCtx->TargetPa & ~0xFFFULL;
 
@@ -371,7 +467,6 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
             }
 
             if (!switchedToOtherHook) {
-                /* [BUGFIX 2026/03/15] Check return values, always flush */
                 ApplyNptHookByPa(vpData, suspCtx->TargetPa, suspCtx->OriginalPagePa);
                 SetNptPagePermissions(vpData, suspCtx->TargetPa, NPT_PERM_READ_ONLY);
                 ForceNptFlush(vpData);
@@ -403,10 +498,6 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
             ForceNptFlush(vpData);
         }
         else if (leaf == CPUID_UNLOAD_SVM_UNINSTALL_HOOK) {
-            /* [BUGFIX 2026/03/15] 卸载前恢复所有 NPT 条目到原始物理页，
-             * 确保 SVM 退出后 Guest 直接执行原始代码，
-             * 避免 RawInputThread 等永久线程仍在执行 FakePage 代码
-             * 导致 PAGE_FAULT_IN_NONPAGED_AREA (0x50) BSOD。 */
             for (int i = 0; i < HOOK_MAX_COUNT; i++) {
                 if (g_HookList[i].IsUsed && g_HookList[i].TargetPa != 0
                     && g_HookList[i].OriginalPagePa != 0) {
@@ -445,8 +536,6 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
         /*
          * NPF handler - No TF model (Execution/Read split)
          *
-         * [BUGFIX 2026/03/15] All page table operations check return values.
-         * SuspendedHook only set when both ops succeed.
          */
     case VMEXIT_NPF:
     {
@@ -583,12 +672,26 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
         break;
     }
 }
+/**
+ * @brief 执行单次VMRUN - 包装SvLaunchVm汇编调用
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData - VCPU上下文
+ */
 
 void SVMLauchRun(PVCPU_CONTEXT vpData)
 {
     if (vpData == nullptr) return;
     SvLaunchVm(vpData);
 }
+/**
+ * @brief VMM主循环 - 反复执行VMRUN并处理VMEXIT直到收到退出信号
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in,out] vpData - VCPU上下文
+ * @note 循环: VMRUN → 保存RAX → SvHandleVmExit → 检查isExit
+ *       退出后调用SvSwitchStack切回Guest栈
+ */
 
 EXTERN_C void HostLoop(PVCPU_CONTEXT vpData)
 {
@@ -599,6 +702,12 @@ EXTERN_C void HostLoop(PVCPU_CONTEXT vpData)
     }
     SvSwitchStack(vpData);
 }
+/**
+ * @brief 调试打印Guest GPR寄存器值
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] Gpr - Guest通用寄存器结构体指针
+ */
 
 VOID PrintGuestGpr(PGUEST_GPR Gpr)
 {

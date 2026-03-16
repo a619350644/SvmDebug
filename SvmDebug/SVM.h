@@ -4,9 +4,9 @@
  * @author yewilliam
  * @date 2026/02/06
  *
- * [BUGFIX] 新增 SplitPtPas[] 数组，与 SplitPtPages[] 一一对应，
- *          在 PASSIVE_LEVEL 拆分时记录 PA，消除 VMEXIT 路径中的
- *          MmGetPhysicalAddress 调用。
+ * 定义VCPU_CONTEXT结构体(per-CPU虚拟化上下文)和SVM核心函数声明。
+ * SplitPtPages/SplitPtPas数组一一对应, 在PASSIVE_LEVEL拆分时记录PA,
+ * 消除VMEXIT高IRQL路径中的MmGetPhysicalAddress调用。
  */
 
 #pragma once
@@ -51,14 +51,13 @@ typedef struct _VCPU_CONTEXT {
     ULONG64* New_pd_tables;
 
     /**
-     * [BUGFIX] SplitPtPages 和 SplitPtPas 必须一一对应：
+     * SplitPtPages 和 SplitPtPas 一一对应:
      *   SplitPtPages[i] = 拆分后PT页的虚拟地址 (VA)
      *   SplitPtPas[i]   = 拆分后PT页的物理地址 (PA)
-     * 这样在 VMEXIT (高IRQL) 中查找PT页时直接比较PA，
-     * 无需调用 MmGetPhysicalAddress。
+     * VMEXIT高IRQL中查找PT页时直接比较PA, 无需调用MmGetPhysicalAddress
      */
     PVOID   SplitPtPages[4096];
-    ULONG64 SplitPtPas[4096];      /* [BUGFIX] 新增：预存PA，消除VMEXIT中的API调用 */
+    ULONG64 SplitPtPas[4096];
     ULONG   SplitPtCount;
 
     PVOID ActiveHook;

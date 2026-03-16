@@ -1,4 +1,18 @@
-﻿#include <ntifs.h>
+﻿/**
+ * @file DrvMain.cpp
+ * @brief 驱动主入口 - DriverEntry、IRP派发、SVM初始化线程、卸载清理
+ * @author yewilliam
+ * @date 2026/02/06
+ *
+ * 标准WDM驱动入口点, 提供:
+ *   - 设备对象/符号链接创建(R3通过\\.\SvmDebug通信)
+ *   - IOCTL派发: 进程保护/窗口保护/内存读写
+ *   - SVM初始化系统线程(多核VCPU分配+NPT构建+IPI广播)
+ *   - 延迟Hook安装线程(SSDT/SSSDT解析+NPT Hook激活)
+ *   - 安全卸载流程(drain等待+IPI恢复+资源释放)
+ */
+
+#include <ntifs.h>
 #include <ntimage.h>
 #include "SVM.h"
 #include "Hook.h"
@@ -54,6 +68,12 @@ VOID DelayedHookWorkItemRoutine(PVOID Context);
 /* ========================================================================
  *  资源释放
  * ======================================================================== */
+/**
+ * @brief 释放所有驱动资源 - VCPU上下文、Host栈、NPT页表、TrampolinePage
+ * @author yewilliam
+ * @date 2026/02/06
+ * @note TrampolinePage在此统一释放(CleanupAllNptHooks故意保留以防执行中崩溃)
+ */
 static VOID ReleaseDriverResources()
 {
     ULONG n_cout = KeQueryActiveProcessorCount(0);
@@ -73,12 +93,6 @@ static VOID ReleaseDriverResources()
     }
     CleanupAllNptHooks();
 
-    /* [BUGFIX 2026/03/15] 最终释放 TrampolinePage。
-     * CleanupAllNptHooks 故意不释放 TrampolinePage，因为 SVM 退出后
-     * 仍有线程可能在执行 trampoline 代码。
-     * 但在 ReleaseDriverResources 调用时，已经过 drain 等待，
-     * 所有 NPT 条目已恢复为原始页，不会再有执行流进入 trampoline。
-     * 此处统一释放防止内存泄漏（26 个 Hook × 4KB = 104KB/次）。 */
     for (int i = 0; i < HOOK_MAX_COUNT; i++) {
         if (g_HookList[i].TrampolinePage) {
             MmFreeContiguousMemory(g_HookList[i].TrampolinePage);
@@ -252,6 +266,15 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 /* ========================================================================
  *  Communication thread (runs at PASSIVE_LEVEL)
  * ======================================================================== */
+
+/**
+ * @brief 通信工作线程 - 轮询保护请求、执行PEB伪装、卸载时统一清理
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] Context - 未使用
+ * @note 运行在PASSIVE_LEVEL, 1秒轮询间隔
+ *       卸载流程: 清除保护→drain等待→IPI卸载Hook→IPI退出SVM→释放资源
+ */
 VOID CommunicationThread(PVOID Context)
 {
     UNREFERENCED_PARAMETER(Context);
@@ -261,8 +284,6 @@ VOID CommunicationThread(PVOID Context)
 
     while (!g_DriverUnloading)
     {
-        /* [BUGFIX 2026/03/15] 移除 g_PendingCallbackOp 处理。
-         * DisableAllProcessCallbacks 写只读内核页导致 0xBE BSOD，已禁用。 */
 
         if (g_PendingProtectPID != (HANDLE)0 && g_PendingProtectPID != g_ProtectedPID)
         {
@@ -309,8 +330,6 @@ VOID CommunicationThread(PVOID Context)
     }
     SvmDebugPrint("[INFO] Hook drain complete.\n");
 
-    /* [BUGFIX 2026/03/15] 不再调用 RestoreAllProcessCallbacks()，
-     * 因为从未修改过回调。 */
 
     KeIpiGenericCall(IpiUninstallHookBroadcastCallback, 0);
     SvmDebugPrint("[INFO] All NPT hooks deactivated (original pages restored).\n");
@@ -346,6 +365,16 @@ VOID CommunicationThread(PVOID Context)
 /* ========================================================================
  *  Delayed hook activation thread
  * ======================================================================== */
+
+/**
+ * @brief 延迟Hook安装线程 - 初始化Hook→准备资源→拆分大页→激活NPT Hook
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] Context - 未使用
+ * @note 完整流程: InitializeProcessHideHooks → PrepareAllNptHookResources
+ *       → LinkTrampolineAddresses → 解析TargetPa → PreSplitLargePageByPa
+ *       → PrewarmPtVaCache → ActivateAllNptHooks → IPI广播激活
+ */
 VOID DelayedHookWorkItemRoutine(PVOID Context)
 {
     UNREFERENCED_PARAMETER(Context);
@@ -397,9 +426,6 @@ VOID DelayedHookWorkItemRoutine(PVOID Context)
 
     SvmDebugPrint("[INFO] SUCCESS! TargetPa All safely resolved.\n");
 
-    /* [BUGFIX 2026/03/15] 二次校验：禁用 OriginalPagePa 或 TargetPa 为 0 的 Hook，
-     * 避免 ActivateAllNptHooks 传递无效参数给 ApplyNptHookByPa。
-     * ZwGetNextProcess 等函数在某些内核版本中 MmGetPhysicalAddress 返回 0。 */
     for (int h = 0; h < HOOK_MAX_COUNT; h++) {
         if (g_HookList[h].IsUsed && g_HookList[h].ResourcesReady) {
             if (g_HookList[h].OriginalPagePa == 0 || g_HookList[h].TargetPa == 0) {
@@ -445,6 +471,14 @@ VOID DelayedHookWorkItemRoutine(PVOID Context)
 /* ========================================================================
  *  IPI 回调
  * ======================================================================== */
+
+/**
+ * @brief IPI回调: 在所有CPU上通过CPUID超级调用刷新NPT TLB激活Hook
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] Argument - 未使用
+ * @return 0
+ */
 ULONG_PTR IpiActivateHookBroadcastCallback(ULONG_PTR Argument)
 {
     UNREFERENCED_PARAMETER(Argument);
@@ -453,6 +487,13 @@ ULONG_PTR IpiActivateHookBroadcastCallback(ULONG_PTR Argument)
     return 0;
 }
 
+/**
+ * @brief IPI回调: 在当前CPU上初始化SVM核心(VMCB配置+VMRUN)
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] Argument - 未使用
+ * @return 1表示成功进入SVM模式, 0表示失败
+ */
 ULONG_PTR IpiInstallBroadcastCallback(ULONG_PTR Argument)
 {
     UNREFERENCED_PARAMETER(Argument);
@@ -474,6 +515,13 @@ ULONG_PTR IpiInstallBroadcastCallback(ULONG_PTR Argument)
     return 0;
 }
 
+/**
+ * @brief IPI回调: 在所有CPU上通过CPUID超级调用退出SVM模式
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] Argument - 未使用
+ * @return 0
+ */
 ULONG_PTR IpiUnloadBroadcastCallback(ULONG_PTR Argument)
 {
     UNREFERENCED_PARAMETER(Argument);
@@ -482,7 +530,13 @@ ULONG_PTR IpiUnloadBroadcastCallback(ULONG_PTR Argument)
     return 0;
 }
 
-/* [BUGFIX 2026/03/15] 新增：卸载前通过 IPI 让所有 CPU 恢复 NPT 映射 */
+/**
+ * @brief IPI回调: 在所有CPU上通过CPUID超级调用恢复NPT原始映射(卸载Hook)
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] Argument - 未使用
+ * @return 0
+ */
 ULONG_PTR IpiUninstallHookBroadcastCallback(ULONG_PTR Argument)
 {
     UNREFERENCED_PARAMETER(Argument);
@@ -494,6 +548,12 @@ ULONG_PTR IpiUninstallHookBroadcastCallback(ULONG_PTR Argument)
 /* ========================================================================
  *  DriverUnload — 删除设备/符号链接, 通知 CommunicationThread 退出
  * ======================================================================== */
+/**
+ * @brief 驱动卸载入口 - 通知CommunicationThread退出并等待, 删除设备/符号链接
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] DriverObject - 驱动对象
+ */
 void UnloadDriver(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
@@ -521,6 +581,13 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject)
 
     SvmDebugPrint("[DrvMain] Unload complete.\n");
 }
+/**
+ * @brief IPI回调: 通过CPUID超级调用触发NPT Hook激活
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] Argument - 未使用
+ * @return 0
+ */
 
 static ULONG_PTR BroadcastHookActivation(ULONG_PTR Argument) {
     UNREFERENCED_PARAMETER(Argument);
@@ -528,6 +595,11 @@ static ULONG_PTR BroadcastHookActivation(ULONG_PTR Argument) {
     __cpuidex(cpuInfo, CPUID_UNLOAD_SVM_INSTALL_HOOK, 0);
     return 0;
 }
+/**
+ * @brief 通过IPI广播在所有CPU上同步激活NPT Hook
+ * @author yewilliam
+ * @date 2026/02/06
+ */
 
 VOID TriggerGlobalHookActivation() {
     SvmDebugPrint("[INFO] IPI broadcast NPT Hook activation...\n");
@@ -537,9 +609,17 @@ VOID TriggerGlobalHookActivation() {
 
 /* ========================================================================
  *  SVM 初始化系统线程
- *  正常加载下 DriverEntry 已在 System 进程上下文,
- *  仍用独立线程避免阻塞 DriverEntry 返回
  * ======================================================================== */
+
+/**
+ * @brief SVM初始化系统线程 - 分配VCPU资源、构建NPT、IPI广播启动SVM
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] StartContext - 未使用
+ * @note 在System进程上下文运行, 独立线程避免阻塞DriverEntry返回
+ *       流程: AMD支持检查 → 分配VCPU_CONTEXT × N核 → PrepareNPT
+ *       → HvInitSharedContext → IPI InitSVMCORE → 启动通信线程和Hook线程
+ */
 VOID SvmInitSystemThread(PVOID StartContext)
 {
     UNREFERENCED_PARAMETER(StartContext);
@@ -652,6 +732,14 @@ VOID SvmInitSystemThread(PVOID StartContext)
  *    sc stop   SvmDebug
  *    sc delete SvmDebug
  * ======================================================================== */
+/**
+ * @brief 驱动主入口 - 创建设备对象/符号链接, 启动SVM初始化线程
+ * @author yewilliam
+ * @date 2026/02/06
+ * @param [in] DriverObject - WDM驱动对象
+ * @param [in] RegistryPath - 注册表路径(未使用)
+ * @return STATUS_SUCCESS或设备创建/线程创建错误码
+ */
 EXTERN_C NTSTATUS DriverEntry(
     _In_ PDRIVER_OBJECT  DriverObject,
     _In_ PUNICODE_STRING RegistryPath)

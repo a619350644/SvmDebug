@@ -4,14 +4,15 @@
  * @author yewilliam
  * @date 2026/02/06
  *
- * 实现四类NPT Hook拦截函数：
- * SSDT系统调用Hook (12个): 进程发现/访问/操控全面拦截
- * 内核导出函数Hook (6个): PsLookup/ObReference/MmCopy等内核级拦截
- * Win32k SSSDT Hook (3个): 窗口查找/枚举过滤
- * Win32kbase内部导出Hook (1个): ValidateHwnd底层窗口验证拦截
- * 采用per-CPU Guard防递归，系统白名单保证桌面稳定。
+ * 实现四类NPT Hook拦截函数:
+ *   SSDT系统调用Hook (12个): 进程发现/访问/操控全面拦截
+ *   内核导出函数Hook (6个): PsLookup/ObReference/MmCopy等内核级拦截
+ *   Win32k SSSDT Hook (3个): 窗口查找/枚举过滤
+ *   Win32kbase内部导出Hook (1个): ValidateHwnd底层窗口验证拦截
+ *
+ * 采用per-CPU Guard防递归, 系统白名单保证桌面稳定。
+ * 全局数据置于显式可写段(.drv_rw), 避免只读页写入导致BSOD。
  */
-
 #include "Hide.h"
 #include <ntstrsafe.h>
 #include <ntimage.h>
@@ -20,11 +21,6 @@
 #define SEC_IMAGE 0x01000000
 #define DEBUG 1
 
-/* [BUGFIX 2026/03/15] 所有运行时可写的全局数据放入显式可写段。
- * 解决 0xBE BSOD: MSVC/Linker 可能将 function-local static 或小数组
- * 放在与 .rdata 共享的页面上（对齐+COMDAT 排布），导致 lock cmpxchg
- * 写只读页 → ATTEMPTED_WRITE_TO_READONLY_MEMORY。
- * 使用自定义段 .drv_rw 并显式标记 RW 来避免。 */
 #pragma section(".drv_rw", read, write)
 #pragma comment(linker, "/SECTION:.drv_rw,RW")
 
@@ -32,11 +28,6 @@ __declspec(allocate(".drv_rw")) static volatile LONG g_Guard[64] = { 0 };
 __declspec(allocate(".drv_rw")) static volatile LONG g_FakePrintOnce[HOOK_MAX_COUNT] = { 0 };
 
 #if DEBUG
-/* [BUGFIX 2026/03/15] 替换 FAKE_PRINT_ONCE: 不再使用 function-local static。
- * 旧版本每个 Fake_ 函数内的 `static LONG _p = 0` 由 InterlockedCompareExchange
- * 通过 lock cmpxchg 访问。x64 上 lock cmpxchg 即使比较失败也会执行写操作，
- * 如果 _p 恰好落在只读页上 → 0xBE BSOD。
- * 新版本使用全局数组 g_FakePrintOnce[]，所有元素在同一显式可写段中。 */
 #define FAKE_PRINT_ONCE_FOR(hookIdx) \
     do { \
         if ((hookIdx) < HOOK_MAX_COUNT && \
@@ -82,7 +73,6 @@ extern POBJECT_TYPE* IoFileObjectType;
 /* ========================================================================
  *  Hook Guard — 轻量级防递归（不修改 IRQL） *   *  【修复】旧版本把 IRQL 提升到 DISPATCH_LEVEL，导致后续调用的 *  内核函数（ObReferenceObjectByHandle、PsLookupProcessByProcessId 等） *  无法访问分页内存 → IRQL_NOT_LESS_OR_EQUAL (0x0A) BSOD。 *   *  NPT Hook 的 trampoline 跳过了 hook 入口点（JMP 指令之后的地址）， *  所以通过 trampoline 调用原函数不会触发 NPF 重入。 *  这里只保留一个轻量级的 per-CPU guard 作为安全网， *  完全不修改 IRQL。
  * ======================================================================== */
-/* [BUGFIX 2026/03/15] g_Guard 已移至 .drv_rw 段（文件顶部） */
 
 /**
  * @brief 进入Hook防递归保护 - per-CPU原子锁, 不修改IRQL
@@ -1969,9 +1959,6 @@ VOID LinkTrampolineAddresses()
     LH(HOOK_NtUserBuildHwndList, g_OrigNtUserBuildHwndList, FnNtUserBuildHwndList);
     LH(HOOK_ValidateHwnd, g_OrigValidateHwnd, FnValidateHwnd);
 
-    /* [BUGFIX 2026/03/15] g_Trampoline_NtUserBuildHwndList 是独立全局变量，
-     * 供 Asm_Fake_NtUserBuildHwndList 使用 (jmp qword ptr [g_Trampoline_...])。
-     * LH 宏只赋值了 g_OrigNtUserBuildHwndList，但 ASM 需要这个单独的指针。 */
     if (g_HookList[HOOK_NtUserBuildHwndList].IsUsed && g_HookList[HOOK_NtUserBuildHwndList].TrampolinePage)
         g_Trampoline_NtUserBuildHwndList = (ULONG64)g_HookList[HOOK_NtUserBuildHwndList].TrampolinePage;
 #undef LH
@@ -2354,9 +2341,6 @@ static VOID NTAPI NoopProcessNotifyCallback(PVOID a1, PVOID a2, PVOID a3)
  * @note 绝不清零 EX_FAST_REF！那会破坏引用计数 → LIST_ENTRY 损坏 → BSOD 0x139
  *       正确做法：替换 EX_CALLBACK_ROUTINE_BLOCK.Function 为 Noop
  *
- * [BUGFIX 2026/03/15] 提升 IRQL 到 APC_LEVEL 防止在替换过程中被 APC 打断，
- * 减少与 mpengine 等扫描线程的竞态窗口。替换完成后等待 drain 确保
- * 所有正在执行的回调完成退出。
  */
 void DisableAllProcessCallbacks()
 {
@@ -2395,7 +2379,6 @@ void DisableAllProcessCallbacks()
 
 /**
  * @brief 恢复所有进程创建回调
- * [BUGFIX 2026/03/15] 同样提升 IRQL 保护，防止恢复过程中竞态
  */
 void RestoreAllProcessCallbacks()
 {

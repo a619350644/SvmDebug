@@ -52,7 +52,7 @@
     <ClCompile Include="HvMemory.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Disguise.c">
+    <ClCompile Include="Disguise.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

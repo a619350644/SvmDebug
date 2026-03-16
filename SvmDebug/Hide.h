@@ -119,7 +119,6 @@ extern HANDLE g_WorkerThreadHandle;
 
 extern volatile BOOLEAN g_DriverUnloading;
 
-/* [BUGFIX 2026/03/15] 延迟回调操作标志 */
 extern volatile LONG g_PendingCallbackOp;
 
 

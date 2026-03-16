@@ -19,7 +19,7 @@ _sgdt(
 );
 
 /* ========================================================================
- *  SVM_HWND ���� �� ȫ��Ψһ����
+ *  SVM_HWND 类型定义 - 全局唯一定义
  * ======================================================================== */
 #ifndef SVM_HWND_DEFINED
 #define SVM_HWND_DEFINED
@@ -27,7 +27,7 @@ typedef HANDLE SVM_HWND;
 #endif
 
 /* ========================================================================
- *  ϵͳ��Ϣö��
+ *  系统信息枚举
  * ======================================================================== */
 typedef enum _SYSTEM_INFORMATION_CLASS {
     SystemBasicInformation = 0,
@@ -37,7 +37,7 @@ typedef enum _SYSTEM_INFORMATION_CLASS {
 } SYSTEM_INFORMATION_CLASS;
 
 /* ========================================================================
- *  ϵͳ������Ϣ�ṹ��
+ *  系统进程信息结构体
  * ======================================================================== */
 typedef struct _SYSTEM_PROCESS_INFORMATION {
     ULONG NextEntryOffset;
@@ -111,7 +111,7 @@ typedef struct _SVM_HANDLE_INFO_EX {
 } SVM_HANDLE_INFO_EX, * PSVM_HANDLE_INFO_EX;
 
 /* ========================================================================
- *  SSDT ����ָ��
+ *  SSDT 函数指针类型定义
  * ======================================================================== */
 typedef NTSTATUS(NTAPI* FnNtQuerySystemInformation)(
     SYSTEM_INFORMATION_CLASS SystemInformationClass,
@@ -187,7 +187,7 @@ typedef NTSTATUS(NTAPI* FnNtQueryInformationThread)(
     PULONG ReturnLength);
 
 /* ========================================================================
- *  �ں˵�������ָ��
+ *  内核导出函数指针类型定义
  * ======================================================================== */
 typedef NTSTATUS(NTAPI* FnPsLookupProcessByProcessId)(
     HANDLE ProcessId, PEPROCESS* Process);
@@ -213,7 +213,7 @@ typedef VOID(NTAPI* FnKeStackAttachProcess)(
     PEPROCESS Process, PKAPC_STATE ApcState);
 
 /* ========================================================================
- *  SSSDT (Win32k) ����ָ��
+ *  SSSDT (Win32k) 函数指针类型定义
  * ======================================================================== */
 typedef SVM_HWND(NTAPI* FnNtUserFindWindowEx)(
     SVM_HWND hwndParent, SVM_HWND hwndChildAfter,
@@ -225,36 +225,37 @@ typedef SVM_HWND(NTAPI* FnNtUserWindowFromPoint)(
 typedef PVOID(NTAPI* FnValidateHwnd)(
     SVM_HWND hwnd);
 
-// NtUserBuildHwndList (Win10 8������)
+// NtUserBuildHwndList (Win10 8参数版本)
 typedef NTSTATUS(NTAPI* FnNtUserBuildHwndList)(
     HANDLE hdesk, SVM_HWND hwndNext, ULONG fEnumChildren,
     ULONG bRemoveImmersive, ULONG idThread,
     ULONG cHwndMax, SVM_HWND* phwndFirst, ULONG* pcHwndNeeded);
 
 /* ========================================================================
- *  �ڲ�δ��������ָ��
+ *  内部未导出函数指针类型定义
  * ======================================================================== */
 typedef PVOID(NTAPI* FnPspReferenceCidTableEntry)(
     HANDLE Id, BOOLEAN IsThread);
 
 /* ========================================================================
- *  Extern ����
+ *  Extern 声明
  * ======================================================================== */
 
-/* ========================================================================
- *  Win32k minimal structures for ValidateHwnd Hook *  tagWND+0x10 -> pti (THREADINFO*), pti+0x00 -> pEThread
- * ======================================================================== */
+ /* ========================================================================
+  *  Win32k 最小窗口结构体 - 用于ValidateHwnd Hook
+  *  tagWND+0x10 -> pti (THREADINFO*), pti+0x00 -> pEThread
+  * ======================================================================== */
 #pragma pack(push, 8)
 typedef struct _SVM_W32THREAD {
     PETHREAD pEThread;           // +0x00
-} SVM_W32THREAD, *PSVM_W32THREAD;
+} SVM_W32THREAD, * PSVM_W32THREAD;
 
 typedef struct _SVM_WND {
     PVOID           hHandle;     // +0x00 HEAD.h
     ULONG           cLockObj;    // +0x08 HEAD.cLockObj
     ULONG           _pad;        // +0x0C
     PSVM_W32THREAD  pti;         // +0x10 THROBJHEAD.pti
-} SVM_WND, *PSVM_WND;
+} SVM_WND, * PSVM_WND;
 #pragma pack(pop)
 
 EXTERN_C NTSTATUS NTAPI NtQuerySystemInformation(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
