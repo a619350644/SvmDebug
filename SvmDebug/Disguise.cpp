@@ -1,17 +1,4 @@
-﻿/**
- * @file Disguise.c
- * @brief 进程伪装实现 - PEB/LDR模块链表篡改, 32/64位双架构支持
- * @author yewilliam
- * @date 2026/02/06
- *
- * 通过修改目标进程的PEB(Process Environment Block)实现进程伪装:
- *   - 替换ImagePathName/CommandLine为系统进程路径
- *   - 篡改PEB_LDR_DATA模块链表(InLoadOrder/InMemoryOrder/InInitializationOrder)
- *   - 支持WoW64 32位进程的PEB32/LDR32伪装
- *   - 复制源进程模块列表到目标进程用户空间
- */
-
-#include <ntifs.h>
+﻿#include <ntifs.h>
 #include <ntimage.h>
 #include <windef.h>
 #include <intrin.h>
@@ -768,7 +755,7 @@ void resetProcessPeb64Moudle(PEPROCESS fakeProcess, PEPROCESS srcProcess)
 
 	KeStackAttachProcess(srcProcess, &srcApcState);
 
-	/* 【修复】__try 包裹所有用户态PEB/LDR访问 —— 进程可能正在退出,结构被部分拆除 */
+
 	__try {
 		SIZE_T pro = NULL;
 		MmCopyVirtualMemory(srcProcess, srcPeb, srcProcess, srcPeb, 1, UserMode, &pro);
@@ -1028,7 +1015,7 @@ void resetProcessPeb32Moudle(PEPROCESS fakeProcess)
 
 	KeStackAttachProcess(fakeProcess, &fakeApcState);
 
-	/* 【修复】__try 包裹所有用户态PEB/LDR访问 */
+
 	__try {
 		SIZE_T pro = NULL;
 
@@ -1118,6 +1105,10 @@ BOOLEAN FakeProcessByPid(PEPROCESS fakeProcess, HANDLE SrcPid)
 	}
 
 	/*
+	 * [BUGFIX] Wrap all PEB manipulation in __try/__except.
+	 * User-mode PEB/LDR structures can be partially torn down during
+	 * process exit or not yet initialized during early creation.
+	 * Any access violation here should not BSOD the system.
 	 */
 	__try {
 		resetProcessImageName(fakeProcess, Process);

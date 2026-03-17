@@ -52,7 +52,10 @@
     <ClCompile Include="HvMemory.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Disguise.c">
+    <ClCompile Include="Disguise.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="DebugApi.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -91,6 +94,9 @@
       <Filter>MDL</Filter>
     </ClInclude>
     <ClInclude Include="HvMemory.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="DebugApi.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
