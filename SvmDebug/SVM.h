@@ -2,7 +2,7 @@
  * @file SVM.h
  * @brief SVM虚拟化引擎头文件 - VCPU上下文结构体与函数声明
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  *
  * 定义VCPU_CONTEXT结构体(per-CPU虚拟化上下文)和SVM核心函数声明。
  * SplitPtPages/SplitPtPas数组一一对应, 在PASSIVE_LEVEL拆分时记录PA,

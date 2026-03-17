@@ -2,7 +2,7 @@
  * @file Common.h
  * @brief 公共头文件 - 全局数据结构定义、VMCB布局、常量宏、CPU检测函数声明
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  *
  * 本文件为整个SVM Hypervisor项目的基础头文件，包含：
  *   - MSR/CPUID 常量定义
@@ -337,7 +337,7 @@ BOOLEAN CommCheckAMDSvmlFeature();
 /**
  * @brief SVM调试输出函数 - 带[SvmDebug]前缀的格式化打印
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Format - printf格式字符串
  * @param [in] ...    - 可变参数
  */

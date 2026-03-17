@@ -2,7 +2,7 @@
  * @file HvMemory.cpp
  * @brief 超级调用内存操作 - 基于物理内存的跨进程读写
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  *
  * 提供绕过所有内核API的进程内存读写能力：
  * Guest侧: 获取目标CR3 → 填充共享上下文 → CPUID触发超级调用
@@ -23,7 +23,7 @@ FAST_MUTEX g_HvMutex;
 /**
  * @brief 初始化Guest-VMM共享上下文页 - 分配连续物理内存供超级调用通信
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return 成功返回STATUS_SUCCESS, 分配失败返回STATUS_INSUFFICIENT_RESOURCES
  */
 NTSTATUS HvInitSharedContext()
@@ -52,7 +52,7 @@ NTSTATUS HvInitSharedContext()
 /**
  * @brief 释放共享上下文页
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  */
 VOID HvFreeSharedContext()
 {
@@ -83,7 +83,7 @@ static VOID UnmapPhysicalPage(PVOID Va, SIZE_T Size)
 /**
  * @brief 遍历x64四级页表将Guest VA翻译为Guest PA - 支持1GB/2MB/4KB页面
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] GuestCr3 - 目标进程的CR3(PML4基址)
  * @param [in] GuestVa  - 要翻译的虚拟地址
  * @return 物理地址, 页面不存在返回0
@@ -156,7 +156,7 @@ static ULONG64 TranslateGuestVaToPa(ULONG64 GuestCr3, ULONG64 GuestVa)
 /**
  * @brief 物理地址间内存拷贝 - 通过MmGetVirtualForPhysical映射后拷贝
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] DestPa  - 目标物理地址
  * @param [in] SrcPa   - 源物理地址
  * @param [in] Size    - 拷贝字节数(不超过PAGE_SIZE)
@@ -184,7 +184,6 @@ static BOOLEAN PhysicalMemoryCopy(
     ULONG64 srcOffset = SrcPa & 0xFFF;
     ULONG64 dstOffset = DestPa & 0xFFF;
 
-    // Ensure we don't overflow the mapped page
     SIZE_T srcAvail = PAGE_SIZE - (SIZE_T)srcOffset;
     SIZE_T dstAvail = PAGE_SIZE - (SIZE_T)dstOffset;
     SIZE_T copyLen = Size;
@@ -205,7 +204,7 @@ static BOOLEAN PhysicalMemoryCopy(
 /**
  * @brief VMM侧内存操作处理器 - VMEXIT时读取共享上下文执行物理内存操作
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in,out] vpData - VCPU上下文(RBX=共享上下文PA, RAX=返回值)
  * @note 按页遍历目标VA, 翻译PA后逐页拷贝, 支持最大1MB单次请求
  */
@@ -315,7 +314,7 @@ static ULONG64 GetProcessCr3(ULONG64 TargetPid)
 /**
  * @brief Guest侧读取目标进程内存 - 通过CPUID超级调用触发VMM执行物理拷贝
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  TargetPid - 目标进程PID
  * @param [in]  Address   - 目标进程中的虚拟地址
  * @param [out] Buffer    - 读取数据的输出缓冲区
@@ -388,7 +387,7 @@ NTSTATUS HvReadProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZ
 /**
  * @brief Guest侧写入目标进程内存 - 通过CPUID超级调用触发VMM执行物理拷贝
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] TargetPid - 目标进程PID
  * @param [in] Address   - 目标进程中的虚拟地址
  * @param [in] Buffer    - 要写入的数据缓冲区

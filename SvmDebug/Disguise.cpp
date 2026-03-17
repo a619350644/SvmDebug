@@ -755,7 +755,7 @@ void resetProcessPeb64Moudle(PEPROCESS fakeProcess, PEPROCESS srcProcess)
 
 	KeStackAttachProcess(srcProcess, &srcApcState);
 
-	/* 【修复】__try 包裹所有用户态PEB/LDR访问 —— 进程可能正在退出,结构被部分拆除 */
+
 	__try {
 		SIZE_T pro = NULL;
 		MmCopyVirtualMemory(srcProcess, srcPeb, srcProcess, srcPeb, 1, UserMode, &pro);
@@ -1015,7 +1015,7 @@ void resetProcessPeb32Moudle(PEPROCESS fakeProcess)
 
 	KeStackAttachProcess(fakeProcess, &fakeApcState);
 
-	/* 【修复】__try 包裹所有用户态PEB/LDR访问 */
+
 	__try {
 		SIZE_T pro = NULL;
 

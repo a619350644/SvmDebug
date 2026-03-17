@@ -2,7 +2,7 @@
  * @file DrvMain.cpp
  * @brief 驱动主入口 - DriverEntry、IRP派发、SVM初始化线程、卸载清理
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  *
  * 标准WDM驱动入口点, 提供:
  *   - 设备对象/符号链接创建(R3通过\\.\SvmDebug通信)
@@ -71,7 +71,7 @@ VOID DelayedHookWorkItemRoutine(PVOID Context);
 /**
  * @brief 释放所有驱动资源 - VCPU上下文、Host栈、NPT页表、TrampolinePage
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @note TrampolinePage在此统一释放(CleanupAllNptHooks故意保留以防执行中崩溃)
  */
 static VOID ReleaseDriverResources()
@@ -270,7 +270,7 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 /**
  * @brief 通信工作线程 - 轮询保护请求、执行PEB伪装、卸载时统一清理
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Context - 未使用
  * @note 运行在PASSIVE_LEVEL, 1秒轮询间隔
  *       卸载流程: 清除保护→drain等待→IPI卸载Hook→IPI退出SVM→释放资源
@@ -369,7 +369,7 @@ VOID CommunicationThread(PVOID Context)
 /**
  * @brief 延迟Hook安装线程 - 初始化Hook→准备资源→拆分大页→激活NPT Hook
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Context - 未使用
  * @note 完整流程: InitializeProcessHideHooks → PrepareAllNptHookResources
  *       → LinkTrampolineAddresses → 解析TargetPa → PreSplitLargePageByPa
@@ -475,7 +475,7 @@ VOID DelayedHookWorkItemRoutine(PVOID Context)
 /**
  * @brief IPI回调: 在所有CPU上通过CPUID超级调用刷新NPT TLB激活Hook
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Argument - 未使用
  * @return 0
  */
@@ -490,7 +490,7 @@ ULONG_PTR IpiActivateHookBroadcastCallback(ULONG_PTR Argument)
 /**
  * @brief IPI回调: 在当前CPU上初始化SVM核心(VMCB配置+VMRUN)
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Argument - 未使用
  * @return 1表示成功进入SVM模式, 0表示失败
  */
@@ -518,7 +518,7 @@ ULONG_PTR IpiInstallBroadcastCallback(ULONG_PTR Argument)
 /**
  * @brief IPI回调: 在所有CPU上通过CPUID超级调用退出SVM模式
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Argument - 未使用
  * @return 0
  */
@@ -533,7 +533,7 @@ ULONG_PTR IpiUnloadBroadcastCallback(ULONG_PTR Argument)
 /**
  * @brief IPI回调: 在所有CPU上通过CPUID超级调用恢复NPT原始映射(卸载Hook)
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Argument - 未使用
  * @return 0
  */
@@ -551,7 +551,7 @@ ULONG_PTR IpiUninstallHookBroadcastCallback(ULONG_PTR Argument)
 /**
  * @brief 驱动卸载入口 - 通知CommunicationThread退出并等待, 删除设备/符号链接
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] DriverObject - 驱动对象
  */
 void UnloadDriver(PDRIVER_OBJECT DriverObject)
@@ -584,7 +584,7 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject)
 /**
  * @brief IPI回调: 通过CPUID超级调用触发NPT Hook激活
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Argument - 未使用
  * @return 0
  */
@@ -598,7 +598,7 @@ static ULONG_PTR BroadcastHookActivation(ULONG_PTR Argument) {
 /**
  * @brief 通过IPI广播在所有CPU上同步激活NPT Hook
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  */
 
 VOID TriggerGlobalHookActivation() {
@@ -614,7 +614,7 @@ VOID TriggerGlobalHookActivation() {
 /**
  * @brief SVM初始化系统线程 - 分配VCPU资源、构建NPT、IPI广播启动SVM
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] StartContext - 未使用
  * @note 在System进程上下文运行, 独立线程避免阻塞DriverEntry返回
  *       流程: AMD支持检查 → 分配VCPU_CONTEXT × N核 → PrepareNPT
@@ -735,7 +735,7 @@ VOID SvmInitSystemThread(PVOID StartContext)
 /**
  * @brief 驱动主入口 - 创建设备对象/符号链接, 启动SVM初始化线程
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] DriverObject - WDM驱动对象
  * @param [in] RegistryPath - 注册表路径(未使用)
  * @return STATUS_SUCCESS或设备创建/线程创建错误码

@@ -2,7 +2,7 @@
  * @file NPT.h
  * @brief 嵌套页表(NPT)管理头文件 - NPT条目结构体与函数声明
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  */
 
 #pragma once
@@ -56,6 +56,7 @@ typedef struct _NPT_CONTEXT{
 
 BOOLEAN IsSupportNPT();
 NTSTATUS InitNPT(PVCPU_CONTEXT vpData);
+static PULONG64 CachePtVa(ULONG64 PtPa);
 ULONG64 PrepareNPT(PVCPU_CONTEXT vpData);
 VOID FreePvCPUNPT(PVCPU_CONTEXT vpData);
 PVOID AllocateAlignedZeroedMemory(SIZE_T NumberOfBytes);
@@ -73,7 +74,7 @@ NTSTATUS GPaToHostPa(PNPT_CONTEXT npt_context);
 PNPT_ENTRY GetNptPteByHostPa(PVCPU_CONTEXT vpData, ULONG64 TargetPa);
 NTSTATUS PreSplitLargePageByPa(PVCPU_CONTEXT vpData, ULONG64 TargetPa);
 
-// 【新增】预热 PT 虚拟地址缓存 - 在 Hook 激活前调用
+
 // 确保所有 VMEXIT 中需要访问的 PT 表 VA 都已缓存
 _IRQL_requires_max_(PASSIVE_LEVEL)
 VOID PrewarmPtVaCache(PVCPU_CONTEXT vpData);

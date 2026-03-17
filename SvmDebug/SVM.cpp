@@ -5,7 +5,7 @@
  * @file SVM.cpp
  * @brief SVM虚拟化引擎 - VMCB配置、VMEXIT分派、超级调用处理
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  *
  * 实现AMD SVM核心功能:
  *   - VMCB控制区/状态保存区初始化
@@ -21,7 +21,7 @@ extern ULONG64 g_SystemCr3;
 /**
  * @brief 强制刷新NPT TLB - 清除VMCB缓存并重新加载NPT CR3
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in,out] vpData - VCPU上下文
  * @note 设置VmcbClean=0强制处理器重新读取所有VMCB字段, TlbControl=1触发TLB全刷新
  */
@@ -35,7 +35,7 @@ static inline VOID ForceNptFlush(PVCPU_CONTEXT vpData)
 /**
  * @brief 快速判断地址是否在内核空间范围内 - 检查高16位canonical形式
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Address - 待检查的64位虚拟地址
  * @return TRUE表示地址在内核空间(0xFFFF8000_00000000以上), FALSE表示不在
  */
@@ -47,7 +47,7 @@ static __forceinline BOOLEAN IsKernelAddressLikely(UINT64 Address)
 /**
  * @brief 从Guest RIP解码MOV CRn指令 - 解析REX前缀、操作码和ModRM字段
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  GuestRip - Guest当前指令指针
  * @param [out] crNum    - 解码出的CR寄存器编号(0/2/3/4)
  * @param [out] gprNum   - 解码出的通用寄存器编号(0-15)
@@ -107,7 +107,7 @@ static BOOLEAN DecodeCrInstructionFromRip(
 /**
  * @brief 读取Guest通用寄存器值 - 根据寄存器索引从VMCB或GPR结构体读取
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] vpData   - VCPU上下文(GPR保存区)
  * @param [in] vmcb     - VMCB(RAX/RSP保存在StateSaveArea中)
  * @param [in] gprIndex - 寄存器索引(0=RAX, 1=RCX, ..., 15=R15)
@@ -139,7 +139,7 @@ static UINT64 ReadGuestGpr(PVCPU_CONTEXT vpData, PVMCB vmcb, ULONG gprIndex)
 /**
  * @brief 写入Guest通用寄存器值 - 根据寄存器索引写入VMCB或GPR结构体
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in,out] vpData   - VCPU上下文(GPR保存区)
  * @param [in,out] vmcb     - VMCB(RAX/RSP保存在StateSaveArea中)
  * @param [in]     gprIndex - 寄存器索引(0=RAX, 1=RCX, ..., 15=R15)
@@ -170,14 +170,14 @@ static VOID WriteGuestGpr(PVCPU_CONTEXT vpData, PVMCB vmcb, ULONG gprIndex, UINT
 /**
  * @brief 初始化当前CPU的SVM核心 - 捕获上下文、配置VMCB、进入VMM
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in,out] vpData - 当前CPU的VCPU上下文(已预分配)
  * @return STATUS_SUCCESS表示成功进入SVM Guest模式
  * @note 调用RtlCaptureContext获取当前寄存器状态作为Guest初始状态,
 /**
  * @brief 检测自研Hypervisor是否已安装 - 通过CPUID 0x40000000读取Vendor ID
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return TRUE表示CPUID返回"VtDebugView "(自定义签名), FALSE表示未安装
  * @note 用于InitSVMCORE中避免重复虚拟化(VMRUN后CPUID被拦截返回自定义签名)
  */
@@ -202,7 +202,7 @@ NTSTATUS InitSVMCORE(PVCPU_CONTEXT vpData)
 /**
  * @brief 配置VMCB控制区和状态保存区 - 填充段寄存器、控制寄存器、拦截位
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in,out] vpData        - VCPU上下文(包含Guest/Host VMCB)
  * @param [in]     contextRecord - RtlCaptureContext捕获的CPU寄存器快照
  * @return STATUS_SUCCESS表示VMCB配置完成, STATUS_NOT_SUPPORTED表示NPT不可用
@@ -317,7 +317,7 @@ NTSTATUS PrepareVMCB(PVCPU_CONTEXT vpData, CONTEXT contextRecord)
 /**
  * @brief 从GDT获取段描述符属性 - 解析Type/DPL/Present/LongMode等字段
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] SegmentSelector - 段选择子(CS/DS/SS等)
  * @param [in] GdtBase         - GDT基地址
  * @return VMCB格式的16位段属性值
@@ -342,7 +342,7 @@ UINT16 GetSegmentAttribute(UINT16 SegmentSelector, UINT64 GdtBase)
 /**
  * @brief 从GDT获取段基地址 - 拼接BaseLow/BaseMiddle/BaseHigh
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] SegmentSelector - 段选择子
  * @param [in] GdtBase         - GDT基地址
  * @return 段基地址(x64长模式下通常为0, FS/GS例外)
@@ -372,7 +372,7 @@ BOOLEAN IsSvmHypervisorInstalled()
 /**
  * @brief 处理自定义超级调用命令 - 在VMEXIT(CPUID/VMMCALL)中执行保护操作
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in,out] vpData - VCPU上下文
  * @param [in,out] vmcb   - Guest VMCB
  * @param [in]     cmd    - 命令码(0x12345678=保护PID, 0x12345679=保护HWND等)
@@ -426,7 +426,7 @@ static BOOLEAN HandleHypercallCommand(PVCPU_CONTEXT vpData, PVMCB vmcb, UINT32 c
 /**
  * @brief VMEXIT分派中心 - 根据退出码分发到对应处理器
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in,out] vpData - VCPU上下文
  *
  * 处理的VMEXIT类型:
@@ -675,7 +675,7 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
 /**
  * @brief 执行单次VMRUN - 包装SvLaunchVm汇编调用
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in,out] vpData - VCPU上下文
  */
 
@@ -687,7 +687,7 @@ void SVMLauchRun(PVCPU_CONTEXT vpData)
 /**
  * @brief VMM主循环 - 反复执行VMRUN并处理VMEXIT直到收到退出信号
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in,out] vpData - VCPU上下文
  * @note 循环: VMRUN → 保存RAX → SvHandleVmExit → 检查isExit
  *       退出后调用SvSwitchStack切回Guest栈
@@ -705,7 +705,7 @@ EXTERN_C void HostLoop(PVCPU_CONTEXT vpData)
 /**
  * @brief 调试打印Guest GPR寄存器值
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Gpr - Guest通用寄存器结构体指针
  */
 

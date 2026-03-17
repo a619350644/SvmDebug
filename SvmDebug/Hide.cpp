@@ -2,7 +2,7 @@
  * @file Hide.cpp
  * @brief 进程保护逻辑实现 - 22个Fake函数、SSDT/SSSDT解析、窗口隐藏
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  *
  * 实现四类NPT Hook拦截函数:
  *   SSDT系统调用Hook (12个): 进程发现/访问/操控全面拦截
@@ -71,13 +71,13 @@ extern POBJECT_TYPE* IoFileObjectType;
 
 
 /* ========================================================================
- *  Hook Guard — 轻量级防递归（不修改 IRQL） *   *  【修复】旧版本把 IRQL 提升到 DISPATCH_LEVEL，导致后续调用的 *  内核函数（ObReferenceObjectByHandle、PsLookupProcessByProcessId 等） *  无法访问分页内存 → IRQL_NOT_LESS_OR_EQUAL (0x0A) BSOD。 *   *  NPT Hook 的 trampoline 跳过了 hook 入口点（JMP 指令之后的地址）， *  所以通过 trampoline 调用原函数不会触发 NPF 重入。 *  这里只保留一个轻量级的 per-CPU guard 作为安全网， *  完全不修改 IRQL。
+ *  Hook Guard — 轻量级防递归（不修改 IRQL） *   *  
  * ======================================================================== */
 
 /**
  * @brief 进入Hook防递归保护 - per-CPU原子锁, 不修改IRQL
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [out] OldIrql - 输出当前IRQL(仅记录, 不提升)
  * @return TRUE表示成功获取Guard, FALSE表示当前CPU已在Guard中(递归)
  */
@@ -97,7 +97,7 @@ static __forceinline BOOLEAN EnterHookGuard(PKIRQL OldIrql)
 /**
  * @brief 离开Hook防递归保护 - 释放per-CPU原子锁
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] OldIrql - EnterHookGuard时记录的IRQL(未使用)
  */
 static __forceinline VOID LeaveHookGuard(KIRQL OldIrql)
@@ -138,7 +138,7 @@ BOOLEAN AddProtectedPid(HANDLE Pid)
 /**
  * @brief 从保护列表中移除PID
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Pid - 要移除的进程ID
  * @return TRUE表示移除成功, FALSE表示未找到
  */
@@ -199,7 +199,7 @@ BOOLEAN AddProtectedChildHwnd(SVM_HWND Hwnd)
 /**
  * @brief 清除所有保护目标 - PID/HWND/子窗口列表全部清零
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  */
 VOID ClearAllProtectedTargets()
 {
@@ -239,12 +239,7 @@ static FnNtQueryInformationThread      g_OrigNtQueryInformationThread = NULL;
 static FnPsLookupProcessByProcessId    g_OrigPsLookupProcessByProcessId = NULL;
 static FnPsLookupThreadByThreadId      g_OrigPsLookupThreadByThreadId = NULL;
 static FnObReferenceObjectByHandle     g_OrigObReferenceObjectByHandle = NULL;
-/* 【修复 物理机BSOD】Hook 内部函数 ObpReferenceObjectByHandleWithTag
- * 逆向 ObReferenceObjectByHandleWithTag 得到真实签名（8个参数）:
- *   ObpReferenceObjectByHandleWithTag(
- *     (ULONG_PTR)Handle, DesiredAccess, (__int64)ObjectType,
- *     AccessMode, Tag, Object, HandleInformation, 0);
- */
+
 typedef NTSTATUS(NTAPI* FnObpRefByHandleWithTag)(
     ULONG_PTR Handle, ACCESS_MASK DesiredAccess, POBJECT_TYPE ObjectType,
     KPROCESSOR_MODE AccessMode, ULONG Tag, PVOID* Object,
@@ -424,7 +419,7 @@ static PVOID FindWin32kbaseExport(PCSTR ExportName)
 /**
  * @brief 检查PID是否在保护列表中
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Pid - 要检查的进程ID
  * @return TRUE表示受保护, FALSE表示未保护
  */
@@ -466,7 +461,7 @@ BOOLEAN IsProtectedHwnd(SVM_HWND Hwnd)
 /**
  * @brief 检查当前调用者进程是否为受保护进程
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return TRUE表示调用者受保护, FALSE表示不受保护
  */
 BOOLEAN IsCallerProtected()
@@ -479,7 +474,7 @@ BOOLEAN IsCallerProtected()
 /**
  * @brief 检查进程句柄是否指向受保护进程 - 通过ObReferenceObjectByHandle解析
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] ProcessHandle - 进程句柄
  * @return TRUE表示句柄指向受保护进程, FALSE表示不是
  */
@@ -559,7 +554,7 @@ PVOID GetTrueSsdtAddress(PCWSTR ZwName)
     }
     if (!syscallIndex) return NULL;
 
-    PUCHAR kiSysCall = (PUCHAR)__readmsr(0xC0000082);
+    PUCHAR kiSysCall = (PUCHAR)__readmsr(MSR_LSTAR);
     PVOID ssdtPtr = NULL;
     for (int i = 0; i < 1000; i++) {
         if (kiSysCall[i] == 0x4C && kiSysCall[i + 1] == 0x8D &&
@@ -587,7 +582,7 @@ static PVOID EnsureSsdtBase()
 {
     if (g_SsdtBase) return g_SsdtBase;
 
-    PUCHAR kiSysCall = (PUCHAR)__readmsr(0xC0000082);
+    PUCHAR kiSysCall = (PUCHAR)__readmsr(MSR_LSTAR);
     for (int i = 0; i < 1000; i++) {
         if (kiSysCall[i] == 0x4C && kiSysCall[i + 1] == 0x8D && kiSysCall[i + 2] == 0x15) {
             LONG offset = *(PLONG)(&kiSysCall[i + 3]);
@@ -700,13 +695,13 @@ static PEPROCESS FindGuiProcess()
 /**
  * @brief 初始化SSSDT(Win32k影子系统调用表)解析器
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return 成功返回STATUS_SUCCESS, 未找到返回STATUS_NOT_FOUND
  * @note 解析Shadow SSDT获取W32pServiceTable基址和函数数量限制
  */
 NTSTATUS InitSssdtResolver()
 {
-    PUCHAR kiSysCall = (PUCHAR)__readmsr(0xC0000082);
+    PUCHAR kiSysCall = (PUCHAR)__readmsr(MSR_LSTAR);
     PVOID keSDT = NULL, keSDTShadow = NULL;
 
     for (int i = 0; i < 1000; i++) {
@@ -756,7 +751,7 @@ NTSTATUS InitSssdtResolver()
 /**
  * @brief 通过索引获取SSSDT中的函数地址
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Index - SSSDT函数索引
  * @return 函数虚拟地址, 索引越界返回NULL
  */
@@ -771,7 +766,7 @@ PVOID GetSssdtFunctionAddress(ULONG Index)
 /**
  * @brief 模式扫描定位PspReferenceCidTableEntry - 从PsLookupProcessByProcessId中查找CALL指令
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return PspReferenceCidTableEntry的虚拟地址, 未找到返回NULL
  */
 PVOID ScanForPspReferenceCidTableEntry()
@@ -853,9 +848,6 @@ static PVOID ScanWrapperForInternalTarget(PUCHAR func, int range)
 /**
  * @brief 扫描找到内部函数 ObpReferenceObjectByHandleWithTag
  *
- * 【修复 物理机BSOD】Build 19041.6807 使用 retpoline/CFG:
- *   LEA R11, [rip+offset]        ; 加载真实目标
- *   CALL __guard_dispatch_icall   ; E8 → CFG thunk, 不是真实目标!
  *
  * 新策略: 优先查找 LEA [rip+disp] 模式, 验证目标是大函数
  */
@@ -954,7 +946,7 @@ ULONG GetSssdtIndexDynamic(PCSTR FunctionName)
 /**
  * @brief Hook: NtQuerySystemInformation - 从系统信息查询结果中过滤受保护进程
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  SystemInformationClass  - 信息类型(Process/Handle/ExtendedHandle)
  * @param [out] SystemInformation       - 系统信息输出缓冲区
  * @param [in]  SystemInformationLength - 缓冲区大小
@@ -1009,7 +1001,7 @@ static NTSTATUS NTAPI Fake_NtQuerySystemInformation(
                         if (!current->NextEntryOffset)
                             previous->NextEntryOffset = 0;
                         else
-                            previous->NextEntryOffset += current->NextEntryOffset;
+                            previous->NextEntryOffset += current->NextEntryOffset;      //这里是关键把偏移增加上去，然后就相当于跳过了我们保护的进程
 
                         if (!current->NextEntryOffset)
                             break;
@@ -1044,7 +1036,7 @@ static NTSTATUS NTAPI Fake_NtQuerySystemInformation(
             for (ULONG_PTR i = 0; i < handleInfoEx->NumberOfHandles; i++) {
                 if (!IsProtectedPid((HANDLE)handleInfoEx->Handles[i].OwnerPid)) {
                     if (dest != i)
-                        handleInfoEx->Handles[dest] = handleInfoEx->Handles[i];
+                        handleInfoEx->Handles[dest] = handleInfoEx->Handles[i];//这里可以跳过句柄表中的句柄
                     dest++;
                 }
             }
@@ -1059,7 +1051,7 @@ static NTSTATUS NTAPI Fake_NtQuerySystemInformation(
 /**
  * @brief Hook: NtOpenProcess - 阻止外部进程打开受保护进程
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [out] ProcessHandle   - 输出的进程句柄
  * @param [in]  DesiredAccess   - 请求的访问权限
  * @param [in]  ObjectAttributes - 对象属性
@@ -1089,7 +1081,7 @@ static NTSTATUS NTAPI Fake_NtOpenProcess(
 
     if (IsCallerProtected() && ClientId && !IsProtectedPid(ClientId->UniqueProcess))
         return g_OrigNtOpenProcess(ProcessHandle,
-            PROCESS_QUERY_LIMITED_INFORMATION, ObjectAttributes, ClientId);
+            PROCESS_QUERY_LIMITED_INFORMATION, ObjectAttributes, ClientId);//这里是判断到了是我们保护的进程，那么我们的权限设置为0x1000
 
     return g_OrigNtOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId);
 }
@@ -1097,7 +1089,7 @@ static NTSTATUS NTAPI Fake_NtOpenProcess(
 /**
  * @brief Hook: NtQueryInformationProcess - 阻止外部查询受保护进程信息
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  ProcessHandle      - 进程句柄
  * @param [in]  ProcessInfoClass   - 查询的信息类型
  * @param [out] ProcessInfo        - 输出缓冲区
@@ -1114,7 +1106,7 @@ static NTSTATUS NTAPI Fake_NtQueryInformationProcess(
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;
+        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
 
     return g_OrigNtQueryInformationProcess(
         ProcessHandle, ProcessInfoClass, ProcessInfo, ProcessInfoLength, ReturnLength);
@@ -1123,7 +1115,7 @@ static NTSTATUS NTAPI Fake_NtQueryInformationProcess(
 /**
  * @brief Hook: NtQueryVirtualMemory - 阻止外部探测受保护进程的内存布局
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  ProcessHandle  - 进程句柄
  * @param [in]  BaseAddress     - 查询基地址
  * @param [in]  MemInfoClass   - 信息类型
@@ -1141,7 +1133,7 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;
+        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
 
     return g_OrigNtQueryVirtualMemory(
         ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
@@ -1150,7 +1142,7 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
 /**
  * @brief Hook: NtDuplicateObject - 阻止通过句柄复制间接获取受保护进程访问权
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  SourceProcessHandle  - 源进程句柄
  * @param [in]  SourceHandle         - 要复制的句柄
  * @param [in]  TargetProcessHandle  - 目标进程句柄
@@ -1170,7 +1162,7 @@ static NTSTATUS NTAPI Fake_NtDuplicateObject(
 
     if (g_ProtectedPidCount > 0 && !IsCallerProtected() &&
         IsProtectedProcessHandle(SourceProcessHandle))
-        return STATUS_ACCESS_DENIED;
+        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
 
     return g_OrigNtDuplicateObject(
         SourceProcessHandle, SourceHandle, TargetProcessHandle, TargetHandle,
@@ -1180,7 +1172,7 @@ static NTSTATUS NTAPI Fake_NtDuplicateObject(
 /**
  * @brief Hook: NtGetNextProcess - 在进程遍历中自动跳过受保护进程
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  ProcessHandle    - 当前进程句柄
  * @param [in]  DesiredAccess    - 请求权限
  * @param [in]  HandleAttributes - 句柄属性
@@ -1212,7 +1204,7 @@ static NTSTATUS NTAPI Fake_NtGetNextProcess(
             __try { *NewProcessHandle = NULL; }
             __except (1) {}
             status = g_OrigNtGetNextProcess(
-                hSkip, DesiredAccess, HandleAttributes, Flags, NewProcessHandle);
+                hSkip, DesiredAccess, HandleAttributes, Flags, NewProcessHandle);//这里选择了跳过
             ZwClose(hSkip);
             if (!NT_SUCCESS(status)) break;
             continue;
@@ -1225,7 +1217,7 @@ static NTSTATUS NTAPI Fake_NtGetNextProcess(
 /**
  * @brief Hook: NtGetNextThread - 阻止枚举受保护进程的线程
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  ProcessHandle    - 进程句柄
  * @param [in]  ThreadHandle     - 当前线程句柄
  * @param [in]  DesiredAccess    - 请求权限
@@ -1244,7 +1236,7 @@ static NTSTATUS NTAPI Fake_NtGetNextThread(
 
     if (g_ProtectedPidCount > 0 && !IsCallerProtected() &&
         IsProtectedProcessHandle(ProcessHandle))
-        return STATUS_ACCESS_DENIED;
+        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
 
     return g_OrigNtGetNextThread(
         ProcessHandle, ThreadHandle, DesiredAccess, HandleAttributes,
@@ -1254,7 +1246,7 @@ static NTSTATUS NTAPI Fake_NtGetNextThread(
 /**
  * @brief Hook: NtReadVirtualMemory - 对受保护进程返回全零数据欺骗读取
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  ProcessHandle     - 进程句柄
  * @param [in]  BaseAddress        - 读取地址
  * @param [out] Buffer            - 输出缓冲区
@@ -1274,7 +1266,7 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
     {
         __try {
-            RtlZeroMemory(Buffer, Size);
+            RtlZeroMemory(Buffer, Size);//这里是关键我们返回拒绝权限
             if (NumberOfBytesRead) *NumberOfBytesRead = Size;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -1288,7 +1280,7 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
 /**
  * @brief Hook: NtWriteVirtualMemory - 阻止向受保护进程写入内存
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  ProcessHandle        - 进程句柄
  * @param [in]  BaseAddress           - 写入地址
  * @param [in]  Buffer               - 数据缓冲区
@@ -1305,7 +1297,7 @@ static NTSTATUS NTAPI Fake_NtWriteVirtualMemory(
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;
+        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
 
     return g_OrigNtWriteVirtualMemory(
         ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesWritten);
@@ -1314,7 +1306,7 @@ static NTSTATUS NTAPI Fake_NtWriteVirtualMemory(
 /**
  * @brief Hook: NtProtectVirtualMemory - 阻止修改受保护进程的内存保护属性
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]     ProcessHandle - 进程句柄
  * @param [in,out] BaseAddress    - 目标地址
  * @param [in,out] RegionSize    - 区域大小
@@ -1331,7 +1323,7 @@ static NTSTATUS NTAPI Fake_NtProtectVirtualMemory(
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;
+        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
 
     return g_OrigNtProtectVirtualMemory(
         ProcessHandle, BaseAddress, RegionSize, NewProtect, OldProtect);
@@ -1340,7 +1332,7 @@ static NTSTATUS NTAPI Fake_NtProtectVirtualMemory(
 /**
  * @brief Hook: NtTerminateProcess - 阻止外部进程终止受保护进程
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] ProcessHandle - 进程句柄
  * @param [in] ExitStatus - 退出状态码
  * @return STATUS_ACCESS_DENIED 或原函数返回值
@@ -1354,7 +1346,7 @@ static NTSTATUS NTAPI Fake_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS Exi
     if (ProcessHandle != NtCurrentProcess() && ProcessHandle &&
         g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;
+        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
 
     return g_OrigNtTerminateProcess(ProcessHandle, ExitStatus);
 }
@@ -1362,7 +1354,7 @@ static NTSTATUS NTAPI Fake_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS Exi
 /**
  * @brief Hook: NtCreateThreadEx - 阻止在受保护进程中创建远程线程
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [out] ThreadHandle     - 输出线程句柄
  * @param [in]  DesiredAccess    - 访问权限
  * @param [in]  ObjectAttributes - 对象属性
@@ -1386,7 +1378,7 @@ static NTSTATUS NTAPI Fake_NtCreateThreadEx(
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;
+        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
 
     return g_OrigNtCreateThreadEx(
         ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle,
@@ -1417,7 +1409,7 @@ static NTSTATUS NTAPI Fake_NtSuspendThread(
 
     if (!IsCallerProtected() && IsProtectedThreadHandle(ThreadHandle)) {
         LeaveHookGuard(oldIrql);
-        return STATUS_ACCESS_DENIED;
+        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
     }
 
     LeaveHookGuard(oldIrql);
@@ -1441,7 +1433,7 @@ static NTSTATUS NTAPI Fake_NtResumeThread(
 
     if (!IsCallerProtected() && IsProtectedThreadHandle(ThreadHandle)) {
         LeaveHookGuard(oldIrql);
-        return STATUS_ACCESS_DENIED;
+        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
     }
 
     LeaveHookGuard(oldIrql);
@@ -1476,6 +1468,7 @@ static NTSTATUS NTAPI Fake_NtGetContextThread(
                     ThreadContext->Dr3 = 0;
                     ThreadContext->Dr6 = 0;
                     ThreadContext->Dr7 = 0;
+                    //这里是关键我们把所有的dr清零还有ContextFlags的权限
                 }
             }
             __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -1548,7 +1541,7 @@ static NTSTATUS NTAPI Fake_NtQueryInformationThread(
 /**
  * @brief Hook: PsLookupProcessByProcessId - 阻止外部通过PID查找受保护进程对象
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  ProcessId - 进程PID
  * @param [out] Process   - 输出PEPROCESS指针
  * @return STATUS_INVALID_PARAMETER(拒绝) 或原函数返回值
@@ -1579,7 +1572,7 @@ static NTSTATUS NTAPI Fake_PsLookupProcessByProcessId(HANDLE ProcessId, PEPROCES
 /**
  * @brief Hook: PsLookupThreadByThreadId - 阻止通过线程ID获取受保护进程的线程对象
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  ThreadId - 线程ID
  * @param [out] Thread   - 输出PETHREAD指针
  * @return STATUS_INVALID_PARAMETER(拒绝) 或原函数返回值
@@ -1615,8 +1608,6 @@ static NTSTATUS NTAPI Fake_PsLookupThreadByThreadId(HANDLE ThreadId, PETHREAD* T
  * @author yewilliam
  * @date 2026/03/15
  *
- * 【修复 物理机BSOD】改为 hook 内部函数 ObpReferenceObjectByHandleWithTag:
- *   逆向得到真实签名: 8个参数, 第1个是ULONG_PTR, 第8个是Flags(传0)
  */
 static NTSTATUS NTAPI Fake_ObpRefByHandleWithTag(
     ULONG_PTR Handle, ACCESS_MASK DesiredAccess,
@@ -1663,7 +1654,7 @@ static NTSTATUS NTAPI Fake_ObpRefByHandleWithTag(
 /**
  * @brief Hook: MmCopyVirtualMemory - 阻止通过内核内存拷贝读写受保护进程
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  FromProcess          - 源进程
  * @param [in]  FromAddress          - 源地址
  * @param [in]  ToProcess            - 目标进程
@@ -1722,16 +1713,13 @@ static NTSTATUS NTAPI Fake_MmCopyVirtualMemory(
 /**
  * @brief Hook: KeStackAttachProcess - 当前版本直接透传, 不再重定向
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]  Process  - 目标进程EPROCESS
  * @param [out] ApcState - APC状态保存结构
- * @note 早期版本将attach重定向到System进程导致BSOD, 已修复为直接透传
+ * @note 早期版本将attach重定向到System进程导致BSOD,直接透传
  */
 static VOID NTAPI Fake_KeStackAttachProcess(PEPROCESS Process, PKAPC_STATE ApcState)
 {
-    /* ========================================================================
- *  【修复】始终透传，不再重定向到 IoGetCurrentProcess() *   *  旧逻辑将 attach 重定向到 System 进程，导致调用者在错误的 *  地址空间中操作 → 随机内核数据结构被破坏 → BSOD。 *   *  保护不需要 hook 这个函数：NtOpenProcess / ObReferenceObjectByHandle *  / MmCopyVirtualMemory 等上层 hook 已经阻止了外部访问。
- * ======================================================================== */
     if (!g_OrigKeStackAttachProcess) return;
     g_OrigKeStackAttachProcess(Process, ApcState);
 }
@@ -1739,7 +1727,7 @@ static VOID NTAPI Fake_KeStackAttachProcess(PEPROCESS Process, PKAPC_STATE ApcSt
 /**
  * @brief Hook: ValidateHwnd - 对外部进程隐藏受保护进程的窗口对象
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] hwnd - 窗口句柄
  * @return 窗口对象指针(PVOID), 受保护窗口对外返回NULL
  * @note 通过pwnd->pti->pEThread获取窗口所属进程, 白名单进程始终放行
@@ -1783,7 +1771,7 @@ static PVOID NTAPI Fake_ValidateHwnd(SVM_HWND hwnd)
 /**
  * @brief Hook: NtUserFindWindowEx - 在窗口查找中跳过受保护进程的窗口
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] hwndParent     - 父窗口句柄
  * @param [in] hwndChildAfter - 子窗口起点
  * @param [in] lpszClass      - 窗口类名
@@ -1816,7 +1804,7 @@ static SVM_HWND NTAPI Fake_NtUserFindWindowEx(
 /**
  * @brief Hook: NtUserWindowFromPoint - 屏蔽受保护进程窗口的坐标点查找
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] x - 屏幕X坐标
  * @param [in] y - 屏幕Y坐标
  * @return 窗口句柄, 受保护窗口返回NULL
@@ -1844,7 +1832,7 @@ extern "C" BOOLEAN Cpp_Fake_NtUserBuildHwndList(PREGISTER_CONTEXT Ctx)
 /**
  * @brief Hook: NtUserBuildHwndList - 从窗口枚举列表中移除受保护进程的窗口
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in]     hDesktop         - 桌面句柄
  * @param [in]     hwndNext         - 起始窗口
  * @param [in]     fEnumChildren    - 是否枚举子窗口
@@ -1906,7 +1894,7 @@ extern "C" ULONG64 g_Trampoline_NtUserBuildHwndList = 0;
 /**
  * @brief 初始化进程隐藏Hook系统 - 解析SSSDT和进程创建回调
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return 始终返回STATUS_SUCCESS
  */
 NTSTATUS InitializeProcessHideHooks()
@@ -1923,7 +1911,7 @@ NTSTATUS InitializeProcessHideHooks()
 /**
  * @brief 链接Trampoline地址到原函数指针 - 填充所有g_Orig*函数指针
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @note 遍历g_HookList, 将TrampolinePage地址赋给对应的原函数指针
  */
 VOID LinkTrampolineAddresses()
@@ -1967,7 +1955,7 @@ VOID LinkTrampolineAddresses()
 /**
  * @brief 准备所有NPT Hook资源 - 两阶段解析(普通函数 + CSRSS上下文中的Win32k函数)
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return 至少1个Hook就绪返回STATUS_SUCCESS
  * @note Pass1: SSDT/ntdll/内核导出; Pass2: 在CSRSS上下文中解析SSSDT和win32kbase
  */
@@ -2011,9 +1999,6 @@ NTSTATUS PrepareAllNptHookResources()
         // 内核导出
         { L"PsLookupProcessByProcessId", NULL, (PVOID)Fake_PsLookupProcessByProcessId, HOOK_PsLookupProcessByProcessId, TRUE, RESOLVE_EXPORT, 0 },
         { L"PsLookupThreadByThreadId",   NULL, (PVOID)Fake_PsLookupThreadByThreadId,   HOOK_PsLookupThreadByThreadId,   TRUE, RESOLVE_EXPORT, 0 },
-        /* 【修复 物理机BSOD】Hook 内部函数 ObpReferenceObjectByHandleWithTag
-         * 通过模式扫描 ObReferenceObjectByHandle 中的 CALL/JMP 找到内部函数
-         * 参考 DbgkSysWin10: Hook_ObpReferenceObjectByHandleWithTag() */
         { L"ObpReferenceObjectByHandleWithTag", NULL, (PVOID)Fake_ObpRefByHandleWithTag, HOOK_ObReferenceObjectByHandle, FALSE, RESOLVE_SCAN_OBP, 0 },
         { L"MmCopyVirtualMemory",        NULL, (PVOID)Fake_MmCopyVirtualMemory,        HOOK_MmCopyVirtualMemory,        TRUE, RESOLVE_EXPORT, 0 },
         { L"KeStackAttachProcess",       NULL, (PVOID)Fake_KeStackAttachProcess,       HOOK_KeStackAttachProcess,       FALSE, RESOLVE_EXPORT, 0 },
@@ -2192,7 +2177,7 @@ VOID RestoreProcessByDkom()
 /**
  * @brief 进程伪装主函数 - 将目标进程的所有身份信息替换为源进程的信息
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in,out] fakeProcess - 要伪装的目标进程EPROCESS
  * @param [in]     SrcPid      - 源进程PID(通常为explorer.exe)
  * @return TRUE表示伪装成功, FALSE表示源进程查找失败或已退出
@@ -2221,7 +2206,7 @@ static HANDLE GetExplorerPid()
 /**
  * @brief 伪装目标进程为explorer.exe - 调用FakeProcessByPid复制进程身份信息
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] Pid - 要伪装的目标进程PID
  * @return 成功返回STATUS_SUCCESS
  */
@@ -2242,7 +2227,7 @@ NTSTATUS DisguiseProcess(HANDLE Pid)
 /**
  * @brief 删除驱动文件 - 清除磁盘上的驱动文件痕迹
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [in] DriverObject - 驱动对象指针
  * @return 成功返回STATUS_SUCCESS
  * @note 若文件被占用则清除SectionObject后重试ZwDeleteFile
@@ -2295,7 +2280,7 @@ NTSTATUS DeleteDriverFile(PDRIVER_OBJECT DriverObject)
 /**
  * @brief 定位PspCreateProcessNotifyRoutine全局数组 - 通过模式扫描PsSetCreateProcessNotifyRoutine
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return PspCreateProcessNotifyRoutine数组指针, 未找到返回NULL
  */
 PEX_FAST_REF FindPspCreateProcessNotifyRoutine()
@@ -2317,7 +2302,7 @@ PEX_FAST_REF FindPspCreateProcessNotifyRoutine()
 /**
  * @brief 初始化进程创建回调解析器
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return 成功返回STATUS_SUCCESS, 未找到返回STATUS_NOT_FOUND
  */
 NTSTATUS InitNotifyRoutineResolver()

@@ -146,6 +146,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Common.cpp" />
+    <ClCompile Include="DebugApi.cpp" />
     <ClCompile Include="Disguise.cpp">
       <CompileAs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CompileAsC</CompileAs>
     </ClCompile>
@@ -160,6 +161,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common.h" />
+    <ClInclude Include="DebugApi.h" />
     <ClInclude Include="hde\hde64.h" />
     <ClInclude Include="hde\headers.hpp" />
     <ClInclude Include="hde\pstdint.h" />

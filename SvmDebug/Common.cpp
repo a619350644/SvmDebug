@@ -2,7 +2,7 @@
  * @file Common.cpp
  * @brief CPU硬件支持检测实现 - AMD/Intel虚拟化能力检查
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  *
  * 实现CPU厂商检测、BIOS开关检查、SVM/VMX硬件支持验证等功能。
  * 在启用SVM前，软件应按AMD APM规定的算法检测SVM可用性。
@@ -21,7 +21,7 @@
 /**
  * @brief 获取CPU厂商名称字符串 - 通过CPUID leaf 0读取12字节Vendor ID
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @param [out] vendor - 输出厂商名称缓冲区 (如"AuthenticAMD"或"GenuineIntel")
  * @param [in]  size   - 缓冲区大小(建议>=13字节)
  */
@@ -41,7 +41,7 @@ void CommGetCPUName(char* vendor, SIZE_T size)
 /**
  * @brief 检查Intel BIOS是否启用VMX - 读取IA32_FEATURE_CONTROL MSR
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return TRUE表示bit0(Lock)和bit2(VMX outside SMX)均为1, FALSE表示未启用
  */
 BOOLEAN CommCheckIntelBios()
@@ -54,7 +54,7 @@ BOOLEAN CommCheckIntelBios()
 /**
  * @brief 检查AMD VM_CR.SVMDIS位 - 判断SVM是否被固件禁用
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return TRUE表示SVMDIS=0(SVM可用), FALSE表示SVMDIS=1(SVM被禁用)
  */
 BOOLEAN CommCheckAMDLock()
@@ -73,7 +73,7 @@ BOOLEAN CommCheckAMDLock()
 /**
  * @brief 检查Intel CPU硬件VMX支持 - 读取CPUID.1:ECX[5]
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return TRUE表示CPU支持VMX, FALSE表示不支持
  */
 BOOLEAN CommCheckIntelCpuid()
@@ -87,7 +87,7 @@ BOOLEAN CommCheckIntelCpuid()
 /**
  * @brief 检查AMD CPU硬件SVM支持 - 读取CPUID Fn8000_0001_ECX[SVM] (bit2)
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return TRUE表示CPU支持SVM, FALSE表示不支持
  */
 BOOLEAN CommCheckAMDCpuid()
@@ -101,7 +101,7 @@ BOOLEAN CommCheckAMDCpuid()
 /**
  * @brief 检查CR4.VMXE位 - 确认系统未被其他Hypervisor占用
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return TRUE表示CR4.VMXE(bit13)未置位(可用), FALSE表示已被占用
  */
 BOOLEAN CommCheckCr4()
@@ -114,7 +114,7 @@ BOOLEAN CommCheckCr4()
 /**
  * @brief 检查AMD SVM锁定状态 - 读取CPUID Fn8000_000A_EDX[SVML] (bit2)
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return TRUE表示SVM未被BIOS锁定, FALSE表示已锁定
  * @note SVML=0表示不支持SVM锁定(即未被锁), 取反后返回TRUE统一接口语义
  */
@@ -129,7 +129,7 @@ BOOLEAN CommCheckAMDBios()
 /**
  * @brief 获取AMD SVML特征位原始值 - 不做取反, 返回硬件实际值
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return 1表示支持SVM锁定特征, 0表示不支持
  */
 BOOLEAN CommCheckAMDSvmlFeature()
@@ -142,7 +142,7 @@ BOOLEAN CommCheckAMDSvmlFeature()
 /**
  * @brief Intel平台综合虚拟化支持检查 - BIOS + CPUID + CR4 三重验证
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return TRUE表示Intel平台完全支持虚拟化, FALSE表示任一检查未通过
  */
 BOOLEAN CommCheckIntelsupport()
@@ -165,7 +165,7 @@ BOOLEAN CommCheckIntelsupport()
 /**
  * @brief AMD平台综合SVM支持检查 - 按AMD APM规定算法逐步验证
  * @author yewilliam
- * @date 2026/02/06
+ * @date 2026/03/16
  * @return TRUE表示AMD SVM完全可用, FALSE表示不支持或被禁用
  * @note 检查顺序: CPUID硬件支持 -> VM_CR.SVMDIS -> SVML锁定特征
  */
