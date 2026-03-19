@@ -311,6 +311,13 @@ ULONG GetSssdtIndexDynamic(PCSTR FunctionName);
  */
 PVOID ScanForPspReferenceCidTableEntry();
 
+/**
+ * @brief 通过ntdll导出表解析syscall索引, 再查SSDT获取Nt函数内核地址
+ * @param [in] NtFuncName - Nt函数名(如 "NtCreateDebugObject")
+ * @return Nt函数虚拟地址, 失败返回NULL
+ */
+PVOID GetSsdtAddressByNtdllName(PCSTR NtFuncName);
+
 
 
 /* ========================================================================

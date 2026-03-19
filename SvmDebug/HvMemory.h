@@ -62,3 +62,6 @@ extern ULONG64 g_HvSharedContextPa;
 
 NTSTATUS HvInitSharedContext();
 VOID HvFreeSharedContext();
+
+/* DebugApi VMM-side page table translation export */
+ULONG64 TranslateGuestVaToPa_Ext(ULONG64 GuestCr3, ULONG64 GuestVa);

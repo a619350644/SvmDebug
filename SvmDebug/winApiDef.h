@@ -464,6 +464,12 @@ typedef NTSTATUS(NTAPI* FnPsLookupThreadByThreadId)(
  typedef VOID(NTAPI* FnKeStackAttachProcess)(
      PEPROCESS Process, PKAPC_STATE ApcState);
 
+ /* ZwQuerySystemInformation未在WDK标准头文件中声明 */
+ extern "C" NTSTATUS NTAPI ZwQuerySystemInformation(
+     ULONG SystemInformationClass,
+     PVOID SystemInformation,
+     ULONG SystemInformationLength,
+     PULONG ReturnLength);
 
  /* ========================================================================
   *  SSSDT (Win32k) 函数指针 — 4个窗口子系统调用

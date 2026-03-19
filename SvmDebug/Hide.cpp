@@ -14,12 +14,13 @@
  * 全局数据置于显式可写段(.drv_rw), 避免只读页写入导致BSOD。
  */
 #include "Hide.h"
+#include "DebugApi.h"       // IsDebugger() — 区分调试器(CE)与被保护游戏进程
 #include <ntstrsafe.h>
 #include <ntimage.h>
 #pragma warning(disable: 4505)
 
 #define SEC_IMAGE 0x01000000
-#define DEBUG 1
+
 
 #pragma section(".drv_rw", read, write)
 #pragma comment(linker, "/SECTION:.drv_rw,RW")
@@ -602,7 +603,7 @@ static BOOLEAN IsStringMatchLocal(PCSTR a, PCSTR b)
     return (*a == *b);
 }
 
-static PVOID GetSsdtAddressByNtdllName(PCSTR NtFuncName)
+PVOID GetSsdtAddressByNtdllName(PCSTR NtFuncName)
 {
     UNICODE_STRING uniName;
     OBJECT_ATTRIBUTES objAttr;
@@ -1080,8 +1081,13 @@ static NTSTATUS NTAPI Fake_NtOpenProcess(
     }
 
     if (IsCallerProtected() && ClientId && !IsProtectedPid(ClientId->UniqueProcess))
+    {
+        if (IsDebugger(PsGetCurrentProcess())) {
+            return g_OrigNtOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId);
+        }
         return g_OrigNtOpenProcess(ProcessHandle,
-            PROCESS_QUERY_LIMITED_INFORMATION, ObjectAttributes, ClientId);//这里是判断到了是我们保护的进程，那么我们的权限设置为0x1000
+            PROCESS_QUERY_LIMITED_INFORMATION, ObjectAttributes, ClientId);
+    }
 
     return g_OrigNtOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId);
 }

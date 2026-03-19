@@ -16,6 +16,7 @@
  */
 #include "SVM.h"
 #include "HvMemory.h"
+#include "DebugApi.h"
 
 extern ULONG64 g_SystemCr3;
 /**
@@ -514,12 +515,25 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
             vpData->Guest_gpr.Rbx = g_HvSharedContextPa;
             HvHandleMemoryOp(vpData);
         }
+        else if (leaf == CPUID_HV_DEBUG_OP) {
+            HvHandleDebugOp(vpData);
+        }
         else if (HandleHypercallCommand(vpData, vmcb, leaf)) {
             /* handled */
         }
         else {
             int cpuInfo[4] = { 0 };
             __cpuidex(cpuInfo, leaf, (int)vpData->Guest_gpr.Rcx);
+
+            /* [FIX] 隐藏 Hypervisor 存在标志, 防止 VMP/TMD 等加壳工具检测到虚拟化环境
+             *
+             * CPUID leaf 0x1, ECX bit 31 = Hypervisor Present
+             * 在 SVM Guest 模式下此 bit 被 CPU 自动设置为 1,
+             * 必须手动清除, 否则 VMP 壳会认为在 VM 中运行并触发 FastFail (0xC0000409) */
+            if (leaf == 1) {
+                cpuInfo[2] &= ~(1 << 31);  /* 清除 ECX.HypervisorPresent */
+            }
+
             vmcb->StateSaveArea.Rax = (UINT64)cpuInfo[0];
             vpData->Guest_gpr.Rbx = (UINT64)cpuInfo[1];
             vpData->Guest_gpr.Rcx = (UINT64)cpuInfo[2];
@@ -547,10 +561,36 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
         if (hookCtx != nullptr) {
             if (isExecFault) {
                 NTSTATUS s1, s2;
-                if (vmcb->StateSaveArea.Rip == (ULONG64)hookCtx->TargetAddress) {
+                ULONG64 guestRip = vmcb->StateSaveArea.Rip;
+
+                /*
+                 * [FIX] 页面共享修复: 当多个Hook共享同一物理页(page reuse)时,
+                 * FindHookByFaultPa返回第一个匹配的Hook, 但RIP可能对应同页上的
+                 * 其他Hook。需要遍历所有共享同一OriginalPagePa的Hook, 找到RIP
+                 * 精确匹配的那个。
+                 *
+                 * 例: NtCreateDebugObject(0xAF0) 和 NtDebugActiveProcess(0xCF0)
+                 * 共享同一页。FindHookByFaultPa可能返回NtCreateDebugObject的hookCtx,
+                 * 但RIP=NtDebugActiveProcess的地址 → 原代码走else分支 → 显示原始页
+                 * → Hook不触发 → 自定义句柄泄漏给原函数 → STATUS_INVALID_HANDLE
+                 */
+                PNPT_HOOK_CONTEXT matchedHook = nullptr;
+                ULONG64 faultPagePa = hookCtx->OriginalPagePa;
+                for (int hi = 0; hi < HOOK_MAX_COUNT; hi++) {
+                    if (g_HookList[hi].IsUsed &&
+                        g_HookList[hi].OriginalPagePa == faultPagePa &&
+                        guestRip == (ULONG64)g_HookList[hi].TargetAddress) {
+                        matchedHook = &g_HookList[hi];
+                        break;
+                    }
+                }
+
+                if (matchedHook != nullptr) {
+                    /* RIP精确命中某个Hook的入口 → 显示FakePage(含JMP到Proxy) */
                     s1 = ApplyNptHookByPa(vpData, hookCtx->TargetPa, hookCtx->FakePagePa);
                 }
                 else {
+                    /* RIP在Hook页上但不是任何Hook入口 → 显示原始页继续执行 */
                     s1 = ApplyNptHookByPa(vpData, hookCtx->TargetPa, hookCtx->OriginalPagePa);
                 }
                 s2 = SetNptPagePermissions(vpData, hookCtx->TargetPa, NPT_PERM_EXECUTE);

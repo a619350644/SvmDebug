@@ -163,6 +163,15 @@ static ULONG64 TranslateGuestVaToPa(ULONG64 GuestCr3, ULONG64 GuestVa)
  * @param [in] IsWrite - 是否为写操作(预留参数)
  * @return TRUE表示拷贝成功, FALSE表示映射失败
  */
+
+/**
+ * @brief TranslateGuestVaToPa export wrapper for DebugApi VMM-side SW breakpoint
+ */
+ULONG64 TranslateGuestVaToPa_Ext(ULONG64 GuestCr3, ULONG64 GuestVa)
+{
+    return TranslateGuestVaToPa(GuestCr3, GuestVa);
+}
+
 static BOOLEAN PhysicalMemoryCopy(
     ULONG64 DestPa,
     ULONG64 SrcPa,
