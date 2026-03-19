@@ -294,6 +294,9 @@ typedef enum _HOOK_INDEX {
     HOOK_PspInsertProcess,              // 进程插入拦截 — 掌控进程生命周期源头
     HOOK_PspGetContextThreadInternal,   // 底层上下文获取拦截 — 清除 DR0-DR7 硬件断点
 
+    /* ---- 反调试检测防御 Hook (Hide module) ---- */
+    HOOK_NtSetInformationThread,        // 拦截 ThreadHideFromDebugger — 防止反作弊隐藏线程
+
     HOOK_MAX_ENUM_COUNT // 枚举计数哨兵, 用于数组边界检查
 } HOOK_INDEX;
 

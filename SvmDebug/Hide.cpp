@@ -248,6 +248,13 @@ typedef NTSTATUS(NTAPI* FnObpRefByHandleWithTag)(
 static FnObpRefByHandleWithTag g_OrigObpRefByHandleWithTag = NULL;
 static FnMmCopyVirtualMemory           g_OrigMmCopyVirtualMemory = NULL;
 static FnKeStackAttachProcess          g_OrigKeStackAttachProcess = NULL;
+
+/* [FIX] NtSetInformationThread — 拦截 ThreadHideFromDebugger */
+typedef NTSTATUS(NTAPI* FnNtSetInformationThread)(
+    HANDLE ThreadHandle, ULONG ThreadInformationClass,
+    PVOID ThreadInformation, ULONG ThreadInformationLength);
+static FnNtSetInformationThread        g_OrigNtSetInformationThread = NULL;
+
 static FnNtUserFindWindowEx            g_OrigNtUserFindWindowEx = NULL;
 static FnNtUserWindowFromPoint         g_OrigNtUserWindowFromPoint = NULL;
 static FnNtUserBuildHwndList           g_OrigNtUserBuildHwndList = NULL;
@@ -956,6 +963,16 @@ ULONG GetSssdtIndexDynamic(PCSTR FunctionName)
  * @note 过滤三种信息类: SystemProcessInformation(链表摘除),
  *        SystemHandleInformation(句柄数组压缩), SystemExtendedHandleInformation(同上)
  */
+/**
+ * @brief Hook: NtQuerySystemInformation - 过滤进程/句柄列表 + 隐藏内核调试器
+ *
+ * [FIX] 新增 SystemKernelDebuggerInformation (class 0x23) 伪装:
+ *   无论保护是否激活, 始终报告"无内核调试器"。
+ *   这防止反作弊通过此查询检测 WinDbg/KD 连接。
+ *
+ * 过滤三种信息类: SystemProcessInformation(链表摘除),
+ *  SystemHandleInformation(句柄数组压缩), SystemExtendedHandleInformation(同上)
+ */
 static NTSTATUS NTAPI Fake_NtQuerySystemInformation(
     SYSTEM_INFORMATION_CLASS SystemInformationClass,
     PVOID  SystemInformation,
@@ -966,15 +983,43 @@ static NTSTATUS NTAPI Fake_NtQuerySystemInformation(
     if (!g_OrigNtQuerySystemInformation)
         return STATUS_UNSUCCESSFUL;
 
-    if (g_ProtectedPidCount == 0 || IsCallerProtected())
-        return g_OrigNtQuerySystemInformation(
-            SystemInformationClass, SystemInformation,
-            SystemInformationLength, ReturnLength);
-
+    /* 先调用原函数获取数据 */
     NTSTATUS status = g_OrigNtQuerySystemInformation(
         SystemInformationClass, SystemInformation,
         SystemInformationLength, ReturnLength);
     if (!NT_SUCCESS(status) || !SystemInformation)
+        return status;
+
+    /* ============================================================
+     * [FIX] 全局伪装: SystemKernelDebuggerInformation (class 0x23)
+     * 无论保护是否激活, 始终报告"无内核调试器"
+     * 结构体: { BOOLEAN KernelDebuggerEnabled; BOOLEAN KernelDebuggerNotPresent; }
+     * ============================================================ */
+    if (SystemInformationClass == (SYSTEM_INFORMATION_CLASS)0x23) {
+        __try {
+            if (SystemInformationLength >= 2) {
+                PUCHAR info = (PUCHAR)SystemInformation;
+                info[0] = FALSE; /* KernelDebuggerEnabled = FALSE */
+                info[1] = TRUE;  /* KernelDebuggerNotPresent = TRUE */
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return status;
+    }
+
+    /* SystemKernelDebuggerInformationEx (class 0x95) — 扩展版本, 同样伪装 */
+    if (SystemInformationClass == (SYSTEM_INFORMATION_CLASS)0x95) {
+        __try {
+            if (SystemInformationLength >= 2) {
+                PUCHAR info = (PUCHAR)SystemInformation;
+                info[0] = FALSE;
+                info[1] = TRUE;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return status;
+    }
+
+    /* 进程/句柄过滤仅在保护激活且调用者非受保护进程时生效 */
+    if (g_ProtectedPidCount == 0 || IsCallerProtected())
         return status;
 
     __try {
@@ -1077,7 +1122,10 @@ static NTSTATUS NTAPI Fake_NtOpenProcess(
             __try { *ProcessHandle = NULL; }
             __except (1) {}
         }
-        return STATUS_ACCESS_DENIED;
+        /* [FIX] 返回 STATUS_INVALID_CID 而非 STATUS_ACCESS_DENIED
+         * STATUS_INVALID_CID 表示"该PID不存在", 与进程从枚举列表中消失一致。
+         * STATUS_ACCESS_DENIED 暗示"有东西在阻止你", 反而暴露存在保护。 */
+        return STATUS_INVALID_CID;
     }
 
     if (IsCallerProtected() && ClientId && !IsProtectedPid(ClientId->UniqueProcess))
@@ -1093,15 +1141,15 @@ static NTSTATUS NTAPI Fake_NtOpenProcess(
 }
 
 /**
- * @brief Hook: NtQueryInformationProcess - 阻止外部查询受保护进程信息
- * @author yewilliam
- * @date 2026/03/16
- * @param [in]  ProcessHandle      - 进程句柄
- * @param [in]  ProcessInfoClass   - 查询的信息类型
- * @param [out] ProcessInfo        - 输出缓冲区
- * @param [in]  ProcessInfoLength  - 缓冲区大小
- * @param [out] ReturnLength       - 实际大小
- * @return STATUS_ACCESS_DENIED 或原函数返回值
+ * @brief Hook: NtQueryInformationProcess - 反调试伪装 + 保护进程隐藏
+ *
+ * [FIX] 三层策略:
+ *   1. 外部进程访问保护进程 → STATUS_INVALID_PARAMETER
+ *   2. 保护进程(CE)查询自身或目标 → 透传, 不干扰调试流程
+ *   3. 非保护进程查询自身的调试状态 → 伪装:
+ *        - ProcessDebugPort    (class 0x07) → 返回 0
+ *        - ProcessDebugObjectHandle (class 0x1E) → STATUS_PORT_NOT_SET
+ *        - ProcessDebugFlags   (class 0x1F) → 返回 1 (未被调试)
  */
 static NTSTATUS NTAPI Fake_NtQueryInformationProcess(
     HANDLE ProcessHandle, ULONG ProcessInfoClass,
@@ -1110,12 +1158,52 @@ static NTSTATUS NTAPI Fake_NtQueryInformationProcess(
     FAKE_PRINT_ONCE_FOR(HOOK_NtQueryInformationProcess);
     if (!g_OrigNtQueryInformationProcess) return STATUS_UNSUCCESSFUL;
 
-    if (g_ProtectedPidCount > 0 &&
-        IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
+    if (g_ProtectedPidCount == 0)
+        return g_OrigNtQueryInformationProcess(
+            ProcessHandle, ProcessInfoClass, ProcessInfo, ProcessInfoLength, ReturnLength);
 
-    return g_OrigNtQueryInformationProcess(
+    /* 外部访问保护进程 → STATUS_INVALID_PARAMETER */
+    if (IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
+        return STATUS_INVALID_PARAMETER;
+
+    /* 保护进程(CE)自身的调用 → 全部透传, 不干扰调试器工作流程 */
+    if (IsCallerProtected())
+        return g_OrigNtQueryInformationProcess(
+            ProcessHandle, ProcessInfoClass, ProcessInfo, ProcessInfoLength, ReturnLength);
+
+    /* ================================================================
+     * 到此: 调用者是非保护进程, 查询的也不是保护进程
+     * 这就是反作弊自查场景 (游戏查自己是否被调试)
+     * ================================================================ */
+
+    /* ProcessDebugObjectHandle (0x1E) — 直接返回 "无调试对象" */
+    if (ProcessInfoClass == 0x1E) {
+        g_OrigNtQueryInformationProcess(
+            ProcessHandle, ProcessInfoClass, ProcessInfo,
+            ProcessInfoLength, ReturnLength);
+        return (NTSTATUS)0xC0000353; /* STATUS_PORT_NOT_SET */
+    }
+
+    NTSTATUS status = g_OrigNtQueryInformationProcess(
         ProcessHandle, ProcessInfoClass, ProcessInfo, ProcessInfoLength, ReturnLength);
+
+    if (!NT_SUCCESS(status) || !ProcessInfo)
+        return status;
+
+    __try {
+        switch (ProcessInfoClass) {
+        case 7: /* ProcessDebugPort → 0 */
+            if (ProcessInfoLength >= sizeof(ULONG_PTR))
+                *(PULONG_PTR)ProcessInfo = 0;
+            break;
+        case 0x1F: /* ProcessDebugFlags → 1 (未被调试) */
+            if (ProcessInfoLength >= sizeof(ULONG))
+                *(PULONG)ProcessInfo = 1;
+            break;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+
+    return status;
 }
 
 /**
@@ -1139,7 +1227,7 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
+        return STATUS_ACCESS_DENIED;
 
     return g_OrigNtQueryVirtualMemory(
         ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
@@ -1166,9 +1254,11 @@ static NTSTATUS NTAPI Fake_NtDuplicateObject(
     FAKE_PRINT_ONCE_FOR(HOOK_NtDuplicateObject);
     if (!g_OrigNtDuplicateObject) return STATUS_UNSUCCESSFUL;
 
+    /* [FIX] 系统白名单进程放行 (csrss/svchost等做SxS/句柄继承时必须能复制句柄) */
     if (g_ProtectedPidCount > 0 && !IsCallerProtected() &&
+        !IsWhitelistedCaller() &&
         IsProtectedProcessHandle(SourceProcessHandle))
-        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
+        return STATUS_ACCESS_DENIED;
 
     return g_OrigNtDuplicateObject(
         SourceProcessHandle, SourceHandle, TargetProcessHandle, TargetHandle,
@@ -1242,7 +1332,7 @@ static NTSTATUS NTAPI Fake_NtGetNextThread(
 
     if (g_ProtectedPidCount > 0 && !IsCallerProtected() &&
         IsProtectedProcessHandle(ProcessHandle))
-        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
+        return STATUS_NO_MORE_ENTRIES; /* [FIX] 伪装"没有更多线程" */
 
     return g_OrigNtGetNextThread(
         ProcessHandle, ThreadHandle, DesiredAccess, HandleAttributes,
@@ -1303,7 +1393,7 @@ static NTSTATUS NTAPI Fake_NtWriteVirtualMemory(
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
+        return STATUS_ACCESS_DENIED;
 
     return g_OrigNtWriteVirtualMemory(
         ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesWritten);
@@ -1329,7 +1419,7 @@ static NTSTATUS NTAPI Fake_NtProtectVirtualMemory(
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
+        return STATUS_ACCESS_DENIED;
 
     return g_OrigNtProtectVirtualMemory(
         ProcessHandle, BaseAddress, RegionSize, NewProtect, OldProtect);
@@ -1352,7 +1442,7 @@ static NTSTATUS NTAPI Fake_NtTerminateProcess(HANDLE ProcessHandle, NTSTATUS Exi
     if (ProcessHandle != NtCurrentProcess() && ProcessHandle &&
         g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
+        return STATUS_ACCESS_DENIED;
 
     return g_OrigNtTerminateProcess(ProcessHandle, ExitStatus);
 }
@@ -1384,7 +1474,7 @@ static NTSTATUS NTAPI Fake_NtCreateThreadEx(
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
-        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
+        return STATUS_ACCESS_DENIED;
 
     return g_OrigNtCreateThreadEx(
         ThreadHandle, DesiredAccess, ObjectAttributes, ProcessHandle,
@@ -1415,7 +1505,7 @@ static NTSTATUS NTAPI Fake_NtSuspendThread(
 
     if (!IsCallerProtected() && IsProtectedThreadHandle(ThreadHandle)) {
         LeaveHookGuard(oldIrql);
-        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
+        return STATUS_ACCESS_DENIED;
     }
 
     LeaveHookGuard(oldIrql);
@@ -1439,7 +1529,7 @@ static NTSTATUS NTAPI Fake_NtResumeThread(
 
     if (!IsCallerProtected() && IsProtectedThreadHandle(ThreadHandle)) {
         LeaveHookGuard(oldIrql);
-        return STATUS_ACCESS_DENIED;//这里是关键我们返回拒绝权限
+        return STATUS_ACCESS_DENIED;
     }
 
     LeaveHookGuard(oldIrql);
@@ -1509,6 +1599,45 @@ static NTSTATUS NTAPI Fake_NtSetContextThread(
 
     LeaveHookGuard(oldIrql);
     return g_OrigNtSetContextThread(ThreadHandle, ThreadContext);
+}
+
+/**
+ * @brief [FIX] Hook: NtSetInformationThread — 拦截 ThreadHideFromDebugger
+ *
+ * 反作弊常用技术: 调用 NtSetInformationThread(hThread, ThreadHideFromDebugger, ...)
+ * 设置 ETHREAD.HideFromDebugger = TRUE, 使该线程的调试事件 (断点/异常) 不再
+ * 通过 Dbgk 路径投递。由于我们的影子调试端口依赖 Dbgk hook 接收事件,
+ * ThreadHideFromDebugger 会使反作弊线程对调试器完全不可见。
+ *
+ * 策略: 对 ThreadHideFromDebugger (class 0x11) 直接返回 STATUS_SUCCESS,
+ *        但不实际调用原函数, 使线程保持可见。
+ *        反作弊认为操作成功, 但线程未被隐藏。
+ */
+static NTSTATUS NTAPI Fake_NtSetInformationThread(
+    HANDLE ThreadHandle, ULONG ThreadInformationClass,
+    PVOID ThreadInformation, ULONG ThreadInformationLength)
+{
+    if (!g_OrigNtSetInformationThread) return STATUS_UNSUCCESSFUL;
+
+    /* 保护进程(CE)自身的调用 → 全部透传 */
+    if (g_ProtectedPidCount == 0 || IsCallerProtected())
+        return g_OrigNtSetInformationThread(
+            ThreadHandle, ThreadInformationClass,
+            ThreadInformation, ThreadInformationLength);
+
+    /* ThreadHideFromDebugger = 0x11 — 静默成功, 不执行 */
+    if (ThreadInformationClass == 0x11) {
+        return STATUS_SUCCESS;
+    }
+
+    /* ThreadBreakOnTermination = 0x12 — 静默成功, 不执行 */
+    if (ThreadInformationClass == 0x12) {
+        return STATUS_SUCCESS;
+    }
+
+    return g_OrigNtSetInformationThread(
+        ThreadHandle, ThreadInformationClass,
+        ThreadInformation, ThreadInformationLength);
 }
 
 /**
@@ -1708,7 +1837,7 @@ static NTSTATUS NTAPI Fake_MmCopyVirtualMemory(
 
     if (touchesProtected) {
         if (NumberOfBytesCopied) *NumberOfBytesCopied = 0;
-        return STATUS_ACCESS_DENIED;
+        return STATUS_ACCESS_VIOLATION; /* [FIX] 伪装"内存不可访问" */
     }
 
     return g_OrigMmCopyVirtualMemory(
@@ -1953,6 +2082,9 @@ VOID LinkTrampolineAddresses()
     LH(HOOK_NtUserBuildHwndList, g_OrigNtUserBuildHwndList, FnNtUserBuildHwndList);
     LH(HOOK_ValidateHwnd, g_OrigValidateHwnd, FnValidateHwnd);
 
+    /* [FIX] 新增 NtSetInformationThread trampoline */
+    LH(HOOK_NtSetInformationThread, g_OrigNtSetInformationThread, FnNtSetInformationThread);
+
     if (g_HookList[HOOK_NtUserBuildHwndList].IsUsed && g_HookList[HOOK_NtUserBuildHwndList].TrampolinePage)
         g_Trampoline_NtUserBuildHwndList = (ULONG64)g_HookList[HOOK_NtUserBuildHwndList].TrampolinePage;
 #undef LH
@@ -2002,6 +2134,8 @@ NTSTATUS PrepareAllNptHookResources()
         { NULL, "NtGetContextThread",       (PVOID)Fake_NtGetContextThread,       HOOK_NtGetContextThread,       FALSE, RESOLVE_NTDLL, 0 },
         { NULL, "NtSetContextThread",       (PVOID)Fake_NtSetContextThread,       HOOK_NtSetContextThread,       FALSE, RESOLVE_NTDLL, 0 },
         { NULL, "NtQueryInformationThread", (PVOID)Fake_NtQueryInformationThread, HOOK_NtQueryInformationThread, FALSE, RESOLVE_NTDLL, 0 },
+        /* [FIX] 反调试防御: 拦截 ThreadHideFromDebugger */
+        { NULL, "NtSetInformationThread",   (PVOID)Fake_NtSetInformationThread,   HOOK_NtSetInformationThread,   FALSE, RESOLVE_NTDLL, 0 },
         // 内核导出
         { L"PsLookupProcessByProcessId", NULL, (PVOID)Fake_PsLookupProcessByProcessId, HOOK_PsLookupProcessByProcessId, TRUE, RESOLVE_EXPORT, 0 },
         { L"PsLookupThreadByThreadId",   NULL, (PVOID)Fake_PsLookupThreadByThreadId,   HOOK_PsLookupThreadByThreadId,   TRUE, RESOLVE_EXPORT, 0 },

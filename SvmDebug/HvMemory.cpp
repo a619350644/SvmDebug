@@ -13,9 +13,9 @@
 #include "HvMemory.h"
 #include "SVM.h"
 
-/* ========================================================================
- *  Shared context for Guest <-> VMM communication *  Allocated as contiguous physical memory so VMM can access it
- * ======================================================================== */
+ /* ========================================================================
+  *  Shared context for Guest <-> VMM communication *  Allocated as contiguous physical memory so VMM can access it
+  * ======================================================================== */
 PHV_RW_CONTEXT g_HvSharedContext = nullptr;
 ULONG64 g_HvSharedContextPa = 0;
 FAST_MUTEX g_HvMutex;
@@ -93,9 +93,9 @@ static ULONG64 TranslateGuestVaToPa(ULONG64 GuestCr3, ULONG64 GuestVa)
 {
     ULONG64 pml4Idx = (GuestVa >> 39) & 0x1FF;
     ULONG64 pdptIdx = (GuestVa >> 30) & 0x1FF;
-    ULONG64 pdIdx   = (GuestVa >> 21) & 0x1FF;
-    ULONG64 ptIdx   = (GuestVa >> 12) & 0x1FF;
-    ULONG64 offset  = GuestVa & 0xFFF;
+    ULONG64 pdIdx = (GuestVa >> 21) & 0x1FF;
+    ULONG64 ptIdx = (GuestVa >> 12) & 0x1FF;
+    ULONG64 offset = GuestVa & 0xFFF;
 
     // Read PML4 entry
     ULONG64 pml4Base = GuestCr3 & ~0xFFFULL;
@@ -164,9 +164,9 @@ static ULONG64 TranslateGuestVaToPa(ULONG64 GuestCr3, ULONG64 GuestVa)
  * @return TRUE表示拷贝成功, FALSE表示映射失败
  */
 
-/**
- * @brief TranslateGuestVaToPa export wrapper for DebugApi VMM-side SW breakpoint
- */
+ /**
+  * @brief TranslateGuestVaToPa export wrapper for DebugApi VMM-side SW breakpoint
+  */
 ULONG64 TranslateGuestVaToPa_Ext(ULONG64 GuestCr3, ULONG64 GuestVa)
 {
     return TranslateGuestVaToPa(GuestCr3, GuestVa);
@@ -267,8 +267,12 @@ VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData)
         // Translate target VA to PA
         ULONG64 targetPa = TranslateGuestVaToPa(targetCr3, targetVa + bytesProcessed);
         if (targetPa == 0) {
-            resultStatus = -4; // Page not present
-            break;
+            /* [FIX] 页面不在物理内存 — 跳过而非终止
+             * 读取: 目标缓冲区的对应区域保持为零 (已被 RtlZeroMemory 初始化)
+             * 写入: 跳过此页面 (无法写入不存在的物理页)
+             * CE 中这些区域会显示 00 而不是 ???, 其余区域显示正确数据 */
+            bytesProcessed += chunkSize;
+            continue;
         }
 
         ULONG64 currentBufferPa = bufferPa + bytesProcessed;
@@ -284,8 +288,9 @@ VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData)
         }
 
         if (!ok) {
-            resultStatus = -5; // Map failed
-            break;
+            /* 物理内存映射失败 — 同样跳过 */
+            bytesProcessed += chunkSize;
+            continue;
         }
 
         bytesProcessed += chunkSize;
@@ -302,7 +307,7 @@ VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData)
  *  Guest-side functions - called from IOCTL handler *  These set up the shared context and fire the hypercall
  * ======================================================================== */
 
-// Get CR3 of target process
+ // Get CR3 of target process
 static ULONG64 GetProcessCr3(ULONG64 TargetPid)
 {
     PEPROCESS targetProc = nullptr;
@@ -318,6 +323,66 @@ static ULONG64 GetProcessCr3(ULONG64 TargetPid)
 
     ObDereferenceObject(targetProc);
     return cr3;
+}
+
+/**
+ * @brief 强制目标进程的页面驻留物理内存 — 在 CPUID 超级调用前调用
+ *
+ * 问题: VMM 通过 CR3 遍历页表翻译 VA→PA, 如果 PTE.Present=0
+ *        (页面被换出到 pagefile 或从未 page-in), 翻译返回 0 → 读取失败。
+ *        CE 中显示为 "???"。
+ *
+ * 解决: 在 Guest 侧附加到目标进程, 逐页触摸 (volatile read/write)
+ *        强制 OS 内存管理器将页面调入物理内存。
+ *        之后 VMM 的页表遍历就能找到有效的 PTE。
+ *
+ * 对反作弊透明:
+ *   - KeStackAttachProcess: 经过我们的 NPT Hook (已拦截)
+ *   - 页面触摸: 只是普通的内存读取, 没有 API 调用
+ *   - 实际数据拷贝: 在 VMM 层通过物理内存完成, 不经过任何内核 API
+ *
+ * @param [in] TargetPid  - 目标进程 PID
+ * @param [in] Address    - 目标虚拟地址
+ * @param [in] Size       - 要访问的字节数
+ * @param [in] ForWrite   - TRUE=写入操作(触发COW), FALSE=读取操作
+ */
+static VOID ForcePagePresent(ULONG64 TargetPid, PVOID Address, SIZE_T Size, BOOLEAN ForWrite)
+{
+    PEPROCESS targetProc = nullptr;
+    NTSTATUS status = PsLookupProcessByProcessId((HANDLE)TargetPid, &targetProc);
+    if (!NT_SUCCESS(status) || !targetProc) return;
+
+    KAPC_STATE apcState;
+    KeStackAttachProcess(targetProc, &apcState);
+
+    __try {
+        PUCHAR base = (PUCHAR)Address;
+        SIZE_T offset = 0;
+
+        while (offset < Size) {
+            if (ForWrite) {
+                /* 写操作: 触发 Copy-on-Write 和 PAGE_GUARD 解除
+                 * InterlockedOr8 是原子读-改-写, 值不变但触发页面写入 */
+                InterlockedOr8((volatile char*)(base + offset), 0);
+            }
+            else {
+                /* 读操作: 触发 demand-paging / pagefile read-in */
+                volatile UCHAR dummy = *(volatile UCHAR*)(base + offset);
+                UNREFERENCED_PARAMETER(dummy);
+            }
+
+            /* 推进到下一页边界 */
+            SIZE_T pageRemain = PAGE_SIZE - (((ULONG_PTR)(base + offset)) & 0xFFF);
+            offset += pageRemain;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        /* 某些页面真的无法访问 (未提交/PAGE_NOACCESS)
+         * 这些页面在 VMM 侧会被跳过并填零 */
+    }
+
+    KeUnstackDetachProcess(&apcState);
+    ObDereferenceObject(targetProc);
 }
 
 /**
@@ -342,6 +407,11 @@ NTSTATUS HvReadProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZ
         return STATUS_NOT_FOUND;
     }
 
+    /* [FIX] 强制目标页面驻留物理内存
+     * 没有这一步, VMM 的页表遍历会遇到 PTE.Present=0 → 返回 0 → CE 显示 "???"
+     * 附加到目标进程后触摸每一页, OS 自动将页面从 pagefile 调入 */
+    ForcePagePresent(TargetPid, Address, Size, FALSE);
+
     // Allocate a kernel buffer for the transfer
     PVOID kernelBuffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, Size, 'HvRd');
     if (!kernelBuffer) {
@@ -364,13 +434,7 @@ NTSTATUS HvReadProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZ
     g_HvSharedContext->IsWrite = 0;
     g_HvSharedContext->Status = 1; // Pending
 
-    // Fire hypercall: CPUID with leaf=CPUID_HV_MEMORY_OP, RBX=shared context PA
     int regs[4] = { 0 };
-    // We need to pass g_HvSharedContextPa in RBX before CPUID
-    // Since __cpuid doesn't let us set RBX, we use __cpuidex with ECX as subfunction
-    // and the VMM reads RBX from Guest GPR save area
-    // WORKAROUND: store PA in shared context and pass its PA via a known global
-
     __cpuidex(regs, CPUID_HV_MEMORY_OP, HV_MEM_OP_READ);
 
     NTSTATUS status;
@@ -414,6 +478,11 @@ NTSTATUS HvWriteProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SI
         return STATUS_NOT_FOUND;
     }
 
+    /* [FIX] 强制页面驻留 + 触发 Copy-on-Write
+     * ForWrite=TRUE 使用 InterlockedOr8 触发写入,
+     * 确保 COW 页面被复制为私有副本 */
+    ForcePagePresent(TargetPid, Address, Size, TRUE);
+
     // Allocate kernel buffer and copy user data into it
     PVOID kernelBuffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, Size, 'HvWr');
     if (!kernelBuffer) {
@@ -434,6 +503,8 @@ NTSTATUS HvWriteProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SI
         return STATUS_UNSUCCESSFUL;
     }
 
+    ExAcquireFastMutex(&g_HvMutex);
+
     // Fill shared context
     g_HvSharedContext->TargetCr3 = targetCr3;
     g_HvSharedContext->SourceVa = (ULONG64)Address;
@@ -447,6 +518,8 @@ NTSTATUS HvWriteProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SI
 
     NTSTATUS status = (g_HvSharedContext->Status == 0) ?
         STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+
+    ExReleaseFastMutex(&g_HvMutex);
 
     ExFreePoolWithTag(kernelBuffer, 'HvWr');
     return status;

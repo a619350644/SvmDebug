@@ -35,15 +35,11 @@ __declspec(allocate(".drv_rw")) static volatile LONG g_DeepPrintOnce[HOOK_MAX_CO
 
 #if DEBUG
 #define DEEP_PRINT_ONCE(idx) \
-    do { \
-        if ((idx) < HOOK_MAX_COUNT && InterlockedCompareExchange(&g_DeepPrintOnce[(idx)], 1, 0) == 0) { \
-            SvmDebugPrint("[DeepFake] %s called\n", __FUNCTION__); \
-        } \
-    } while (0)
+    (void)(((idx) < HOOK_MAX_COUNT && InterlockedCompareExchange(&g_DeepPrintOnce[(idx)], 1, 0) == 0) ? \
+        (SvmDebugPrint("[DeepFake] %s called\n", __FUNCTION__), 0) : 0)
 #else
-#define DEEP_PRINT_ONCE(idx) ((void)0)
+#define DEEP_PRINT_ONCE(idx)
 #endif
-
 
 
 /* ========================================================================
@@ -1215,8 +1211,8 @@ PHYSICAL_ADDRESS NTAPI Fake_MmGetPhysicalAddress_Deep(PVOID BaseAddress)
     /* 慢路径: 用户态地址 + 有保护进程
      * 所有操作仅访问非分页数据, 任何 IRQL 安全 */
 
-     /* PsGetCurrentProcess 读取 KPCR->CurrentThread->ApcState.Process,
-      * 全部在非分页内存中, 任何 IRQL 安全 */
+    /* PsGetCurrentProcess 读取 KPCR->CurrentThread->ApcState.Process,
+     * 全部在非分页内存中, 任何 IRQL 安全 */
     PEPROCESS currentProc = PsGetCurrentProcess();
     if (!currentProc)
         return g_OrigMmGetPhysicalAddress(BaseAddress);

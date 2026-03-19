@@ -24,6 +24,10 @@ GuestGPR            EQU 3000h
 GuestStateSaveRSP   EQU 5D8h
 HostStackTopOffset  EQU 5020h
 
+; VMCB StateSaveArea field offsets from VCPU_CONTEXT base
+; StateSaveArea starts at +0x1400 (ControlArea=0x400, Guestvmcb starts at +0x1000)
+GuestCr3Offset      EQU 1550h   ; +0x1000 + 0x400 + 0x150
+
 PUBLIC SvLaunchVm
 PUBLIC SvEnterVmmOnNewStack
 PUBLIC SvSwitchStack
@@ -143,6 +147,11 @@ SvEnterVmmOnNewStack ENDP
 ; @brief Exit SVM: switch from Host stack to Guest stack and IRETQ
 ; @param RCX = PVCPU_CONTEXT VpData
 ; @note Restores Guest segment state, disables EFER.SVME, then IRETQ
+;
+; [FIX] Added CR3 restore before IRETQ.
+;       Without this, the CPU continues with Host CR3 after SVM exit.
+;       If the Guest was in a GUI process (win32k session space),
+;       the Host CR3 doesn't map those pages -> BSOD 0x50 in win32kfull.sys.
 ; =========================================================================
 SvSwitchStack PROC
     MOV R15, RCX                 ; Save VpData in R15
@@ -158,7 +167,13 @@ SvSwitchStack PROC
     BTR EAX, 12
     WRMSR
 
-    ; Step 3: Build IRETQ frame (SS, RSP, RFLAGS, CS, RIP)
+    ; Step 3: Restore Guest CR3 BEFORE switching stacks
+    ;   VMLOAD does NOT restore CR3 (only FS/GS/TR/LDTR/STAR/LSTAR/etc)
+    ;   Without this: CPU uses Host CR3 -> no session space -> BSOD
+    MOV RAX, [R15 + GuestCr3Offset]
+    MOV CR3, RAX
+
+    ; Step 4: Build IRETQ frame (SS, RSP, RFLAGS, CS, RIP)
     MOVZX RAX, word ptr [R15 + 1420h]    ; Push SS
     PUSH RAX
     MOV RAX, [R15 + 15D8h]               ; Push RSP
@@ -170,7 +185,7 @@ SvSwitchStack PROC
     MOV RAX, [R15 + 1578h]               ; Push RIP
     PUSH RAX
 
-    ; Step 4: Restore Guest GPRs (manual expansion to preserve IRETQ frame)
+    ; Step 5: Restore Guest GPRs (manual expansion to preserve IRETQ frame)
     LEA RAX, [R15 + GuestGPR]
     MOV RBX, [RAX+08H]
     MOV RCX, [RAX+10H]
@@ -188,7 +203,7 @@ SvSwitchStack PROC
     MOV R15, [RAX+70H]
     MOV RAX, [RAX+00H]
 
-    ; Step 5: Return to Guest
+    ; Step 6: Return to Guest
     IRETQ
 SvSwitchStack ENDP
 

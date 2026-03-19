@@ -298,7 +298,16 @@ NTSTATUS PrepareVMCB(PVCPU_CONTEXT vpData, CONTEXT contextRecord)
     vpData->Guestvmcb.ControlArea.InterceptMisc2 |= SVM_INTERCEPT_MISC2_VMRUN | SVM_INTERCEPT_MISC2_VMCALL;
 
     vpData->Guestvmcb.ControlArea.InterceptException |= (1UL << 1);   /* #DB */
+    vpData->Guestvmcb.ControlArea.InterceptException |= (1UL << 3);   /* #BP — 隐形断点基础 */
     vpData->Guestvmcb.ControlArea.InterceptException |= (1UL << 13);  /* #GP */
+
+    if (vpData->ProcessorIndex == 0) {
+        SvmDebugPrint("[SVM] InterceptException=0x%X (#DB=%d #BP=%d #GP=%d)\n",
+            vpData->Guestvmcb.ControlArea.InterceptException,
+            (vpData->Guestvmcb.ControlArea.InterceptException >> 1) & 1,
+            (vpData->Guestvmcb.ControlArea.InterceptException >> 3) & 1,
+            (vpData->Guestvmcb.ControlArea.InterceptException >> 13) & 1);
+    }
 
     /* Do NOT intercept RDTSC/RDTSCP - causes physical machine freeze */
 
@@ -559,7 +568,7 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
                 NTSTATUS s1, s2;
                 ULONG64 guestRip = vmcb->StateSaveArea.Rip;
 
-  
+
                 PNPT_HOOK_CONTEXT matchedHook = nullptr;
                 ULONG64 faultPagePa = hookCtx->OriginalPagePa;
                 for (int hi = 0; hi < HOOK_MAX_COUNT; hi++) {
@@ -604,11 +613,133 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
 
     case VMEXIT_EXCEPTION_DB:
     {
-        EVENTINJ reinject = { 0 };
-        reinject.Fields.Vector = 1;
-        reinject.Fields.Type = 3;
-        reinject.Fields.Valid = 1;
-        vmcb->ControlArea.EventInj = reinject.AsUInt64;
+        /* === 验证计数器 === */
+        static volatile LONG s_DbVmexitCount = 0;
+        LONG dbCount = InterlockedIncrement(&s_DbVmexitCount);
+
+        /* 场景 1: NPT 断点单步恢复 */
+        BOOLEAN handled = FALSE;
+
+        if (g_NptBreakpointCount > 0) {
+            for (LONG i = 0; i < MAX_NPT_BREAKPOINTS; i++) {
+                if (g_NptBreakpoints[i].IsActive &&
+                    g_NptBreakpoints[i].IsSingleStepping)
+                {
+                    SvmDebugPrint("[VMM] #DB single-step recovery: BP[%d] addr=0x%llX\n",
+                        i, g_NptBreakpoints[i].VirtualAddress);
+
+                    /* 重新激活 NPT 断点: 切回 FakePage (含 0xCC) */
+                    LONG hookSlot = g_NptBreakpoints[i].HookSlotIndex;
+                    if (hookSlot >= 0 && hookSlot < HOOK_MAX_COUNT &&
+                        g_HookList[hookSlot].IsUsed) {
+                        ApplyNptHookByPa(vpData,
+                            g_HookList[hookSlot].TargetPa,
+                            g_HookList[hookSlot].FakePagePa);
+                        SetNptPagePermissions(vpData,
+                            g_HookList[hookSlot].TargetPa, NPT_PERM_READ_ONLY);
+                        ForceNptFlush(vpData);
+                    }
+
+                    /* 清除 TF 和 DR6.BS */
+                    vmcb->StateSaveArea.Rflags &= ~(1ULL << 8);
+                    vmcb->StateSaveArea.Dr6 &= ~(1ULL << 14);
+                    g_NptBreakpoints[i].IsSingleStepping = FALSE;
+                    handled = TRUE;
+                    break;
+                }
+            }
+        }
+
+        if (!handled) {
+            if (dbCount <= 3) {
+                SvmDebugPrint("[VMM] #DB VMEXIT (reinject): RIP=0x%llX DR6=0x%llX\n",
+                    vmcb->StateSaveArea.Rip, vmcb->StateSaveArea.Dr6);
+            }
+            /* 回注到 Guest */
+            EVENTINJ reinject = { 0 };
+            reinject.Fields.Vector = 1;
+            reinject.Fields.Type = 3;
+            reinject.Fields.Valid = 1;
+            vmcb->ControlArea.EventInj = reinject.AsUInt64;
+        }
+        break;
+    }
+
+    case VMEXIT_EXCEPTION_BP:
+    {
+        /* ============================================================
+         * #BP (Vector 3) — INT3 断点异常
+         *
+         * 两种场景:
+         *   1. 我们的 NPT 隐形断点: 通知调试器, 单步恢复
+         *   2. 其他 INT3 (游戏/OS 自己的): 回注到 Guest OS
+         * ============================================================ */
+        ULONG64 bpRip = vmcb->StateSaveArea.Rip;
+        ULONG64 bpCr3 = vmcb->StateSaveArea.Cr3;
+        ULONG64 bpAddr = bpRip;  /* INT3 执行后 RIP 已指向下一条指令 */
+
+        /* AMD SVM: INT3 的 #BP 异常是 fault 类型, RIP 已指向 INT3 之后
+         * 所以断点地址 = RIP - 1 */
+        bpAddr = bpRip - 1;
+
+        /* === 验证计数器: 前 5 次打印详情, 之后每 1000 次打印一次汇总 === */
+        static volatile LONG s_BpVmexitCount = 0;
+        LONG bpCount = InterlockedIncrement(&s_BpVmexitCount);
+        if (bpCount <= 5) {
+            SvmDebugPrint("[VMM] #BP VMEXIT #%d: RIP=0x%llX CR3=0x%llX CPU=%d\n",
+                bpCount, bpRip, bpCr3, vpData->ProcessorIndex);
+        }
+        else if ((bpCount % 1000) == 0) {
+            SvmDebugPrint("[VMM] #BP VMEXIT total: %d\n", bpCount);
+        }
+
+        BOOLEAN isOurBp = FALSE;
+        LONG bpIdx = -1;
+
+        if (g_NptBreakpointCount > 0) {
+            for (LONG i = 0; i < MAX_NPT_BREAKPOINTS; i++) {
+                if (g_NptBreakpoints[i].IsActive &&
+                    g_NptBreakpoints[i].VirtualAddress == bpAddr &&
+                    g_NptBreakpoints[i].TargetCr3 == bpCr3)
+                {
+                    isOurBp = TRUE;
+                    bpIdx = i;
+                    break;
+                }
+            }
+        }
+
+        if (isOurBp && bpIdx >= 0) {
+            SvmDebugPrint("[VMM] >>> NPT BP HIT! addr=0x%llX pid=%llu slot=%d\n",
+                bpAddr, g_NptBreakpoints[bpIdx].TargetPid, bpIdx);
+
+            vmcb->StateSaveArea.Rip = bpAddr;
+
+            /* 临时切回原始页 */
+            LONG hookSlot = g_NptBreakpoints[bpIdx].HookSlotIndex;
+            if (hookSlot >= 0 && hookSlot < HOOK_MAX_COUNT) {
+                ApplyNptHookByPa(vpData,
+                    g_HookList[hookSlot].TargetPa,
+                    g_HookList[hookSlot].OriginalPagePa);
+                SetNptPagePermissions(vpData,
+                    g_HookList[hookSlot].TargetPa, NPT_PERM_EXECUTE);
+                ForceNptFlush(vpData);
+            }
+
+            /* 设置 TF → 执行 1 条原始指令后 #DB VMEXIT → 重新激活断点 */
+            vmcb->StateSaveArea.Rflags |= (1ULL << 8);
+            g_NptBreakpoints[bpIdx].IsSingleStepping = TRUE;
+
+            /* TODO: 投递 STATUS_BREAKPOINT 事件到 DebugApi 事件队列 */
+        }
+        else {
+            /* 不是我们的断点 — 回注到 Guest OS */
+            EVENTINJ reinject = { 0 };
+            reinject.Fields.Vector = 3;
+            reinject.Fields.Type = 3;   /* Software exception */
+            reinject.Fields.Valid = 1;
+            vmcb->ControlArea.EventInj = reinject.AsUInt64;
+        }
         break;
     }
 

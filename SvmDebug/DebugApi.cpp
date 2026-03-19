@@ -34,6 +34,10 @@ PHV_DEBUG_CONTEXT g_HvDebugContext = nullptr;
 ULONG64 g_HvDebugContextPa = 0;
 FAST_MUTEX g_HvDebugMutex;
 
+/* NPT 隐形断点全局表 */
+NPT_BREAKPOINT g_NptBreakpoints[MAX_NPT_BREAKPOINTS] = { 0 };
+volatile LONG  g_NptBreakpointCount = 0;
+
 /* Dynamic-resolved NT internals */
 FnPsGetNextProcess  g_pfnPsGetNextProcess = NULL;
 
@@ -2144,7 +2148,7 @@ static BOOLEAN LockPageForHook(PVOID Address)
     }
 
     g_DebugPageMdls[g_DebugMdlCount++] = mdl;
-    SvmDebugPrint("[DebugApi] Locked page for %p (MDL#%lu)\n", Address, g_DebugMdlCount);
+    //SvmDebugPrint("[DebugApi] Locked page for %p (MDL#%lu)\n", Address, g_DebugMdlCount);
     return TRUE;
 }
 
