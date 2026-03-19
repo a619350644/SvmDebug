@@ -350,23 +350,6 @@ VOID CommunicationThread(PVOID Context)
         KeDelayExecutionThread(KernelMode, FALSE, &hookDrainDelay);
     }
 
-    /* [FIX] 跳过 SVM 退出步骤
-     *
-     * KeIpiGenericCall(IpiUnloadBroadcastCallback) 会在所有 CPU 上触发 CPUID
-     * → VMEXIT → isExit=1 → HostLoop 退出 → SvSwitchStack 切换栈。
-     * 但 SvSwitchStack 切换到的是 SvmInitSystemThread 的调用栈,
-     * 而该函数早已返回, 栈帧无效, 导致 CPU 卡死或崩溃。
-     *
-     * 安全策略: 只恢复 NPT 映射 (所有 Hook 变为透传), 不退出 SVM。
-     * SVM 虽然仍在运行, 但:
-     *   - 所有 NPT 页面已恢复为原始映射, 无 Hook 生效
-     *   - VMRUN/VMEXIT 仅处理正常的 CPUID/MSR, 开销极小
-     *   - 系统功能完全正常
-     *   - 重启后自动清除
-     *
-     * 如需完全退出 SVM, 需要修复 SvSwitchStack 的栈恢复逻辑,
-     * 确保每个 CPU 能安全回到 IPI 回调的返回点。
-     */
     SvmDebugPrint("[INFO] SVM remains active (hooks deactivated). Reboot to fully exit SVM.\n");
 
     /* 释放非 SVM 核心资源 (不释放 SVM/NPT/VMCB 相关内存) */

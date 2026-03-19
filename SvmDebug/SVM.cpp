@@ -525,11 +525,7 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
             int cpuInfo[4] = { 0 };
             __cpuidex(cpuInfo, leaf, (int)vpData->Guest_gpr.Rcx);
 
-            /* [FIX] 隐藏 Hypervisor 存在标志, 防止 VMP/TMD 等加壳工具检测到虚拟化环境
-             *
-             * CPUID leaf 0x1, ECX bit 31 = Hypervisor Present
-             * 在 SVM Guest 模式下此 bit 被 CPU 自动设置为 1,
-             * 必须手动清除, 否则 VMP 壳会认为在 VM 中运行并触发 FastFail (0xC0000409) */
+
             if (leaf == 1) {
                 cpuInfo[2] &= ~(1 << 31);  /* 清除 ECX.HypervisorPresent */
             }
@@ -563,17 +559,7 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
                 NTSTATUS s1, s2;
                 ULONG64 guestRip = vmcb->StateSaveArea.Rip;
 
-                /*
-                 * [FIX] 页面共享修复: 当多个Hook共享同一物理页(page reuse)时,
-                 * FindHookByFaultPa返回第一个匹配的Hook, 但RIP可能对应同页上的
-                 * 其他Hook。需要遍历所有共享同一OriginalPagePa的Hook, 找到RIP
-                 * 精确匹配的那个。
-                 *
-                 * 例: NtCreateDebugObject(0xAF0) 和 NtDebugActiveProcess(0xCF0)
-                 * 共享同一页。FindHookByFaultPa可能返回NtCreateDebugObject的hookCtx,
-                 * 但RIP=NtDebugActiveProcess的地址 → 原代码走else分支 → 显示原始页
-                 * → Hook不触发 → 自定义句柄泄漏给原函数 → STATUS_INVALID_HANDLE
-                 */
+  
                 PNPT_HOOK_CONTEXT matchedHook = nullptr;
                 ULONG64 faultPagePa = hookCtx->OriginalPagePa;
                 for (int hi = 0; hi < HOOK_MAX_COUNT; hi++) {

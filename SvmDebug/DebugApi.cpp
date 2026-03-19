@@ -260,14 +260,6 @@ BOOLEAN IsDebugger(PEPROCESS Process)
         entry = entry->Flink)
     {
         PDEBUGGER_TABLE_ENTRY dbgEntry = CONTAINING_RECORD(entry, DEBUGGER_TABLE_ENTRY, ListEntry);
-        /*
-         * [FIX] 同时匹配EPROCESS指针和PID:
-         *   IOCTL注册时通过PsLookupProcessByProcessId获取EPROCESS并存储,
-         *   但syscall上下文中PsGetCurrentProcess()返回的EPROCESS指针可能
-         *   与注册时不同(PsLookup返回的是引用, Deref后指针值仍有效但不保证
-         *   与PsGetCurrentProcess()的快速路径返回值相同)。
-         *   增加PID匹配作为回退, 确保CE在任何调用上下文中都能被识别。
-         */
         if (dbgEntry->DebuggerProcess == Process ||
             dbgEntry->DebuggerPid == currentPid) {
             result = TRUE;
@@ -280,10 +272,6 @@ BOOLEAN IsDebugger(PEPROCESS Process)
 
 BOOLEAN SetDebugTargetProcess(PEPROCESS Process, PDEBUG_OBJECT DebugObject)
 {
-    /* [FIX] 移除冗余的 IsDebugger 检查
-     * 调用者 (Fake_NtDebugActiveProcess) 已经验证了调试器身份。
-     * 此处再次检查可能因 EPROCESS 指针不匹配而误拒绝合法操作。
-     * 改为仅验证参数有效性。 */
     if (!Process || !DebugObject) return FALSE;
 
     PDEBUG_PROCESS entry = (PDEBUG_PROCESS)
@@ -669,7 +657,6 @@ NTSTATUS NTAPI Fake_NtSetInformationDebugObject(
     PDEBUG_OBJECT DebugObject;
     ULONG Flags;
 
-    /* [FIX] 自定义句柄保护: 0xDB000000 范围的句柄不能传给原函数 */
     if (!IsDebugger(PsGetCurrentProcess()) && !DBG_IS_VALID_HANDLE(DebugObjectHandle)) {
         /* 非我们的调试器, 透传 */
         return STATUS_PORT_NOT_SET;
@@ -714,11 +701,6 @@ NTSTATUS NTAPI Fake_NtSetInformationDebugObject(
 
 /**
  * @brief Post fake CREATE_PROCESS event after attach so CE's WaitForDebugEvent returns
- *
- * [FIX] 两处修复:
- *   1. ImageBase: 使用 PEB_LITE 结构体安全读取, 而非原始 PVOID* 指针算术
- *   2. InitialThread: 枚举目标进程的真实线程, 而非使用 PsGetCurrentThread()
- *      (当前线程属于驱动/CE进程, 不属于目标进程, CE解析时会发现TID不匹配)
  */
 static VOID DbgkpPostFakeProcessCreateMessages(
     PEPROCESS TargetProcess,
@@ -726,9 +708,7 @@ static VOID DbgkpPostFakeProcessCreateMessages(
 {
     if (!TargetProcess || !DebugObject) return;
 
-    /* [FIX] 通过 PEB_LITE 结构体安全读取 ImageBaseAddress
-     * 注意: 当前运行在CE进程上下文中, 必须KeStackAttachProcess
-     * 到目标进程才能访问其用户态PEB */
+
     PVOID imageBase = NULL;
     PPEB_LITE pPeb = (PPEB_LITE)PsGetProcessPeb(TargetProcess);
     if (pPeb) {
@@ -746,9 +726,7 @@ static VOID DbgkpPostFakeProcessCreateMessages(
         KeUnstackDetachProcess(&apcState);
     }
 
-    /* [FIX] 获取目标进程的真实初始线程
-     * 原版使用 PsGetCurrentThread() 返回的是CE/驱动线程, 不属于目标进程,
-     * CE收到 CREATE_PROCESS 事件时发现 ThreadId 不属于 ProcessId → 异常 */
+
     PETHREAD initialThread = NULL;
     HANDLE targetPid = PsGetProcessId(TargetProcess);
 
@@ -809,14 +787,7 @@ static VOID DbgkpPostFakeProcessCreateMessages(
     ExAcquireFastMutex(&DebugObject->Mutex);
     InsertTailList(&DebugObject->EventList, &createProcEvent->EventList);
 
-    /* [FIX] 追加初始断点事件 (STATUS_BREAKPOINT)
-     * Windows调试协议: attach后系统会投递一个初始断点异常事件,
-     * 这是CE完成附加握手的必需步骤。
-     * 如果不投递, CE的WaitForDebugEvent只收到CREATE_PROCESS,
-     * 然后在等待初始断点时超时或报错。
-     *
-     * 标准流程: CREATE_PROCESS → EXCEPTION(STATUS_BREAKPOINT) → CE发送DBG_CONTINUE → 附加完成
-     */
+
     {
         PDEBUG_EVENT bpEvent = (PDEBUG_EVENT)ExAllocatePool2(
             POOL_FLAG_NON_PAGED, sizeof(DEBUG_EVENT), 'EgbD');
@@ -856,12 +827,6 @@ static VOID DbgkpPostFakeProcessCreateMessages(
 /**
  * @brief [Fake] NtDebugActiveProcess - attach debug, write shadow debug port
  *
- * [FIX] 三重修复:
- *   1. 增加 DBG_IS_VALID_HANDLE 检测: 如果 DebugHandle 是自定义句柄 (0xDB000000 范围),
- *      绝不能传递给原始 NtDebugActiveProcess, 否则 Windows 内核返回 STATUS_INVALID_HANDLE (错误6)
- *   2. IsDebugger 已增加 PID 回退匹配 (Fix 1), 此处额外添加诊断日志
- *   3. ObReferenceObjectByHandle 使用 KeGetPreviousMode() 而非硬编码 KernelMode,
- *      确保用户态进程句柄正确校验
  */
 NTSTATUS NTAPI Fake_NtDebugActiveProcess(
     IN HANDLE ProcessHandle,
@@ -891,8 +856,6 @@ NTSTATUS NTAPI Fake_NtDebugActiveProcess(
         return STATUS_ACCESS_DENIED;
     }
 
-    /* [FIX] 使用 KeGetPreviousMode() 而非 KernelMode
-     * ProcessHandle 来自用户态, 必须按用户态模式校验 */
     Status = ObReferenceObjectByHandle(ProcessHandle, PROCESS_SET_PORT,
         *PsProcessType, KeGetPreviousMode(), (PVOID*)&TargetProcess, NULL);
     if (!NT_SUCCESS(Status)) {
@@ -967,8 +930,6 @@ NTSTATUS NTAPI Fake_NtWaitForDebugEvent(
     PLIST_ENTRY ListHead, NextEntry, NextEntry2;
     LARGE_INTEGER StartTime = { 0 };
 
-    /* [FIX] 自定义句柄保护: 如果 DebugHandle 在 0xDB000000 范围内,
-     * 必须走自定义路径, 绝不能传给原始函数 */
     BOOLEAN bIsCustomHandle = DBG_IS_VALID_HANDLE(DebugHandle);
     if (!IsDebugger(PsGetCurrentProcess()) && !bIsCustomHandle) {
         if (g_OrigNtWaitForDebugEvent)
@@ -1108,7 +1069,6 @@ NTSTATUS NTAPI Fake_NtDebugContinue(
     CLIENT_ID Clid;
     BOOLEAN GotEvent;
 
-    /* [FIX] 自定义句柄保护 */
     BOOLEAN bIsCustomHandle = DBG_IS_VALID_HANDLE(DebugObjectHandle);
     if (!IsDebugger(PsGetCurrentProcess()) && !bIsCustomHandle) {
         if (g_OrigNtDebugContinue)
@@ -1191,7 +1151,7 @@ NTSTATUS NTAPI Fake_NtRemoveProcessDebug(
     PDEBUG_OBJECT DebugObject;
     PEPROCESS Process;
 
-    /* [FIX] 自定义句柄保护 */
+
     BOOLEAN bIsCustomHandle = DBG_IS_VALID_HANDLE(DebugObjectHandle);
     if (!IsDebugger(PsGetCurrentProcess()) && !bIsCustomHandle) {
         if (g_OrigNtRemoveProcessDebug)
@@ -1199,7 +1159,7 @@ NTSTATUS NTAPI Fake_NtRemoveProcessDebug(
         return STATUS_ACCESS_DENIED;
     }
 
-    /* [FIX] 使用 KeGetPreviousMode() */
+
     Status = ObReferenceObjectByHandle(ProcessHandle, PROCESS_SET_PORT,
         *PsProcessType, KeGetPreviousMode(), (PVOID*)&Process, NULL);
     if (!NT_SUCCESS(Status)) return Status;
@@ -2475,7 +2435,6 @@ static ULONG CollectCallTargets(PVOID Start, ULONG MaxBytes, PVOID* Out, ULONG M
                 /* 目标必须在ntoskrnl映像范围内 — 防止跟随到无效地址导致BSOD */
                 if (!IsWithinNtoskrnl(target)) { i += 4; continue; }
 
-                /* [FIX] 额外验证: 目标必须在代码段或已驻留, 否则后续锁定会BSOD */
                 if (!IsWithinCodeRange(target) && !MmIsAddressValid(target)) { i += 4; continue; }
 
                 /* 去重 */
@@ -2719,7 +2678,6 @@ static ULONG FindCallersOf(PVOID TargetFunc, PVOID* OutCallers, ULONG MaxCallers
                     }
 
                     if (funcStart) {
-                        /* [FIX] 验证回溯找到的funcStart仍在代码段内 */
                         if (!IsWithinCodeRange(funcStart)) {
                             i += 5;
                             continue;
@@ -2997,17 +2955,12 @@ NTSTATUS PrepareDebugNptHookResources()
     PVOID pTarget = NULL;
     ULONG ok = 0;
 
-    /* [FIX] 关键: 在Phase 1开始前就初始化ntoskrnl基址
-     * LockPageForHook依赖IsWithinNtoskrnl(), 如果g_NtoskrnlBase为NULL则所有锁页都会失败
-     * 之前GetNtoskrnlBase()只在ScanForDbgkFunctions()中调用, 太晚了 */
     GetNtoskrnlBase(NULL);
     if (!g_NtoskrnlBase || g_NtoskrnlSize == 0) {
         SvmDebugPrint("[DebugApi] GetNtoskrnlBase failed in PrepareDebugNptHookResources\n");
         /* 不return, 继续尝试 — 某些路径可能不需要ntoskrnl基址 */
     }
 
-    /* [FIX] 必须在 Phase 1 的 LockPageForHook 之前初始化代码段范围表,
-     * 否则 IsWithinCodeRange() 始终返回 FALSE → PAGE段函数被误拒 */
     InitCodeRanges();
 
     enum DbgResolve { DBG_RESOLVE_NTDLL, DBG_RESOLVE_EXPORT, DBG_RESOLVE_CALLSCAN };
