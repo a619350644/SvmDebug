@@ -17,10 +17,11 @@
 #include <basetsd.h>
 #include <intrin.h>
 #include <stdarg.h>
+#include <ntstrsafe.h>
 #define DEBUG 0
-/* ============================================================================
- *  Section 1: MSR 地址常量
- * ============================================================================ */
+ /* ============================================================================
+  *  Section 1: MSR 地址常量
+  * ============================================================================ */
 
 #define MSR_IA32_INTEL_FEATURE_CONTROL   0x3a
 #define IA32_MSR_PAT                     0x00000277
@@ -37,9 +38,9 @@
 #define MSR_IA32_SYSENTER_ESP            0x175
 #define MSR_IA32_SYSENTER_EIP            0x176
 
-/* ============================================================================
- *  Section 2: SVM 相关常量
- * ============================================================================ */
+  /* ============================================================================
+   *  Section 2: SVM 相关常量
+   * ============================================================================ */
 
 #define SVM_MSR_VM_CR                    0xc0010114
 #define SVM_MSR_VM_HSAVE_PA              0xc0010117
@@ -47,7 +48,7 @@
 #define SVM_MSR_PERMISSIONS_MAP_SIZE     (PAGE_SIZE * 2)
 #define EFER_SVME                        (1UL << 12)
 
-/** RDTSC拦截: Misc1 bit14 = RDTSC, Misc2 bit7 = RDTSCP */
+   /** RDTSC拦截: Misc1 bit14 = RDTSC, Misc2 bit7 = RDTSCP */
 #define SVM_INTERCEPT_MISC1_RDTSC        (1UL << 14)
 #define SVM_INTERCEPT_MISC2_RDTSCP       (1UL << 7)
 #define SVM_INTERCEPT_MISC1_CPUID        (1UL << 18)
@@ -69,7 +70,7 @@
 #define CPUID_FN0000_0001_ECX_HYPERVISOR_PRESENT     (1UL << 31)
 #define CPUID_FN8000_000A_EDX_NP                     (1UL << 0)
 
-/** Hypervisor自定义CPUID叶 */
+ /** Hypervisor自定义CPUID叶 */
 #define CPUID_HV_VENDOR_AND_MAX_FUNCTIONS  0x40000000
 #define CPUID_HV_INTERFACE                 0x40000001
 #define CPUID_HV_MAX                       CPUID_HV_INTERFACE
@@ -90,7 +91,7 @@
 #define KERNEL_STACK_SIZE 0x6000
 #endif
 
-/** VMMCALL超级调用magic (用于Trampoline中MOV CRn模拟) */
+ /** VMMCALL超级调用magic (用于Trampoline中MOV CRn模拟) */
 #define VMMCALL_CR_WRITE_BASE   0x4141FE00
 #define VMMCALL_CR_READ_BASE    0x4141FD00
 
@@ -152,7 +153,7 @@ typedef struct _VMCB_CONTROL_AREA
     UINT8  RequestedIrr[32];            /* +0x150 */
     UINT8  Reserved170_3DF[0x3E0 - 0x170];
     UINT8  ReservedForHost[0x400 - 0x3E0];
-} VMCB_CONTROL_AREA, *PVMCB_CONTROL_AREA;
+} VMCB_CONTROL_AREA, * PVMCB_CONTROL_AREA;
 #pragma pack(pop)
 static_assert(sizeof(VMCB_CONTROL_AREA) == 0x400, "VMCB_CONTROL_AREA Size Mismatch");
 
@@ -194,7 +195,7 @@ typedef struct _VMCB_STATE_SAVE_AREA
     UINT64 IbsOpCtl; UINT64 IbsOpRip; UINT64 IbsOpData; UINT64 IbsOpData2;
     UINT64 IbsOpData3; UINT64 IbsDcLinaddr; UINT64 BpIbstgtRip; UINT64 IcIbsExtdCtl;
     UINT8  Reserved8[0xC00 - 0x7C8];
-} VMCB_STATE_SAVE_AREA, *PVMCB_STATE_SAVE_AREA;
+} VMCB_STATE_SAVE_AREA, * PVMCB_STATE_SAVE_AREA;
 #pragma pack(pop)
 static_assert(sizeof(VMCB_STATE_SAVE_AREA) == 0xC00, "VMCB_STATE_SAVE_AREA Size Mismatch");
 
@@ -225,11 +226,11 @@ typedef struct _VMSA_SAVE_AREA
     UINT64 GuestExitInfo3; UINT8 Gei3Reserved[8];
     UINT64 GuestExitInfo4; UINT8 Gei4Reserved[8];
     UINT8  Reserved540_BFF[0xC00 - 0x540];
-} VMSA_SAVE_AREA, *PVMSA_SAVE_AREA;
+} VMSA_SAVE_AREA, * PVMSA_SAVE_AREA;
 #pragma pack(pop)
 static_assert(sizeof(VMSA_SAVE_AREA) == 0xC00, "VMSA_SAVE_AREA Size Mismatch");
 
-typedef struct _VMCB { VMCB_CONTROL_AREA ControlArea; VMCB_STATE_SAVE_AREA StateSaveArea; } VMCB, *PVMCB;
+typedef struct _VMCB { VMCB_CONTROL_AREA ControlArea; VMCB_STATE_SAVE_AREA StateSaveArea; } VMCB, * PVMCB;
 static_assert(sizeof(VMCB) == 0x1000, "VMCB Size Mismatch");
 
 /* ============================================================================
@@ -242,7 +243,7 @@ typedef struct _GUEST_GPR
     UINT64 Rsi; UINT64 Rdi; UINT64 Rbp;
     UINT64 R8; UINT64 R9; UINT64 R10; UINT64 R11;
     UINT64 R12; UINT64 R13; UINT64 R14; UINT64 R15;
-} GUEST_GPR, *PGUEST_GPR;
+} GUEST_GPR, * PGUEST_GPR;
 
 typedef struct _SEGMENT_DESCRIPTOR
 {
@@ -254,7 +255,7 @@ typedef struct _SEGMENT_DESCRIPTOR
             UINT32 BaseHigh : 8;
         } Fields;
     };
-} SEGMENT_DESCRIPTOR, *PSEGMENT_DESCRIPTOR;
+} SEGMENT_DESCRIPTOR, * PSEGMENT_DESCRIPTOR;
 
 typedef struct _SEGMENT_ATTRIBUTE
 {
@@ -265,7 +266,7 @@ typedef struct _SEGMENT_ATTRIBUTE
             UINT16 Reserved1 : 4;
         } Fields;
     };
-} SEGMENT_ATTRIBUTE, *PSEGMENT_ATTRIBUTE;
+} SEGMENT_ATTRIBUTE, * PSEGMENT_ATTRIBUTE;
 
 typedef struct _EVENTINJ
 {
@@ -275,7 +276,7 @@ typedef struct _EVENTINJ
             UINT64 Reserved1 : 19; UINT64 Valid : 1; UINT64 ErrorCode : 32;
         } Fields;
     };
-} EVENTINJ, *PEVENTINJ;
+} EVENTINJ, * PEVENTINJ;
 static_assert(sizeof(EVENTINJ) == 8, "EVENTINJ Size Mismatch");
 
 /* ============================================================================
@@ -317,9 +318,9 @@ static_assert(sizeof(EVENTINJ) == 8, "EVENTINJ Size Mismatch");
 #define VMEXIT_NPF              0x0400
 #define VMEXIT_INVALID          -1
 
-/* ============================================================================
- *  Section 10: SVM 状态枚举与函数声明
- * ============================================================================ */
+ /* ============================================================================
+  *  Section 10: SVM 状态枚举与函数声明
+  * ============================================================================ */
 
 typedef enum _SVM_STATUS { SVM_ALLOWED = 0, SVM_NOT_AVAIL, SVM_DISABLED_BY_BIOS, SVM_DISABLED_WITH_KEY } SVM_STATUS;
 
@@ -335,18 +336,34 @@ BOOLEAN CommCheckAMDsupport();
 BOOLEAN CommCheckAMDSvmlFeature();
 
 /**
- * @brief SVM调试输出函数 - 带[SvmDebug]前缀的格式化打印
+ * @brief SVM调试输出函数 - 同时输出到内核调试器和环形缓冲区
  * @author yewilliam
  * @date 2026/03/16
- * @param [in] Format - printf格式字符串
- * @param [in] ...    - 可变参数
+ *
+ * 始终输出到 DbgPrint (WinDbg/DbgView 可看)
+ * 同时写入 SvmLog 环形缓冲区 (R3 Qt 程序通过 IOCTL 轮询读取)
  */
+#include "SvmLog.h"
+
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _IRQL_requires_same_
 static inline VOID SvmDebugPrint(_In_z_ _Printf_format_string_ PCSTR Format, ...)
 {
+    /* 1. 格式化到本地栈缓冲区, 加 [SvmDebug] 前缀 */
+    char buf[SVM_LOG_ENTRY_SIZE];
+    RtlStringCbCopyA(buf, sizeof(buf), "[SvmDebug] ");
+
+    SIZE_T prefixLen = 0;
+    RtlStringCbLengthA(buf, sizeof(buf), &prefixLen);
+
     va_list argList;
     va_start(argList, Format);
-    vDbgPrintExWithPrefix("[SvmDebug] ", DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, Format, argList);
+    RtlStringCbVPrintfA(buf + prefixLen, sizeof(buf) - prefixLen, Format, argList);
     va_end(argList);
+
+    /* 2. 输出到内核调试器 (DbgView/WinDbg) */
+    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, "%s", buf);
+
+    /* 3. 写入环形缓冲区供 R3 读取 */
+    SvmLogWrite("%s", buf);
 }

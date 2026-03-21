@@ -159,6 +159,7 @@
     <ClCompile Include="MDL\MDL.cpp" />
     <ClCompile Include="NPT.cpp" />
     <ClCompile Include="SVM.cpp" />
+    <ClCompile Include="SvmLog.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common.h" />
@@ -174,6 +175,7 @@
     <ClInclude Include="MDL\MDL.h" />
     <ClInclude Include="NPT.h" />
     <ClInclude Include="SVM.h" />
+    <ClInclude Include="SvmLog.h" />
     <ClInclude Include="winApiDef.h" />
   </ItemGroup>
   <ItemGroup>

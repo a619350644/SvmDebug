@@ -39,9 +39,9 @@ __declspec(allocate(".drv_rw")) static volatile LONG g_FakePrintOnce[HOOK_MAX_CO
 #define FAKE_PRINT_ONCE_FOR(hookIdx) (void)0
 #endif
 
- /* ========================================================================
-  *  全局变量
-  * ======================================================================== */
+/* ========================================================================
+ *  全局变量
+ * ======================================================================== */
 HANDLE   g_ProtectedPIDs[MAX_PROTECTED_PIDS] = { 0 };
 volatile LONG g_ProtectedPidCount = 0;
 
@@ -72,16 +72,16 @@ extern POBJECT_TYPE* IoFileObjectType;
 
 
 /* ========================================================================
- *  Hook Guard — 轻量级防递归（不修改 IRQL） *   *  
+ *  Hook Guard — 轻量级防递归（不修改 IRQL） *   *
  * ======================================================================== */
 
-/**
- * @brief 进入Hook防递归保护 - per-CPU原子锁, 不修改IRQL
- * @author yewilliam
- * @date 2026/03/16
- * @param [out] OldIrql - 输出当前IRQL(仅记录, 不提升)
- * @return TRUE表示成功获取Guard, FALSE表示当前CPU已在Guard中(递归)
- */
+ /**
+  * @brief 进入Hook防递归保护 - per-CPU原子锁, 不修改IRQL
+  * @author yewilliam
+  * @date 2026/03/16
+  * @param [out] OldIrql - 输出当前IRQL(仅记录, 不提升)
+  * @return TRUE表示成功获取Guard, FALSE表示当前CPU已在Guard中(递归)
+  */
 static __forceinline BOOLEAN EnterHookGuard(PKIRQL OldIrql)
 {
     *OldIrql = KeGetCurrentIrql();  // 只记录，不提升
@@ -214,6 +214,9 @@ VOID ClearAllProtectedTargets()
     InterlockedExchange(&g_ProtectedChildHwndCount, 0);
 
     g_ProtectedPID = 0;
+
+    /* [NEW] 联动清除升权列表, 防止 PID 复用导致错误升权 */
+    ClearAllElevatedPids();
 }
 
 
@@ -861,26 +864,59 @@ static PVOID ScanWrapperForInternalTarget(PUCHAR func, int range)
  */
 static PVOID ScanForObpReferenceObjectByHandleWithTag()
 {
-    /* 先尝试 ObReferenceObjectByHandleWithTag (导出, 也是包装函数) */
+    /* 参考开源项目的扫描方式: 从导出函数 ObReferenceObjectByHandleWithTag 开始,
+     * 找第一个 E8 CALL rel32, 目标就是内部 ObpReferenceObjectByHandleWithTag。
+     * 不做 IsLargeKernelFunction 过滤 (某些 build 会误判) */
+
     UNICODE_STRING name1;
     RtlInitUnicodeString(&name1, L"ObReferenceObjectByHandleWithTag");
-    PUCHAR func1 = (PUCHAR)MmGetSystemRoutineAddress(&name1);
-    if (func1) {
-        PVOID result = ScanWrapperForInternalTarget(func1, 96);
-        if (result) return result;
-        SvmDebugPrint("[SCAN] Not found in ObRefWithTag, trying ObRef...\n");
+    PUCHAR func = (PUCHAR)MmGetSystemRoutineAddress(&name1);
+    if (!func) {
+        /* 回退到 ObReferenceObjectByHandle */
+        UNICODE_STRING name2;
+        RtlInitUnicodeString(&name2, L"ObReferenceObjectByHandle");
+        func = (PUCHAR)MmGetSystemRoutineAddress(&name2);
+    }
+    if (!func) {
+        SvmDebugPrint("[ERROR] ObReferenceObjectByHandleWithTag export not found!\n");
+        return NULL;
     }
 
-    /* 回退到 ObReferenceObjectByHandle */
-    UNICODE_STRING name2;
-    RtlInitUnicodeString(&name2, L"ObReferenceObjectByHandle");
-    PUCHAR func2 = (PUCHAR)MmGetSystemRoutineAddress(&name2);
-    if (func2) {
-        PVOID result = ScanWrapperForInternalTarget(func2, 96);
-        if (result) return result;
+    /* 简单扫描: 找第一个 E8 (CALL rel32) — 与参考代码一致 */
+    __try {
+        for (int i = 0; i < 128; i++) {
+            if (func[i] == 0xE8) {
+                LONG rel32 = *(PLONG)(func + i + 1);
+                PVOID target = (PVOID)(func + i + 5 + rel32);
+                if ((UINT64)target > 0xFFFFF80000000000ULL) {
+                    SvmDebugPrint("[SCAN] ObpReferenceObjectByHandleWithTag -> %p (via E8 at +0x%X)\n",
+                        target, i);
+                    return target;
+                }
+            }
+        }
+
+        /* 回退: LEA [rip+disp32] — retpoline 版本 */
+        for (int i = 0; i < 128; i++) {
+            if ((func[i] == 0x4C || func[i] == 0x48) && func[i + 1] == 0x8D) {
+                UCHAR modrm = func[i + 2];
+                if ((modrm & 0xC7) == 0x05) {
+                    LONG disp32 = *(PLONG)(func + i + 3);
+                    PUCHAR target = func + i + 7 + disp32;
+                    if ((UINT64)target > 0xFFFFF80000000000ULL) {
+                        SvmDebugPrint("[SCAN] ObpReferenceObjectByHandleWithTag -> %p (via LEA at +0x%X)\n",
+                            target, i);
+                        return (PVOID)target;
+                    }
+                }
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        SvmDebugPrint("[ERROR] Exception in ObpRef scan\n");
     }
 
-    SvmDebugPrint("[ERROR] ObpReferenceObjectByHandleWithTag not found!\n");
+    SvmDebugPrint("[ERROR] ObpReferenceObjectByHandleWithTag NOT FOUND! Handle elevation will not work.\n");
     return NULL;
 }
 
@@ -963,16 +999,16 @@ ULONG GetSssdtIndexDynamic(PCSTR FunctionName)
  * @note 过滤三种信息类: SystemProcessInformation(链表摘除),
  *        SystemHandleInformation(句柄数组压缩), SystemExtendedHandleInformation(同上)
  */
-/**
- * @brief Hook: NtQuerySystemInformation - 过滤进程/句柄列表 + 隐藏内核调试器
- *
- * [FIX] 新增 SystemKernelDebuggerInformation (class 0x23) 伪装:
- *   无论保护是否激活, 始终报告"无内核调试器"。
- *   这防止反作弊通过此查询检测 WinDbg/KD 连接。
- *
- * 过滤三种信息类: SystemProcessInformation(链表摘除),
- *  SystemHandleInformation(句柄数组压缩), SystemExtendedHandleInformation(同上)
- */
+ /**
+  * @brief Hook: NtQuerySystemInformation - 过滤进程/句柄列表 + 隐藏内核调试器
+  *
+  * [FIX] 新增 SystemKernelDebuggerInformation (class 0x23) 伪装:
+  *   无论保护是否激活, 始终报告"无内核调试器"。
+  *   这防止反作弊通过此查询检测 WinDbg/KD 连接。
+  *
+  * 过滤三种信息类: SystemProcessInformation(链表摘除),
+  *  SystemHandleInformation(句柄数组压缩), SystemExtendedHandleInformation(同上)
+  */
 static NTSTATUS NTAPI Fake_NtQuerySystemInformation(
     SYSTEM_INFORMATION_CLASS SystemInformationClass,
     PVOID  SystemInformation,
@@ -1002,7 +1038,8 @@ static NTSTATUS NTAPI Fake_NtQuerySystemInformation(
                 info[0] = FALSE; /* KernelDebuggerEnabled = FALSE */
                 info[1] = TRUE;  /* KernelDebuggerNotPresent = TRUE */
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
         return status;
     }
 
@@ -1014,7 +1051,8 @@ static NTSTATUS NTAPI Fake_NtQuerySystemInformation(
                 info[0] = FALSE;
                 info[1] = TRUE;
             }
-        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
         return status;
     }
 
@@ -1115,6 +1153,7 @@ static NTSTATUS NTAPI Fake_NtOpenProcess(
     if (g_ProtectedPidCount == 0)
         return g_OrigNtOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId);
 
+    /* 外部进程打开受保护进程 → 拒绝 */
     if (ClientId && ClientId->UniqueProcess &&
         IsProtectedPid(ClientId->UniqueProcess) && !IsCallerProtected())
     {
@@ -1122,20 +1161,74 @@ static NTSTATUS NTAPI Fake_NtOpenProcess(
             __try { *ProcessHandle = NULL; }
             __except (1) {}
         }
-        /* [FIX] 返回 STATUS_INVALID_CID 而非 STATUS_ACCESS_DENIED
-         * STATUS_INVALID_CID 表示"该PID不存在", 与进程从枚举列表中消失一致。
-         * STATUS_ACCESS_DENIED 暗示"有东西在阻止你", 反而暴露存在保护。 */
         return STATUS_INVALID_CID;
     }
 
-    if (IsCallerProtected() && ClientId && !IsProtectedPid(ClientId->UniqueProcess))
+    /* ================================================================
+     *  CE 打开升权目标 → 绕过 ACE, 创建完整权限句柄
+     *
+     *  ACE 的 ObRegisterCallbacks 在句柄 CREATE 时降权。
+     *  OBJ_KERNEL_HANDLE → ACE 回调看到 KernelHandle=TRUE → 跳过
+     *  ZwDuplicateObject → 转为用户句柄 → CE 拿到完整权限
+     * ================================================================ */
+    if (IsCallerProtected() && ClientId && ClientId->UniqueProcess &&
+        g_ElevatedPidCount > 0 && IsElevatedPid(ClientId->UniqueProcess))
     {
-        if (IsDebugger(PsGetCurrentProcess())) {
+        PEPROCESS targetProc = NULL;
+        NTSTATUS status;
+
+        /* Step 1: 直接拿 EPROCESS, 不走句柄 */
+        status = PsLookupProcessByProcessId(ClientId->UniqueProcess, &targetProc);
+        if (!NT_SUCCESS(status) || !targetProc)
+            return g_OrigNtOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId);
+
+        /* Step 2: 创建内核句柄 (OBJ_KERNEL_HANDLE → ACE 回调跳过) */
+        HANDLE kernelHandle = NULL;
+        status = ObOpenObjectByPointer(
+            targetProc,
+            OBJ_KERNEL_HANDLE,          /* ACE: KernelHandle=TRUE → skip */
+            NULL,
+            PROCESS_ALL_ACCESS,
+            *PsProcessType,
+            KernelMode,
+            &kernelHandle);
+
+        if (!NT_SUCCESS(status)) {
+            ObDereferenceObject(targetProc);
             return g_OrigNtOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId);
         }
-        return g_OrigNtOpenProcess(ProcessHandle,
-            PROCESS_QUERY_LIMITED_INFORMATION, ObjectAttributes, ClientId);
+
+        /* Step 3: 复制为用户句柄到 CE 的句柄表 */
+        HANDLE userHandle = NULL;
+        status = ZwDuplicateObject(
+            NtCurrentProcess(), kernelHandle,
+            NtCurrentProcess(), &userHandle,
+            PROCESS_ALL_ACCESS, 0, 0);
+
+        ZwClose(kernelHandle);
+        ObDereferenceObject(targetProc);
+
+        if (NT_SUCCESS(status) && userHandle && ProcessHandle) {
+            __try {
+                *ProcessHandle = userHandle;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                ZwClose(userHandle);
+                return STATUS_ACCESS_VIOLATION;
+            }
+            SvmDebugPrint("[Elevate] NtOpenProcess: CE got ALL_ACCESS handle for PID %llu\n",
+                (ULONG64)ClientId->UniqueProcess);
+            return STATUS_SUCCESS;
+        }
+
+        /* 回退 */
+        if (userHandle) ZwClose(userHandle);
+        return g_OrigNtOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId);
     }
+
+    /* CE 打开非升权进程 → 透传 */
+    if (IsCallerProtected())
+        return g_OrigNtOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId);
 
     return g_OrigNtOpenProcess(ProcessHandle, DesiredAccess, ObjectAttributes, ClientId);
 }
@@ -1166,45 +1259,115 @@ static NTSTATUS NTAPI Fake_NtQueryInformationProcess(
     if (IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
         return STATUS_INVALID_PARAMETER;
 
-    /* 保护进程(CE)自身的调用 → 全部透传, 不干扰调试器工作流程 */
+    /* 保护进程(CE)自身的调用 → 全部透传 */
     if (IsCallerProtected())
         return g_OrigNtQueryInformationProcess(
             ProcessHandle, ProcessInfoClass, ProcessInfo, ProcessInfoLength, ReturnLength);
 
     /* ================================================================
-     * 到此: 调用者是非保护进程, 查询的也不是保护进程
-     * 这就是反作弊自查场景 (游戏查自己是否被调试)
+     * [FIX] 反调试伪装: 仅对"正在被我们调试的目标进程"生效
+     *
+     * 原代码问题:
+     *   保护CE后, 所有非保护进程(包括ACE登录器)查询自身调试状态
+     *   都被伪装 → ACE 自检流程被破坏 → 登录器拒绝启动
+     *
+     * 修复后:
+     *   CE attach game.exe → game.exe 是 DebugTarget
+     *   game.exe 反作弊查 ProcessDebugPort → 返回 0 (隐藏调试)
+     *   launcher.exe 查 ProcessDebugPort → 原样返回 (不干扰)
      * ================================================================ */
 
-    /* ProcessDebugObjectHandle (0x1E) — 直接返回 "无调试对象" */
-    if (ProcessInfoClass == 0x1E) {
-        g_OrigNtQueryInformationProcess(
-            ProcessHandle, ProcessInfoClass, ProcessInfo,
-            ProcessInfoLength, ReturnLength);
-        return (NTSTATUS)0xC0000353; /* STATUS_PORT_NOT_SET */
+     /* 仅对自查场景 (进程查自己) 做判断 */
+    if (ProcessHandle == NtCurrentProcess() || ProcessHandle == (HANDLE)-1) {
+        PDEBUG_PROCESS dbgProc = NULL;
+        BOOLEAN isTarget = IsDebugTargetProcess(PsGetCurrentProcess(), &dbgProc);
+
+        if (isTarget) {
+            /* === 调试目标进程: 执行反调试伪装 === */
+
+            /* ProcessDebugObjectHandle (0x1E) → "无调试对象" */
+            if (ProcessInfoClass == 0x1E) {
+                g_OrigNtQueryInformationProcess(
+                    ProcessHandle, ProcessInfoClass, ProcessInfo,
+                    ProcessInfoLength, ReturnLength);
+                return (NTSTATUS)0xC0000353; /* STATUS_PORT_NOT_SET */
+            }
+
+            NTSTATUS status = g_OrigNtQueryInformationProcess(
+                ProcessHandle, ProcessInfoClass, ProcessInfo,
+                ProcessInfoLength, ReturnLength);
+
+            if (NT_SUCCESS(status) && ProcessInfo) {
+                __try {
+                    switch (ProcessInfoClass) {
+                    case 7: /* ProcessDebugPort → 0 */
+                        if (ProcessInfoLength >= sizeof(ULONG_PTR))
+                            *(PULONG_PTR)ProcessInfo = 0;
+                        break;
+                    case 0x1F: /* ProcessDebugFlags → 1 */
+                        if (ProcessInfoLength >= sizeof(ULONG))
+                            *(PULONG)ProcessInfo = 1;
+                        break;
+                    }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+            return status;
+        }
     }
 
-    NTSTATUS status = g_OrigNtQueryInformationProcess(
+    /* 非调试目标 → 正常透传, 不伪装 */
+    return g_OrigNtQueryInformationProcess(
         ProcessHandle, ProcessInfoClass, ProcessInfo, ProcessInfoLength, ReturnLength);
-
-    if (!NT_SUCCESS(status) || !ProcessInfo)
-        return status;
-
-    __try {
-        switch (ProcessInfoClass) {
-        case 7: /* ProcessDebugPort → 0 */
-            if (ProcessInfoLength >= sizeof(ULONG_PTR))
-                *(PULONG_PTR)ProcessInfo = 0;
-            break;
-        case 0x1F: /* ProcessDebugFlags → 1 (未被调试) */
-            if (ProcessInfoLength >= sizeof(ULONG))
-                *(PULONG)ProcessInfo = 1;
-            break;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-
-    return status;
 }
+
+HANDLE   g_ElevatedPIDs[MAX_ELEVATED_PIDS] = { 0 };
+volatile LONG g_ElevatedPidCount = 0;
+
+BOOLEAN AddElevatedPid(HANDLE Pid)
+{
+    if (!Pid) return FALSE;
+    for (LONG i = 0; i < g_ElevatedPidCount; i++)
+        if (g_ElevatedPIDs[i] == Pid) return TRUE;
+    LONG idx = InterlockedIncrement(&g_ElevatedPidCount) - 1;
+    if (idx >= MAX_ELEVATED_PIDS) {
+        InterlockedDecrement(&g_ElevatedPidCount);
+        return FALSE;
+    }
+    g_ElevatedPIDs[idx] = Pid;
+    SvmDebugPrint("[Elevate] PID %llu added (count=%ld)\n", (ULONG64)Pid, idx + 1);
+    return TRUE;
+}
+
+BOOLEAN RemoveElevatedPid(HANDLE Pid)
+{
+    for (LONG i = 0; i < g_ElevatedPidCount; i++) {
+        if (g_ElevatedPIDs[i] == Pid) {
+            for (LONG j = i; j < g_ElevatedPidCount - 1; j++)
+                g_ElevatedPIDs[j] = g_ElevatedPIDs[j + 1];
+            LONG n = InterlockedDecrement(&g_ElevatedPidCount);
+            g_ElevatedPIDs[n] = 0;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+BOOLEAN IsElevatedPid(HANDLE Pid)
+{
+    if (g_ElevatedPidCount == 0 || !Pid) return FALSE;
+    LONG count = g_ElevatedPidCount;
+    for (LONG i = 0; i < count && i < MAX_ELEVATED_PIDS; i++)
+        if (g_ElevatedPIDs[i] == Pid) return TRUE;
+    return FALSE;
+}
+
+VOID ClearAllElevatedPids()
+{
+    RtlZeroMemory(g_ElevatedPIDs, sizeof(g_ElevatedPIDs));
+    InterlockedExchange(&g_ElevatedPidCount, 0);
+}
+
 
 /**
  * @brief Hook: NtQueryVirtualMemory - 阻止外部探测受保护进程的内存布局
@@ -1224,6 +1387,11 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
 {
     FAKE_PRINT_ONCE_FOR(HOOK_NtQueryVirtualMemory);
     if (!g_OrigNtQueryVirtualMemory) return STATUS_UNSUCCESSFUL;
+
+    /* [NEW] ElevatedPid 调用者直接放行 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId()))
+        return g_OrigNtQueryVirtualMemory(
+            ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
@@ -1358,11 +1526,61 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
     FAKE_PRINT_ONCE_FOR(HOOK_NtReadVirtualMemory);
     if (!g_OrigNtReadVirtualMemory) return STATUS_UNSUCCESSFUL;
 
+    /* ================================================================
+     * CE 读升权目标 → 完全绕过句柄系统, 直接 MmCopyVirtualMemory
+     *
+     * 为什么不能走原 NtReadVirtualMemory:
+     *   原函数内部 ObReferenceObjectByHandle(handle, VM_READ, UserMode)
+     *   → ACE 把句柄 GrantedAccess 剥到 0x1000
+     *   → (0x1000 & VM_READ) == 0 → ACCESS_DENIED
+     *
+     * 为什么不用 g_OrigObpRefByHandleWithTag:
+     *   ObpRef 扫描在某些 build 上失败 → trampoline 为 NULL
+     *
+     * 方案: 直接调 ObReferenceObjectByHandle (ntoskrnl 导出)
+     *   传 DesiredAccess=0, KernelMode → 内部跳过所有权限检查
+     *   这是系统导出函数, 不依赖任何扫描/trampoline
+     * ================================================================ */
+    if (IsCallerProtected() && g_ElevatedPidCount > 0 &&
+        g_OrigMmCopyVirtualMemory &&
+        ProcessHandle && ProcessHandle != NtCurrentProcess())
+    {
+        PEPROCESS targetProc = NULL;
+        /* 直接调 ntoskrnl 导出: DesiredAccess=0, KernelMode → 绕过 ACE */
+        NTSTATUS status = ObReferenceObjectByHandle(
+            ProcessHandle, 0, *PsProcessType, KernelMode,
+            (PVOID*)&targetProc, NULL);
+
+        if (NT_SUCCESS(status) && targetProc) {
+            if (IsElevatedPid(PsGetProcessId(targetProc))) {
+                SIZE_T bytesCopied = 0;
+                status = g_OrigMmCopyVirtualMemory(
+                    targetProc, BaseAddress,
+                    PsGetCurrentProcess(), Buffer,
+                    Size, KernelMode, &bytesCopied);
+
+                ObDereferenceObject(targetProc);
+
+                if (NumberOfBytesRead) {
+                    __try { *NumberOfBytesRead = bytesCopied; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {}
+                }
+                return status;
+            }
+            ObDereferenceObject(targetProc);
+        }
+    }
+
+    /* ElevatedPid 调用者放行 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId()))
+        return g_OrigNtReadVirtualMemory(
+            ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesRead);
+
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
     {
         __try {
-            RtlZeroMemory(Buffer, Size);//这里是关键我们返回拒绝权限
+            RtlZeroMemory(Buffer, Size);
             if (NumberOfBytesRead) *NumberOfBytesRead = Size;
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -1391,6 +1609,41 @@ static NTSTATUS NTAPI Fake_NtWriteVirtualMemory(
     FAKE_PRINT_ONCE_FOR(HOOK_NtWriteVirtualMemory);
     if (!g_OrigNtWriteVirtualMemory) return STATUS_UNSUCCESSFUL;
 
+    /* CE 写升权目标 → 直接 MmCopyVirtualMemory, 绕过句柄系统 */
+    if (IsCallerProtected() && g_ElevatedPidCount > 0 &&
+        g_OrigMmCopyVirtualMemory &&
+        ProcessHandle && ProcessHandle != NtCurrentProcess())
+    {
+        PEPROCESS targetProc = NULL;
+        NTSTATUS status = ObReferenceObjectByHandle(
+            ProcessHandle, 0, *PsProcessType, KernelMode,
+            (PVOID*)&targetProc, NULL);
+
+        if (NT_SUCCESS(status) && targetProc) {
+            if (IsElevatedPid(PsGetProcessId(targetProc))) {
+                SIZE_T bytesCopied = 0;
+                status = g_OrigMmCopyVirtualMemory(
+                    PsGetCurrentProcess(), Buffer,
+                    targetProc, BaseAddress,
+                    Size, KernelMode, &bytesCopied);
+
+                ObDereferenceObject(targetProc);
+
+                if (NumberOfBytesWritten) {
+                    __try { *NumberOfBytesWritten = bytesCopied; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {}
+                }
+                return status;
+            }
+            ObDereferenceObject(targetProc);
+        }
+    }
+
+    /* ElevatedPid 调用者放行 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId()))
+        return g_OrigNtWriteVirtualMemory(
+            ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesWritten);
+
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
         return STATUS_ACCESS_DENIED;
@@ -1416,6 +1669,11 @@ static NTSTATUS NTAPI Fake_NtProtectVirtualMemory(
 {
     FAKE_PRINT_ONCE_FOR(HOOK_NtProtectVirtualMemory);
     if (!g_OrigNtProtectVirtualMemory) return STATUS_UNSUCCESSFUL;
+
+    /* [NEW] ElevatedPid 调用者直接放行 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId()))
+        return g_OrigNtProtectVirtualMemory(
+            ProcessHandle, BaseAddress, RegionSize, NewProtect, OldProtect);
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
@@ -1471,6 +1729,67 @@ static NTSTATUS NTAPI Fake_NtCreateThreadEx(
 {
     FAKE_PRINT_ONCE_FOR(HOOK_NtCreateThreadEx);
     if (!g_OrigNtCreateThreadEx) return STATUS_UNSUCCESSFUL;
+
+    /* ================================================================
+     * CE 在升权目标中创建线程 (DbgUiIssueRemoteBreakin 注入断点线程)
+     *
+     * 问题: CE 调 DebugActiveProcess → 内部最后一步 DbgUiIssueRemoteBreakin
+     *       → NtCreateThreadEx(gameHandle, ...) → 内部 ObpRef 解析 handle
+     *       → ACE 剥了句柄权限 + ObpRef trampoline 不稳定 → error 5
+     *
+     * 方案: 不依赖 ObpRef trampoline,
+     *       创建 OBJ_KERNEL_HANDLE + 临时切 PreviousMode=KernelMode
+     *       完全绕过句柄权限检查和 ACE 回调
+     *
+     * KTHREAD.PreviousMode offset:
+     *   Win10 19041-19045 (20H1-22H2): 0x232
+     * ================================================================ */
+    if (IsCallerProtected() && g_ElevatedPidCount > 0 &&
+        ProcessHandle && ProcessHandle != NtCurrentProcess())
+    {
+        PEPROCESS targetProc = NULL;
+        /* 用导出函数解析句柄, 不走 trampoline */
+        NTSTATUS st = ObReferenceObjectByHandle(
+            ProcessHandle, 0, *PsProcessType, KernelMode,
+            (PVOID*)&targetProc, NULL);
+
+        if (NT_SUCCESS(st) && targetProc) {
+            if (IsElevatedPid(PsGetProcessId(targetProc))) {
+                /* 创建 kernel handle — ACE 的 ObCallback 跳过 */
+                HANDLE kHandle = NULL;
+                st = ObOpenObjectByPointer(
+                    targetProc, OBJ_KERNEL_HANDLE, NULL,
+                    PROCESS_ALL_ACCESS, *PsProcessType,
+                    KernelMode, &kHandle);
+                ObDereferenceObject(targetProc);
+
+                if (NT_SUCCESS(st) && kHandle) {
+                    /* 临时切 PreviousMode = KernelMode, 让 kernel handle 可用
+                     * 同时跳过内部所有安全检查 */
+                    PUCHAR kthread = (PUCHAR)PsGetCurrentThread();
+                    CCHAR savedMode = *(CCHAR*)(kthread + 0x232);
+                    *(CCHAR*)(kthread + 0x232) = KernelMode;
+
+                    st = g_OrigNtCreateThreadEx(
+                        ThreadHandle, DesiredAccess, ObjectAttributes,
+                        kHandle, StartRoutine, Argument,
+                        CreateFlags, ZeroBits, StackSize, MaximumStackSize,
+                        AttributeList);
+
+                    /* 恢复 PreviousMode */
+                    *(CCHAR*)(kthread + 0x232) = savedMode;
+                    ZwClose(kHandle);
+
+                    SvmDebugPrint("[Elevate] NtCreateThreadEx: CE thread in elevated PID, status=0x%X\n", st);
+                    return st;
+                }
+                /* ObOpenObjectByPointer 失败, 回退正常路径 */
+            }
+            else {
+                ObDereferenceObject(targetProc);
+            }
+        }
+    }
 
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
@@ -1619,20 +1938,22 @@ static NTSTATUS NTAPI Fake_NtSetInformationThread(
 {
     if (!g_OrigNtSetInformationThread) return STATUS_UNSUCCESSFUL;
 
-    /* 保护进程(CE)自身的调用 → 全部透传 */
+    /* 无保护 或 保护进程(CE)自身调用 → 全部透传 */
     if (g_ProtectedPidCount == 0 || IsCallerProtected())
         return g_OrigNtSetInformationThread(
             ThreadHandle, ThreadInformationClass,
             ThreadInformation, ThreadInformationLength);
 
-    /* ThreadHideFromDebugger = 0x11 — 静默成功, 不执行 */
-    if (ThreadInformationClass == 0x11) {
-        return STATUS_SUCCESS;
-    }
-
-    /* ThreadBreakOnTermination = 0x12 — 静默成功, 不执行 */
-    if (ThreadInformationClass == 0x12) {
-        return STATUS_SUCCESS;
+    /* [FIX] 仅对调试目标进程的线程拦截, 不全局拦截 */
+    if (ThreadInformationClass == 0x11 || ThreadInformationClass == 0x12)
+    {
+        PDEBUG_PROCESS dbgProc = NULL;
+        if (IsDebugTargetProcess(PsGetCurrentProcess(), &dbgProc)) {
+            /* 调试目标进程的线程 → 静默成功, 不执行
+             * 防止反作弊隐藏自己的线程或设置 BreakOnTermination */
+            return STATUS_SUCCESS;
+        }
+        /* 非调试目标(如 ACE 登录器) → 正常执行, 不干扰 */
     }
 
     return g_OrigNtSetInformationThread(
@@ -1752,39 +2073,115 @@ static NTSTATUS NTAPI Fake_ObpRefByHandleWithTag(
 {
     FAKE_PRINT_ONCE_FOR(HOOK_ObReferenceObjectByHandle);
     if (!g_OrigObpRefByHandleWithTag) return STATUS_UNSUCCESSFUL;
-    if (g_ProtectedPidCount == 0)
+
+    if (g_ProtectedPidCount == 0 && g_ElevatedPidCount == 0)
         return g_OrigObpRefByHandleWithTag(
-            Handle, DesiredAccess, ObjectType, AccessMode, Tag, Object, HandleInfo, Flags);
+            Handle, DesiredAccess, ObjectType, AccessMode,
+            Tag, Object, HandleInfo, Flags);
 
     KIRQL oldIrql;
     if (!EnterHookGuard(&oldIrql))
         return g_OrigObpRefByHandleWithTag(
-            Handle, DesiredAccess, ObjectType, AccessMode, Tag, Object, HandleInfo, Flags);
+            Handle, DesiredAccess, ObjectType, AccessMode,
+            Tag, Object, HandleInfo, Flags);
 
+    /*
+     * CE(受保护进程)的所有 ObpRef 调用: 无条件 DesiredAccess=0, KernelMode
+     *
+     * 与参考代码完全一致:
+     *   return ori_ObpReferenceObjectByHandleWithTag(
+     *       Handle, 0, ObjectType, KernelMode, Tag, Object, HandleInformation, WriteSize);
+     *
+     * 原理:
+     *   DesiredAccess=0 → 绕过 (GrantedAccess & Desired) != Desired 检查
+     *   KernelMode      → 绕过 UserMode 安全检查 (SeAccessCheck 等)
+     *   两个必须同时改!
+     *
+     * 对升权目标额外设置 GrantedAccess = ALL_ACCESS,
+     * 让 CE 获取完整句柄权限 (读写内存/挂起线程/调试附加)
+     */
+    if (IsCallerProtected()) {
+        NTSTATUS status = g_OrigObpRefByHandleWithTag(
+            Handle, 0, ObjectType, KernelMode, Tag, Object, HandleInfo, Flags);
+
+        if (NT_SUCCESS(status) && Object && *Object && HandleInfo && g_ElevatedPidCount > 0) {
+            __try {
+                if (ObjectType == *PsProcessType) {
+                    if (IsElevatedPid(PsGetProcessId((PEPROCESS)*Object)))
+                        HandleInfo->GrantedAccess = PROCESS_ALL_ACCESS;
+                }
+                else if (ObjectType == *PsThreadType) {
+                    if (IsElevatedPid(PsGetThreadProcessId((PETHREAD)*Object)))
+                        HandleInfo->GrantedAccess = THREAD_ALL_ACCESS;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
+        LeaveHookGuard(oldIrql);
+        return status;
+    }
+
+    /* [NEW] 被调试程序(ElevatedPid)自身的句柄升权
+     * 等价于 demo: DesiredAccess=0, KernelMode
+     * 绕过 ACE ObRegisterCallbacks 的 GrantedAccess 裁剪 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId())) {
+        NTSTATUS status = g_OrigObpRefByHandleWithTag(
+            Handle, 0, ObjectType, KernelMode, Tag, Object, HandleInfo, Flags);
+        if (NT_SUCCESS(status) && HandleInfo) {
+            __try {
+                if (ObjectType == *PsProcessType)
+                    HandleInfo->GrantedAccess = PROCESS_ALL_ACCESS;
+                else if (ObjectType == *PsThreadType)
+                    HandleInfo->GrantedAccess = THREAD_ALL_ACCESS;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
+        /* [DIAG] 前10次打印日志, 之后静默 (ObpRef 极高频, 不能无限打印) */
+        {
+            static volatile LONG s_ElevHitCount = 0;
+            LONG n = InterlockedIncrement(&s_ElevHitCount);
+            if (n <= 10) {
+                SvmDebugPrint("[DIAG-Hide] ElevatedPid branch HIT! PID=%llu, Handle=0x%llX, status=0x%X (hit#%ld)\n",
+                    (ULONG64)PsGetCurrentProcessId(), (ULONG64)Handle, status, n);
+            }
+        }
+
+        LeaveHookGuard(oldIrql);
+        return status;
+    }
+
+    /* 外部进程访问受保护进程 → 降权 (原有逻辑) */
     NTSTATUS status = g_OrigObpRefByHandleWithTag(
-        Handle, DesiredAccess, ObjectType, AccessMode, Tag, Object, HandleInfo, Flags);
+        Handle, DesiredAccess, ObjectType, AccessMode,
+        Tag, Object, HandleInfo, Flags);
 
-    if (NT_SUCCESS(status) && Object && *Object && !IsCallerProtected()) {
-        if (ObjectType == *PsProcessType &&
-            IsProtectedPid(PsGetProcessId((PEPROCESS)*Object)))
-        {
-            if (HandleInfo)
-                HandleInfo->GrantedAccess &=
-                ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION);
+    if (NT_SUCCESS(status) && Object && *Object) {
+        __try {
+            if (ObjectType == *PsProcessType &&
+                IsProtectedPid(PsGetProcessId((PEPROCESS)*Object)))
+            {
+                if (HandleInfo)
+                    HandleInfo->GrantedAccess &=
+                    ~(PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION);
+            }
+            else if (ObjectType == *PsThreadType &&
+                IsProtectedPid(PsGetThreadProcessId((PETHREAD)*Object)))
+            {
+                if (HandleInfo)
+                    HandleInfo->GrantedAccess &=
+                    ~(THREAD_SUSPEND_RESUME | THREAD_TERMINATE |
+                        THREAD_GET_CONTEXT | THREAD_SET_CONTEXT);
+            }
         }
-        else if (ObjectType == *PsThreadType &&
-            IsProtectedPid(PsGetThreadProcessId((PETHREAD)*Object)))
-        {
-            if (HandleInfo)
-                HandleInfo->GrantedAccess &=
-                ~(THREAD_SUSPEND_RESUME | THREAD_TERMINATE |
-                    THREAD_GET_CONTEXT | THREAD_SET_CONTEXT);
-        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
     LeaveHookGuard(oldIrql);
     return status;
 }
+
 
 /**
  * @brief Hook: MmCopyVirtualMemory - 阻止通过内核内存拷贝读写受保护进程
@@ -1820,6 +2217,14 @@ static NTSTATUS NTAPI Fake_MmCopyVirtualMemory(
             BufferSize, PreviousMode, NumberOfBytesCopied);
 
     if (IsCallerProtected()) {
+        LeaveHookGuard(oldIrql);
+        return g_OrigMmCopyVirtualMemory(
+            FromProcess, FromAddress, ToProcess, ToAddress,
+            BufferSize, PreviousMode, NumberOfBytesCopied);
+    }
+
+    /* [NEW] ElevatedPid 调用者直接放行 — 与 IsCallerProtected 同等权限 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId())) {
         LeaveHookGuard(oldIrql);
         return g_OrigMmCopyVirtualMemory(
             FromProcess, FromAddress, ToProcess, ToAddress,

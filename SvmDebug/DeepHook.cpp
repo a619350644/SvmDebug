@@ -879,32 +879,80 @@ NTSTATUS NTAPI Fake_ObReferenceObjectByHandleWithTag(
         return g_OrigObRefByHandleWithTag(Handle, DesiredAccess, ObjectType,
             AccessMode, Tag, Object, HandleInformation);
 
-    NTSTATUS status = g_OrigObRefByHandleWithTag(Handle, DesiredAccess, ObjectType,
-        AccessMode, Tag, Object, HandleInformation);
-    if (!NT_SUCCESS(status) || !Object || !*Object || g_ProtectedPidCount == 0) {
+    /* CE 调用: 无条件 DesiredAccess=0 + KernelMode (与参考代码一致)
+     * 不检查 ElevatedPidCount — CE 的所有句柄操作都需要绕过 ACE */
+    if (g_ProtectedPidCount > 0 && IsCallerProtected()) {
+        NTSTATUS status = g_OrigObRefByHandleWithTag(
+            Handle, 0, ObjectType, KernelMode, Tag, Object, HandleInformation);
+
+        /* 升权目标额外设置完整 GrantedAccess */
+        if (NT_SUCCESS(status) && Object && *Object && HandleInformation && g_ElevatedPidCount > 0) {
+            __try {
+                if (ObjectType == *PsProcessType) {
+                    if (IsElevatedPid(PsGetProcessId((PEPROCESS)*Object)) && HandleInformation)
+                        HandleInformation->GrantedAccess = PROCESS_ALL_ACCESS;
+                }
+                else if (ObjectType == *PsThreadType) {
+                    if (IsElevatedPid(PsGetThreadProcessId((PETHREAD)*Object)) && HandleInformation)
+                        HandleInformation->GrantedAccess = THREAD_ALL_ACCESS;
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
         DeepLeaveGuard(oldIrql);
         return status;
     }
 
+    /* [NEW] 被调试程序(ElevatedPid)自身的句柄升权
+     * 等价于 demo: DesiredAccess=0, KernelMode
+     * 绕过 ACE ObRegisterCallbacks 的 GrantedAccess 裁剪 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId())) {
+        NTSTATUS status = g_OrigObRefByHandleWithTag(
+            Handle, 0, ObjectType, KernelMode, Tag, Object, HandleInformation);
+        if (NT_SUCCESS(status) && HandleInformation) {
+            __try {
+                if (ObjectType == *PsProcessType)
+                    HandleInformation->GrantedAccess = PROCESS_ALL_ACCESS;
+                else if (ObjectType == *PsThreadType)
+                    HandleInformation->GrantedAccess = THREAD_ALL_ACCESS;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+
+        /* [DIAG] 前10次打印日志 */
+        {
+            static volatile LONG s_DeepElevHitCount = 0;
+            LONG n = InterlockedIncrement(&s_DeepElevHitCount);
+            if (n <= 10) {
+                SvmDebugPrint("[DIAG-Deep] ElevatedPid branch HIT! PID=%llu, Handle=0x%p, status=0x%X (hit#%ld)\n",
+                    (ULONG64)PsGetCurrentProcessId(), Handle, status, n);
+            }
+        }
+
+        DeepLeaveGuard(oldIrql);
+        return status;
+    }
+
+    /* 原有降权 */
+    NTSTATUS status = g_OrigObRefByHandleWithTag(Handle, DesiredAccess, ObjectType,
+        AccessMode, Tag, Object, HandleInformation);
+
+    if (!NT_SUCCESS(status) || !Object || !*Object || g_ProtectedPidCount == 0) {
+        DeepLeaveGuard(oldIrql);
+        return status;
+    }
     if (IsCallerProtected()) { DeepLeaveGuard(oldIrql); return status; }
 
     __try {
         if (ObjectType == *PsProcessType) {
-            PEPROCESS proc = (PEPROCESS)*Object;
-            HANDLE pid = PsGetProcessId(proc);
-            if (IsProtectedPid(pid) && HandleInformation) {
+            if (IsProtectedPid(PsGetProcessId((PEPROCESS)*Object)) && HandleInformation)
                 HandleInformation->GrantedAccess &= PROCESS_QUERY_LIMITED_INFORMATION;
-            }
         }
         else if (ObjectType == *PsThreadType) {
-            PETHREAD thread = (PETHREAD)*Object;
-            PEPROCESS ownerProc = PsGetThreadProcess(thread);
-            if (ownerProc) {
-                HANDLE ownerPid = PsGetProcessId(ownerProc);
-                if (IsProtectedPid(ownerPid) && HandleInformation) {
-                    HandleInformation->GrantedAccess &= THREAD_SUSPEND_RESUME;
-                }
-            }
+            PEPROCESS ownerProc = PsGetThreadProcess((PETHREAD)*Object);
+            if (ownerProc && IsProtectedPid(PsGetProcessId(ownerProc)) && HandleInformation)
+                HandleInformation->GrantedAccess &= THREAD_SUSPEND_RESUME;
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -912,6 +960,7 @@ NTSTATUS NTAPI Fake_ObReferenceObjectByHandleWithTag(
     DeepLeaveGuard(oldIrql);
     return status;
 }
+
 
 LONG_PTR FASTCALL Fake_ObfDereferenceObject(PVOID Object)
 {
@@ -1211,8 +1260,8 @@ PHYSICAL_ADDRESS NTAPI Fake_MmGetPhysicalAddress_Deep(PVOID BaseAddress)
     /* 慢路径: 用户态地址 + 有保护进程
      * 所有操作仅访问非分页数据, 任何 IRQL 安全 */
 
-    /* PsGetCurrentProcess 读取 KPCR->CurrentThread->ApcState.Process,
-     * 全部在非分页内存中, 任何 IRQL 安全 */
+     /* PsGetCurrentProcess 读取 KPCR->CurrentThread->ApcState.Process,
+      * 全部在非分页内存中, 任何 IRQL 安全 */
     PEPROCESS currentProc = PsGetCurrentProcess();
     if (!currentProc)
         return g_OrigMmGetPhysicalAddress(BaseAddress);
@@ -1393,22 +1442,21 @@ NTSTATUS NTAPI Fake_PspInsertProcess(
     DEEP_PRINT_ONCE(HOOK_PspInsertProcess);
     if (!g_OrigPspInsertProcess) return STATUS_NOT_IMPLEMENTED;
 
-    /* 先调用原函数完成进程插入 */
     NTSTATUS status = g_OrigPspInsertProcess(Process, Parent, DesiredAccess, ObjectAttributeFlags);
 
     if (!NT_SUCCESS(status) || g_ProtectedPidCount == 0)
         return status;
 
-    /* 检查父进程是否受保护 → 子进程自动继承保护 */
+    /* [FIX] 不再自动继承保护, 只记录日志
+     * 如需保护子进程, 由 R3 Controller 通过 IOCTL 显式添加 */
     __try {
         if (Parent) {
             PEPROCESS parentProc = (PEPROCESS)Parent;
             HANDLE parentPid = PsGetProcessId(parentProc);
             if (IsProtectedPid(parentPid)) {
                 HANDLE childPid = PsGetProcessId(Process);
-                AddProtectedPid(childPid);
-                SvmDebugPrint("[DeepFake] PspInsertProcess: child PID=%llu auto-protected (parent=%llu)\n",
-                    (ULONG64)childPid, (ULONG64)parentPid);
+                SvmDebugPrint("[DeepFake] PspInsertProcess: protected PID=%llu spawned child PID=%llu (NOT auto-protected)\n",
+                    (ULONG64)parentPid, (ULONG64)childPid);
             }
         }
     }
@@ -1416,6 +1464,7 @@ NTSTATUS NTAPI Fake_PspInsertProcess(
 
     return status;
 }
+
 
 /**
  * @brief Fake_PspGetContextThreadInternal — 底层线程上下文获取拦截
@@ -1501,54 +1550,57 @@ NTSTATUS PrepareDeepHookResources(PULONG OutOkCount)
         { "ObfDereferenceObjectWithTag", ScanForObfDereferenceObjectWithTag,
           (PVOID)Fake_ObfDereferenceObjectWithTag, HOOK_ObfDereferenceObjectWithTag },
 
-          /* 进程/线程 */
-          { "PspInsertThread", ScanForPspInsertThread,
-          (PVOID)Fake_PspInsertThread, HOOK_PspInsertThread },
-          { "PspCallThreadNotifyRoutines", ScanForPspCallThreadNotifyRoutines,
-          (PVOID)Fake_PspCallThreadNotifyRoutines, HOOK_PspCallThreadNotifyRoutines },
-          //{ "PspExitThread", ScanForPspExitThread,
-          //(PVOID)Fake_PspExitThread, HOOK_PspExitThread },
+        /* 进程/线程 */
+        { "PspInsertThread", ScanForPspInsertThread,
+        (PVOID)Fake_PspInsertThread, HOOK_PspInsertThread },
+        { "PspCallThreadNotifyRoutines", ScanForPspCallThreadNotifyRoutines,
+        (PVOID)Fake_PspCallThreadNotifyRoutines, HOOK_PspCallThreadNotifyRoutines },
+        //{ "PspExitThread", ScanForPspExitThread,
+        //(PVOID)Fake_PspExitThread, HOOK_PspExitThread },
 
-          /* 内存管理 */
-          /* [DISABLED] MmProtectVirtualMemory: trampoline stolen bytes 问题 */
-          //{ "MmProtectVirtualMemory(internal)", ScanForMmProtectVirtualMemory,
-          //    (PVOID)Fake_MmProtectVirtualMemory_Deep, HOOK_MmProtectVirtualMemory_Deep },
-          /* [DISABLED] MiObtainReferencedVadEx: BSOD 0xA + 字体异常 */
-          //{ "MiObtainReferencedVadEx", ScanForMiObtainReferencedVadEx,
-          //    (PVOID)Fake_MiObtainReferencedVadEx, HOOK_MiObtainReferencedVadEx },
+        /* 内存管理 */
+        /* [DISABLED] MmProtectVirtualMemory: trampoline stolen bytes 问题 */
+        //{ "MmProtectVirtualMemory(internal)", ScanForMmProtectVirtualMemory,
+        //    (PVOID)Fake_MmProtectVirtualMemory_Deep, HOOK_MmProtectVirtualMemory_Deep },
+        /* [DISABLED] MiObtainReferencedVadEx: BSOD 0xA + 字体异常 */
+        //{ "MiObtainReferencedVadEx", ScanForMiObtainReferencedVadEx,
+        //    (PVOID)Fake_MiObtainReferencedVadEx, HOOK_MiObtainReferencedVadEx },
 
-              /* 异常/调度 */
-              { "KiDispatchException", ScanForKiDispatchException,
-              (PVOID)Fake_KiDispatchException, HOOK_KiDispatchException },
-              { "KiStackAttachProcess", ScanForKiStackAttachProcess,
-              (PVOID)Fake_KiStackAttachProcess, HOOK_KiStackAttachProcess },
+        /* 异常/调度 */
+        /* [DISABLED] KiDispatchException: trampoline RIP-rel 重定位导致 BSOD 0x1E
+        * chrome.exe 触发正常异常 → trampoline 跳到用户态 0x7fff → SMEP → 蓝屏
+        * 此 Hook 仅日志记录 #DB 异常, CE 调试功能不需要 */
+        //{ "KiDispatchException", ScanForKiDispatchException,
+        //(PVOID)Fake_KiDispatchException, HOOK_KiDispatchException },
+        { "KiStackAttachProcess", ScanForKiStackAttachProcess,
+        (PVOID)Fake_KiStackAttachProcess, HOOK_KiStackAttachProcess },
 
-              /* ---- Phase 2: 新增深度 Hook ---- */
+               /* ---- Phase 2: 新增深度 Hook ---- */
 
-      /* APC 注入防御 */
-      { "KiInsertQueueApc", ScanForKiInsertQueueApc,
-          (PVOID)Fake_KiInsertQueueApc, HOOK_KiInsertQueueApc },
+       /* APC 注入防御 */
+       { "KiInsertQueueApc", ScanForKiInsertQueueApc,
+           (PVOID)Fake_KiInsertQueueApc, HOOK_KiInsertQueueApc },
 
-          /* 物理内存防御 */
-          { "MmGetPhysicalAddress", ScanForMmGetPhysicalAddress,
-          (PVOID)Fake_MmGetPhysicalAddress_Deep, HOOK_MmGetPhysicalAddress_Deep },
-          { "MmMapIoSpace", ScanForMmMapIoSpace,
-          (PVOID)Fake_MmMapIoSpace_Deep, HOOK_MmMapIoSpace_Deep },
-          /* [DISABLED] MmMapLockedPagesSpecifyCache: BSOD in MmProbeAndLockPages */
-          //{ "MmMapLockedPagesSpecifyCache", ScanForMmMapLockedPagesSpecifyCache,
-          //(PVOID)Fake_MmMapLockedPages_Deep, HOOK_MmMapLockedPages_Deep },
+        /* 物理内存防御 */
+        { "MmGetPhysicalAddress", ScanForMmGetPhysicalAddress,
+        (PVOID)Fake_MmGetPhysicalAddress_Deep, HOOK_MmGetPhysicalAddress_Deep },
+        { "MmMapIoSpace", ScanForMmMapIoSpace,
+        (PVOID)Fake_MmMapIoSpace_Deep, HOOK_MmMapIoSpace_Deep },
+        /* [DISABLED] MmMapLockedPagesSpecifyCache: BSOD in MmProbeAndLockPages */
+        //{ "MmMapLockedPagesSpecifyCache", ScanForMmMapLockedPagesSpecifyCache,
+        //(PVOID)Fake_MmMapLockedPages_Deep, HOOK_MmMapLockedPages_Deep },
 
-          /* 句柄表隐藏 */
-          { "ExpLookupHandleTableEntry", ScanForExpLookupHandleTableEntry,
-              (PVOID)Fake_ExpLookupHandleTableEntry, HOOK_ExpLookupHandleTableEntry },
+        /* 句柄表隐藏 */
+        { "ExpLookupHandleTableEntry", ScanForExpLookupHandleTableEntry,
+            (PVOID)Fake_ExpLookupHandleTableEntry, HOOK_ExpLookupHandleTableEntry },
 
-              /* 进程生命周期 */
-              { "PspInsertProcess", ScanForPspInsertProcess,
-              (PVOID)Fake_PspInsertProcess, HOOK_PspInsertProcess },
+        /* 进程生命周期 */
+        { "PspInsertProcess", ScanForPspInsertProcess,
+        (PVOID)Fake_PspInsertProcess, HOOK_PspInsertProcess },
 
-              /* 硬件断点隐藏 */
-              //{ "PspGetContextThreadInternal", ScanForPspGetContextThreadInternal,
-              //    (PVOID)Fake_PspGetContextThreadInternal, HOOK_PspGetContextThreadInternal },
+        /* 硬件断点隐藏 */
+        //{ "PspGetContextThreadInternal", ScanForPspGetContextThreadInternal,
+        //    (PVOID)Fake_PspGetContextThreadInternal, HOOK_PspGetContextThreadInternal },
     };
 
     ULONG total = ARRAYSIZE(deepHooks);

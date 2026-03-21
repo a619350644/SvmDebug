@@ -21,6 +21,7 @@
 #include "Common.h"
 #include "DebugApi.h"
 #include "DeepHook.h"
+#include "SvmLog.h"
 
 /* ========================================================================
  *  设备名 / 符号链接 / IOCTL 定义
@@ -37,6 +38,8 @@
 #define IOCTL_SVM_DISABLE_CALLBACKS     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x824, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SVM_RESTORE_CALLBACKS     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x825, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SVM_PROTECT_EX            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x826, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_ELEVATE_PID    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x828, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_UNELEVATE_PID  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x829, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* ========================================================================
  *  全局变量
@@ -238,7 +241,27 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             (SIZE_T)req->Size);
         break;
     }
+    case IOCTL_SVM_ELEVATE_PID:
+    {
+        if (inLen < sizeof(PROTECT_INFO) || !buffer) {
+            status = STATUS_INVALID_PARAMETER; break;
+        }
+        PPROTECT_INFO pi = (PPROTECT_INFO)buffer;
+        AddElevatedPid((HANDLE)pi->Pid);
+        SvmDebugPrint("[IOCTL] ELEVATE_PID: %llu\n", pi->Pid);
+        break;
+    }
 
+    case IOCTL_SVM_UNELEVATE_PID:
+    {
+        if (inLen < sizeof(PROTECT_INFO) || !buffer) {
+            status = STATUS_INVALID_PARAMETER; break;
+        }
+        PPROTECT_INFO pi = (PPROTECT_INFO)buffer;
+        RemoveElevatedPid((HANDLE)pi->Pid);
+        SvmDebugPrint("[IOCTL] UNELEVATE_PID: %llu\n", pi->Pid);
+        break;
+    }
     case IOCTL_HV_WRITE_MEMORY:
     {
         if (inLen < sizeof(HV_MEMORY_REQUEST) || !buffer) {
@@ -251,6 +274,16 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             (PVOID)req->Address,
             (PVOID)req->BufferAddress,
             (SIZE_T)req->Size);
+        break;
+    }
+
+    /* ---- 读取日志环形缓冲区 (R3 轮询) ---- */
+    case IOCTL_SVM_READ_LOG:
+    {
+        ULONG outLen = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+        ULONG bytesWritten = 0;
+        status = SvmLogRead(buffer, outLen, &bytesWritten);
+        info = bytesWritten;
         break;
     }
 
@@ -386,6 +419,7 @@ VOID CommunicationThread(PVOID Context)
     }
 
     SvmDebugPrint("[INFO] Cleanup complete. System is back to normal.\n");
+    SvmLogFree();
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -797,6 +831,9 @@ EXTERN_C NTSTATUS DriverEntry(
     _In_ PUNICODE_STRING RegistryPath)
 {
     UNREFERENCED_PARAMETER(RegistryPath);
+
+    /* 初始化日志环形缓冲区 (必须最先, SvmDebugPrint 依赖它) */
+    SvmLogInit();
 
     SvmDebugPrint("[DrvMain] DriverEntry (standard loading).\n");
 

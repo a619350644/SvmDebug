@@ -510,30 +510,54 @@ VOID DbgkpOpenHandles(
     IN PETHREAD Thread)
 {
     NTSTATUS Status;
-    HANDLE Handle;
+    HANDLE Handle, KernelHandle;
+
+    /* [FIX] ACE 的 ObRegisterCallbacks 在用户态句柄创建时降权。
+     * 解决方案: 先创建 OBJ_KERNEL_HANDLE (ACE 回调跳过),
+     * 再 ZwDuplicateObject 转为用户态句柄给 CE 使用。 */
 
     switch (WaitStateChange->NewState)
     {
     case DbgCreateThreadStateChange:
-        Status = ObOpenObjectByPointer(Thread, 0, NULL, THREAD_ALL_ACCESS,
-            *PsThreadType, KernelMode, &Handle);
-        if (NT_SUCCESS(Status)) {
-            WaitStateChange->StateInfo.CreateThread.HandleToThread = Handle;
+        KernelHandle = NULL;
+        Status = ObOpenObjectByPointer(Thread, OBJ_KERNEL_HANDLE, NULL, THREAD_ALL_ACCESS,
+            *PsThreadType, KernelMode, &KernelHandle);
+        if (NT_SUCCESS(Status) && KernelHandle) {
+            Handle = NULL;
+            Status = ZwDuplicateObject(NtCurrentProcess(), KernelHandle,
+                NtCurrentProcess(), &Handle, THREAD_ALL_ACCESS, 0, 0);
+            ZwClose(KernelHandle);
+            if (NT_SUCCESS(Status))
+                WaitStateChange->StateInfo.CreateThread.HandleToThread = Handle;
         }
         return;
 
     case DbgCreateProcessStateChange:
-        Status = ObOpenObjectByPointer(Thread, 0, NULL, THREAD_ALL_ACCESS,
-            *PsThreadType, KernelMode, &Handle);
-        if (NT_SUCCESS(Status)) {
-            WaitStateChange->StateInfo.CreateProcessInfo.HandleToThread = Handle;
+        /* Thread handle */
+        KernelHandle = NULL;
+        Status = ObOpenObjectByPointer(Thread, OBJ_KERNEL_HANDLE, NULL, THREAD_ALL_ACCESS,
+            *PsThreadType, KernelMode, &KernelHandle);
+        if (NT_SUCCESS(Status) && KernelHandle) {
+            Handle = NULL;
+            Status = ZwDuplicateObject(NtCurrentProcess(), KernelHandle,
+                NtCurrentProcess(), &Handle, THREAD_ALL_ACCESS, 0, 0);
+            ZwClose(KernelHandle);
+            if (NT_SUCCESS(Status))
+                WaitStateChange->StateInfo.CreateProcessInfo.HandleToThread = Handle;
         }
-        Status = ObOpenObjectByPointer(Process, 0, NULL, PROCESS_ALL_ACCESS,
-            *PsProcessType, KernelMode, &Handle);
-        if (NT_SUCCESS(Status)) {
-            WaitStateChange->StateInfo.CreateProcessInfo.HandleToProcess = Handle;
+        /* Process handle */
+        KernelHandle = NULL;
+        Status = ObOpenObjectByPointer(Process, OBJ_KERNEL_HANDLE, NULL, PROCESS_ALL_ACCESS,
+            *PsProcessType, KernelMode, &KernelHandle);
+        if (NT_SUCCESS(Status) && KernelHandle) {
+            Handle = NULL;
+            Status = ZwDuplicateObject(NtCurrentProcess(), KernelHandle,
+                NtCurrentProcess(), &Handle, PROCESS_ALL_ACCESS, 0, 0);
+            ZwClose(KernelHandle);
+            if (NT_SUCCESS(Status))
+                WaitStateChange->StateInfo.CreateProcessInfo.HandleToProcess = Handle;
         }
-        /* 复制文件句柄 */
+        /* File handle */
         {
             PHANDLE DupHandle = &WaitStateChange->StateInfo.CreateProcessInfo.NewProcess.FileHandle;
             Handle = *DupHandle;
@@ -852,6 +876,29 @@ NTSTATUS NTAPI Fake_NtDebugActiveProcess(
         return STATUS_ACCESS_DENIED;
     }
 
+    /* [FIX] CE 使用 "Windows Debugger" 模式时, DebugHandle 是真正的系统
+     * DebugObject 句柄 (由 DbgUiConnectToDbg → NtCreateDebugObject 创建),
+     * 不是我们的自定义句柄。
+     *
+     * 此时必须透传给原始 NtDebugActiveProcess, 让系统真正设置
+     * EPROCESS.DebugPort, 否则后续 NtWaitForDebugEvent 找不到调试端口。
+     *
+     * 我们的 Fake_ObReferenceObjectByHandleWithTag 已经在句柄引用时
+     * 为升权目标设置了 PROCESS_ALL_ACCESS, 所以原生路径不会被 ACE 拦截。
+     */
+    if (bIsDbg && !bIsCustomHandle) {
+        SvmDebugPrint("[DebugApi] NtDebugActiveProcess: Windows Debugger mode, "
+            "passing through to original (PH=%p DH=%p PID=%lld)\n",
+            ProcessHandle, DebugHandle, (ULONG64)PsGetCurrentProcessId());
+
+        if (g_OrigNtDebugActiveProcess) {
+            Status = g_OrigNtDebugActiveProcess(ProcessHandle, DebugHandle);
+            SvmDebugPrint("[DebugApi] NtDebugActiveProcess passthrough Status=0x%X\n", Status);
+            return Status;
+        }
+        return STATUS_ACCESS_DENIED;
+    }
+
     if (bIsCustomHandle && !bIsDbg) {
         /* 自定义句柄但调用者不是注册的调试器 → 拒绝访问
          * 防止非授权进程利用伪造句柄 */
@@ -860,8 +907,17 @@ NTSTATUS NTAPI Fake_NtDebugActiveProcess(
         return STATUS_ACCESS_DENIED;
     }
 
-    Status = ObReferenceObjectByHandle(ProcessHandle, PROCESS_SET_PORT,
-        *PsProcessType, KeGetPreviousMode(), (PVOID*)&TargetProcess, NULL);
+    /* [FIX] CE 的句柄被 ACE 的 ObRegisterCallbacks 剥权了,
+     * PROCESS_SET_PORT + UserMode → ACCESS_DENIED。
+     * CE 是注册的调试器时, 用 DesiredAccess=0 + KernelMode 绕过 */
+    if (bIsDbg) {
+        Status = ObReferenceObjectByHandle(ProcessHandle, 0,
+            *PsProcessType, KernelMode, (PVOID*)&TargetProcess, NULL);
+    }
+    else {
+        Status = ObReferenceObjectByHandle(ProcessHandle, PROCESS_SET_PORT,
+            *PsProcessType, KeGetPreviousMode(), (PVOID*)&TargetProcess, NULL);
+    }
     if (!NT_SUCCESS(Status)) {
         SvmDebugPrint("[DebugApi] NtDebugActiveProcess: ObRefByHandle failed 0x%X\n", Status);
         return Status;
@@ -936,6 +992,15 @@ NTSTATUS NTAPI Fake_NtWaitForDebugEvent(
 
     BOOLEAN bIsCustomHandle = DBG_IS_VALID_HANDLE(DebugHandle);
     if (!IsDebugger(PsGetCurrentProcess()) && !bIsCustomHandle) {
+        if (g_OrigNtWaitForDebugEvent)
+            return g_OrigNtWaitForDebugEvent(DebugHandle, Alertable, Timeout, StateChange);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    /* [FIX] CE "Windows Debugger" 模式: DebugHandle 是系统真正的
+     * DebugObject 句柄, 不是自定义句柄。必须透传给原始函数,
+     * 让系统从真正的 EPROCESS.DebugPort 读取调试事件。 */
+    if (IsDebugger(PsGetCurrentProcess()) && !bIsCustomHandle) {
         if (g_OrigNtWaitForDebugEvent)
             return g_OrigNtWaitForDebugEvent(DebugHandle, Alertable, Timeout, StateChange);
         return STATUS_ACCESS_DENIED;
@@ -1080,6 +1145,13 @@ NTSTATUS NTAPI Fake_NtDebugContinue(
         return STATUS_ACCESS_DENIED;
     }
 
+    /* [FIX] Windows Debugger 模式: 系统句柄, 透传 */
+    if (IsDebugger(PsGetCurrentProcess()) && !bIsCustomHandle) {
+        if (g_OrigNtDebugContinue)
+            return g_OrigNtDebugContinue(DebugObjectHandle, ClientId, ContinueStatus);
+        return STATUS_ACCESS_DENIED;
+    }
+
     __try {
         if (PreviousMode != KernelMode)
             ProbeForReadSmallStructure(ClientId, sizeof(*ClientId), sizeof(UCHAR));
@@ -1163,9 +1235,23 @@ NTSTATUS NTAPI Fake_NtRemoveProcessDebug(
         return STATUS_ACCESS_DENIED;
     }
 
+    /* [FIX] Windows Debugger 模式: 系统句柄, 透传 */
+    if (IsDebugger(PsGetCurrentProcess()) && !bIsCustomHandle) {
+        if (g_OrigNtRemoveProcessDebug)
+            return g_OrigNtRemoveProcessDebug(ProcessHandle, DebugObjectHandle);
+        return STATUS_ACCESS_DENIED;
+    }
 
-    Status = ObReferenceObjectByHandle(ProcessHandle, PROCESS_SET_PORT,
-        *PsProcessType, KeGetPreviousMode(), (PVOID*)&Process, NULL);
+
+    /* [FIX] CE 的句柄被 ACE 剥权, 用 0+KernelMode 绕过 */
+    if (IsDebugger(PsGetCurrentProcess())) {
+        Status = ObReferenceObjectByHandle(ProcessHandle, 0,
+            *PsProcessType, KernelMode, (PVOID*)&Process, NULL);
+    }
+    else {
+        Status = ObReferenceObjectByHandle(ProcessHandle, PROCESS_SET_PORT,
+            *PsProcessType, KeGetPreviousMode(), (PVOID*)&Process, NULL);
+    }
     if (!NT_SUCCESS(Status)) return Status;
 
     Status = STATUS_SUCCESS; DebugObject = DbgLookupHandle(DebugObjectHandle);
