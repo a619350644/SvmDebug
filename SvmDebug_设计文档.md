@@ -40,17 +40,17 @@
 
 ### 1.1 项目定位
 
-Hyper-Vanguard 是一个基于 **AMD SVM (Secure Virtual Machine)** 硬件虚拟化技术的内核级进程保护与透明调试框架。系统在操作系统下方建立一个 Type-1 Hypervisor，利用 **嵌套页表 (NPT)** 实现硬件级无痕函数 Hook，对运行在 Guest 中的反作弊引擎 (ACE) 完全透明。
+Hyper-Vanguard 是一个基于 **AMD SVM (Secure Virtual Machine)** 硬件虚拟化技术的内核级进程保护与透明调试框架。系统在操作系统下方建立一个 Type-1 Hypervisor，利用 **嵌套页表 (NPT)** 实现硬件级无痕函数 Hook，对运行在 Guest 中的反作弊系统 完全透明。
 
 ### 1.2 核心能力矩阵
 
-| 能力维度 | 实现技术 | 对 ACE 的效果 |
+| 能力维度 | 实现技术 | 对反作弊系统的效果 |
 |---------|---------|--------------|
-| **进程隐藏** | NPT Hook 30+ Nt/Ps/Ob 系统调用 + Win32k SSSDT | ACE 枚举进程列表/句柄列表时看不到保护进程 |
-| **句柄权限控制** | Hook ObReferenceObjectByHandleWithTag 裁剪 GrantedAccess | ACE 获得的句柄被降权，同时可升权指定PID绕过 |
-| **透明调试** | 自定义 DEBUG_OBJECT + 影子 DebugPort + NPT隐形断点 | ACE 读取 EPROCESS.DebugPort 永远为 NULL |
-| **隐形内存操作** | CPUID 超级调用 → VMM 物理页表遍历 → PA 直接拷贝 | 不触发任何内核 API，ACE 的回调完全无感知 |
-| **进程伪装** | DKOM 修改 PEB/LDR/ImageFileName → explorer.exe | ACE 查询进程身份信息时返回系统进程特征 |
+| **进程隐藏** | NPT Hook 30+ Nt/Ps/Ob 系统调用 + Win32k SSSDT | 反作弊系统枚举进程列表/句柄列表时看不到保护进程 |
+| **句柄权限控制** | Hook ObReferenceObjectByHandleWithTag 裁剪 GrantedAccess | 反作弊系统获得的句柄被降权，同时可升权指定PID绕过 |
+| **透明调试** | 自定义 DEBUG_OBJECT + 影子 DebugPort + NPT隐形断点 | 反作弊系统读取 EPROCESS.DebugPort 永远为 NULL |
+| **隐形内存操作** | CPUID 超级调用 → VMM 物理页表遍历 → PA 直接拷贝 | 不触发任何内核 API，反作弊系统的回调完全无感知 |
+| **进程伪装** | DKOM 修改 PEB/LDR/ImageFileName → explorer.exe | 反作弊系统查询进程身份信息时返回系统进程特征 |
 | **深度内核防御** | 特征码扫描 + NPT Hook 18个未导出内核函数 | 封堵 APC 注入、物理内存扫描、CID 表查询 |
 
 ### 1.3 技术要求
@@ -156,7 +156,7 @@ sequenceDiagram
     VMM-->>R0: VMRUN 返回 (Status=0)
     R0-->>R3: 拷贝数据到用户缓冲区
 
-    Note over R3,VMM: ACE 在 R0 层完全无法感知 VMM 操作
+    Note over R3,VMM: 反作弊系统在 R0 层完全无法感知 VMM 操作
 ```
 
 ---
@@ -171,7 +171,7 @@ graph TB
     
     subgraph Ring0["Ring 0 — Guest Kernel"]
         SvmDebug["SvmDebug.sys<br/>NPT Hook 框架"]
-        ACE["ACE.sys<br/>反作弊内核驱动"]
+        AntiCheat["反作弊驱动<br/>反作弊内核驱动"]
         ntoskrnl["ntoskrnl.exe<br/>Windows 内核"]
         win32k["win32k.sys<br/>窗口子系统"]
     end
@@ -180,7 +180,7 @@ graph TB
         QtApp["Qt GUI / Controller"]
         CEApp["CE yeshen.vmp.exe"]
         Game["游戏进程"]
-        ACE_R3["ACE 用户态组件"]
+        AntiCheat_R3["反作弊用户态组件"]
     end
 
     Ring_Neg1 -.->|"完全控制"| Ring0
@@ -191,7 +191,7 @@ graph TB
     style Ring3 fill:#e8f5e9,stroke:#2e7d32,stroke-width:2px
 ```
 
-**核心优势**: VMM 运行在所有内核驱动之下 (Ring -1)，ACE 的内核驱动无法检测或干扰 VMM 的操作。NPT 页表由 VMM 独占管理，Guest 操作系统对页表替换完全无感知。ACE 在 Ring 0 所能使用的所有检测手段 (读取内存、枚举句柄、查询进程信息) 都已被 NPT Hook 拦截和伪造。
+**核心优势**: VMM 运行在所有内核驱动之下 (Ring -1)，反作弊系统的内核驱动无法检测或干扰 VMM 的操作。NPT 页表由 VMM 独占管理，Guest 操作系统对页表替换完全无感知。反作弊系统在 Ring 0 所能使用的所有检测手段 (读取内存、枚举句柄、查询进程信息) 都已被 NPT Hook 拦截和伪造。
 
 ---
 
@@ -339,7 +339,7 @@ class HvClient {
     bool SetProtectedProcess(DWORD pid, const wchar_t* processName);
     // → IOCTL 0x800, 发送 PROTECT_INFO 结构体
 
-    // 内存读写 (通过 Hypervisor, ACE 不可见)
+    // 内存读写 (通过 Hypervisor, 反作弊系统不可见)
     bool ReadMemory(DWORD targetPid, ULONG64 address, void* buffer, size_t size);
     // → IOCTL 0x810 (IOCTL_HV_READ_MEMORY)
     // → 输入: HV_MEMORY_REQUEST | 输出: 读取的原始数据
@@ -408,7 +408,7 @@ graph LR
 | `0x00220824` | `IOCTL_SVM_DISABLE_CALLBACKS` | Hide | 无 | 禁用进程创建通知回调 |
 | `0x00220825` | `IOCTL_SVM_RESTORE_CALLBACKS` | Hide | 无 | 恢复进程创建通知回调 |
 | `0x00220826` | `IOCTL_SVM_PROTECT_EX` | Hide | `PROTECT_INFO_EX` | 扩展保护 (PID+HWND+子窗口) |
-| `0x00220828` | `IOCTL_SVM_ELEVATE_PID` | Hide | `PROTECT_INFO` | 句柄升权 (绕过 ACE 降权) |
+| `0x00220828` | `IOCTL_SVM_ELEVATE_PID` | Hide | `PROTECT_INFO` | 句柄升权 (绕过 反作弊系统降权) |
 | `0x00220829` | `IOCTL_SVM_UNELEVATE_PID` | Hide | `PROTECT_INFO` | 取消句柄升权 |
 | `0x00220830` | `IOCTL_DBG_REGISTER_DEBUGGER` | DebugApi | `DBG_REGISTER_REQUEST` | 注册调试器进程 |
 | `0x00220831` | `IOCTL_DBG_ATTACH_PROCESS` | DebugApi | `DBG_ATTACH_REQUEST` | 附加到目标进程调试 |
@@ -568,10 +568,10 @@ graph TB
         OrigFunc["nt!NtOpenProcess<br/>(原始函数继续执行)"]
     end
 
-    subgraph 读取路径["ACE 扫描路径 (Read/Write)"]
-        ACE["ACE.sys 读取内存<br/>MmCopyVirtualMemory"]
+    subgraph 读取路径["反作弊系统扫描路径 (Read/Write)"]
+        AntiCheat["反作弊驱动读取内存<br/>MmCopyVirtualMemory"]
         OP["OriginalPage<br/>(未修改的原始字节)"]
-        Result["ACE 看到原始代码<br/>→ 未检测到 Hook"]
+        Result["反作弊系统看到原始代码<br/>→ 未检测到 Hook"]
     end
 
     subgraph NPT_Core["NPT PTE 权限引擎"]
@@ -587,7 +587,7 @@ graph TB
     Decision -->|"NO: 放行"| Trampoline
     Trampoline --> OrigFunc
 
-    ACE --> PTE
+    AntiCheat --> PTE
     PTE -->|"Read/Write"| OP
     OP --> Result
 
@@ -599,7 +599,7 @@ graph TB
     style NPF fill:#fce4ec,stroke:#c62828
 ```
 
-**核心原理**: 当 CPU 执行指令时 NPT PTE 指向 FakePage (含 JMP 跳转)。当 ACE 驱动读取同一地址的内存内容时，#NPF 异常触发 VMEXIT，VMM 将 PFN 切换到 OriginalPage (未修改的原始代码)。两个视图通过 NPT 权限位自动切换。
+**核心原理**: 当 CPU 执行指令时 NPT PTE 指向 FakePage (含 JMP 跳转)。当 反作弊驱动读取同一地址的内存内容时，#NPF 异常触发 VMEXIT，VMM 将 PFN 切换到 OriginalPage (未修改的原始代码)。两个视图通过 NPT 权限位自动切换。
 
 ### 9.2 NPT_HOOK_CONTEXT 结构体 (Hook.h) — 完整字段注解
 
@@ -619,7 +619,7 @@ NPT_HOOK_CONTEXT — 每个被 Hook 的函数对应一个实例，存储在 g_Ho
 ╠═══════════════════════╪══════════╪══════════════════════════════════════════════════════════╣
 ║ OriginalPageBase      │ PVOID    │ 目标函数所在 4KB 原始物理页的虚拟映射基地址 (页对齐)     ║
 ║ OriginalPagePa        │ ULONG64  │ 原始物理页的物理地址 (4KB 对齐)                          ║
-║                       │          │ → ACE 读取时 NPT PTE 指向此页                           ║
+║                       │          │ → 反作弊系统读取时 NPT PTE 指向此页                           ║
 ╠═══════════════════════╪══════════╪══════════════════════════════════════════════════════════╣
 ║ FakePage              │ PVOID    │ 伪造页的虚拟地址 — 复制原页内容后在目标偏移处写入 JMP     ║
 ║ FakePagePa            │ ULONG64  │ 伪造页的物理地址 — CPU 执行时 NPT PTE 指向此页           ║
@@ -736,25 +736,25 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant ACE as ACE.sys
+    participant AntiCheat as 反作弊驱动
     participant Hook as Fake_ObRefByHandleWithTag
     participant Orig as 原始 ObRefByHandleWithTag
 
-    ACE->>Hook: OpenProcess(PROCESS_ALL_ACCESS, GamePid)
+    AntiCheat->>Hook: OpenProcess(PROCESS_ALL_ACCESS, GamePid)
     Hook->>Hook: 获取目标 EPROCESS → PID
     Hook->>Hook: IsProtectedPid(PID)?
     
     alt 目标是保护进程 且 调用者不在保护列表
         Hook->>Hook: 裁剪权限:<br/>移除 VM_READ, VM_WRITE,<br/>VM_OPERATION, TERMINATE
         Hook->>Orig: 调用原函数(降权后的 DesiredAccess)
-        Orig-->>ACE: 返回降权句柄
+        Orig-->>AntiCheat: 返回降权句柄
     else 调用者在 ElevatedPIDs 列表
         Hook->>Hook: IsElevatedPid(CallerPid) = TRUE
         Hook->>Orig: 调用原函数(保持 FULL_ACCESS)
-        Orig-->>ACE: 返回完整权限句柄
+        Orig-->>AntiCheat: 返回完整权限句柄
     else 目标不是保护进程
         Hook->>Orig: 透传调用
-        Orig-->>ACE: 正常返回
+        Orig-->>AntiCheat: 正常返回
     end
 ```
 
@@ -805,13 +805,13 @@ graph TD
 
 | # | 目标函数 | 攻击场景 | 防御效果 |
 |---|---------|---------|---------|
-| 12 | `KiInsertQueueApc` | ACE 通过 APC 注入代码到保护进程线程 | 拦截目标为保护线程的 APC 插入 |
-| 13 | `MmGetPhysicalAddress` | ACE 获取保护进程物理页地址后直接物理读取 | 对保护进程地址返回伪造 PA |
-| 14 | `MmMapIoSpace` | ACE 通过 MmMapIoSpace 映射保护进程物理内存 | 拦截映射保护进程物理地址范围的请求 |
-| 15 | `MmMapLockedPagesSpecifyCache` | ACE 通过 MDL 锁定+映射读取保护内存 | 拦截 MDL 指向保护进程内存的映射 |
-| 16 | `ExpLookupHandleTableEntry` | ACE 遍历 PspCidTable 发现保护进程 | 从 CID 表查询结果中隐藏保护对象 |
+| 12 | `KiInsertQueueApc` | 反作弊系统通过 APC 注入代码到保护进程线程 | 拦截目标为保护线程的 APC 插入 |
+| 13 | `MmGetPhysicalAddress` | 反作弊系统获取保护进程物理页地址后直接物理读取 | 对保护进程地址返回伪造 PA |
+| 14 | `MmMapIoSpace` | 反作弊系统通过 MmMapIoSpace 映射保护进程物理内存 | 拦截映射保护进程物理地址范围的请求 |
+| 15 | `MmMapLockedPagesSpecifyCache` | 反作弊系统通过 MDL 锁定+映射读取保护内存 | 拦截 MDL 指向保护进程内存的映射 |
+| 16 | `ExpLookupHandleTableEntry` | 反作弊系统遍历 PspCidTable 发现保护进程 | 从 CID 表查询结果中隐藏保护对象 |
 | 17 | `PspInsertProcess` | 在进程暴露给系统前拦截 | 掌控进程生命周期源头 |
-| 18 | `PspGetContextThreadInternal` | ACE 绕过 NtGetContextThread 直接调用底层函数读取 DR0-DR7 | 底层清除硬件断点寄存器 |
+| 18 | `PspGetContextThreadInternal` | 反作弊系统绕过 NtGetContextThread 直接调用底层函数读取 DR0-DR7 | 底层清除硬件断点寄存器 |
 
 ### 11.3 特征码扫描引擎
 
@@ -837,16 +837,16 @@ graph TD
 
 ```mermaid
 graph LR
-    subgraph Standard["标准调试路径 (ACE 可检测)"]
+    subgraph Standard["标准调试路径 (反作弊系统可检测)"]
         S1["CE: NtCreateDebugObject"] --> S2["系统: 创建 DebugObject"]
         S2 --> S3["NtDebugActiveProcess"] --> S4["写入 EPROCESS.DebugPort"]
-        S4 --> S5["ACE: 读取 DebugPort ≠ NULL<br/>⚠️ 检测到调试器!"]
+        S4 --> S5["反作弊系统: 读取 DebugPort ≠ NULL<br/>⚠️ 检测到调试器!"]
     end
 
-    subgraph Shadow["影子调试路径 (ACE 不可见)"]
+    subgraph Shadow["影子调试路径 (反作弊系统不可见)"]
         H1["CE: NtCreateDebugObject<br/>(被 NPT Hook 拦截)"] --> H2["Fake: 创建 Hvm_DebugObject<br/>(自定义对象, 池化句柄表)"]
         H2 --> H3["Fake: NtDebugActiveProcess<br/>写入 g_DebugProcessList"] --> H4["不触碰 EPROCESS.DebugPort"]
-        H4 --> H5["ACE: 读取 DebugPort = NULL<br/>✅ 未发现调试器"]
+        H4 --> H5["反作弊系统: 读取 DebugPort = NULL<br/>✅ 未发现调试器"]
     end
 
     style Standard fill:#ffebee,stroke:#c62828
@@ -922,9 +922,9 @@ NPT_BREAKPOINT (最多 MAX_NPT_BREAKPOINTS=64 个)
 ╚═══════════════════════╧══════════════╧══════════════════════════════════════════════════════╝
 
 Execute/Read 分离断点原理:
-  Original Page (R/W) → ACE 扫描时看到原始指令 (无 0xCC)
+  Original Page (R/W) → 反作弊系统扫描时看到原始指令 (无 0xCC)
   Fake Page (X)       → CPU 执行时命中 0xCC → #BP 异常在 VMCB 层拦截
-                         不进入 Guest IDT → ACE 的 VEH/SEH 完全无感知
+                         不进入 Guest IDT → 反作弊系统的 VEH/SEH 完全无感知
 ```
 
 ### 12.4 被替换的调试 API (13个)
@@ -1054,7 +1054,7 @@ graph TD
     Step4 -->|"是"| Step5["④ PEB32.ProcessParameters<br/>同样替换 32位 PEB 的路径和命令行"]
     Step4 -->|"否"| Step6
     Step5 --> Step6["⑤ PEB_LDR_DATA.InLoadOrderModuleList<br/>64位: 第一个模块 → explorer.exe<br/>32位: 同上 (WOW64)"]
-    Step6 --> Done["伪装完成<br/>ACE 查询进程身份返回 explorer.exe"]
+    Step6 --> Done["伪装完成<br/>反作弊系统查询进程身份返回 explorer.exe"]
 
     style Input fill:#e3f2fd,stroke:#1565c0
     style Done fill:#e8f5e9,stroke:#2e7d32
@@ -1080,16 +1080,16 @@ graph TD
 
 ```mermaid
 graph LR
-    subgraph Original["原始方案 (ACE 可检测)"]
+    subgraph Original["原始方案 (反作弊系统可检测)"]
         O1["KeAttachProcess(Target)"] --> O2["RtlCopyMemory"] --> O3["KeDetachProcess"]
-        O2 -.->|"触发"| ACE1["ObRegisterCallbacks<br/>ACE 检测到!"]
+        O2 -.->|"触发"| AntiCheat1["ObRegisterCallbacks<br/>反作弊系统检测到!"]
     end
 
-    subgraph Bridge["Hypervisor 桥接方案 (ACE 不可见)"]
+    subgraph Bridge["Hypervisor 桥接方案 (反作弊系统不可见)"]
         B1["HvBridge_ReadProcessMemory"] --> B2["填充共享上下文<br/>TargetCr3 + VA + PA"]
         B2 --> B3["CPUID 0x41414150<br/>(超级调用)"]
         B3 --> B4["VMM 物理拷贝<br/>(Ring -1)"]
-        B4 -.->|"不触发"| ACE2["ACE 完全无感知"]
+        B4 -.->|"不触发"| AntiCheat2["反作弊系统完全无感知"]
     end
 
     style Original fill:#ffebee,stroke:#c62828
