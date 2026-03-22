@@ -19,6 +19,9 @@
 #include "Hide.h"
 #include "HvMemory.h"
 #include "Common.h"
+#include "DebugApi.h"
+#include "DeepHook.h"
+#include "SvmLog.h"
 
 /* ========================================================================
  *  设备名 / 符号链接 / IOCTL 定义
@@ -35,6 +38,8 @@
 #define IOCTL_SVM_DISABLE_CALLBACKS     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x824, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SVM_RESTORE_CALLBACKS     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x825, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SVM_PROTECT_EX            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x826, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_ELEVATE_PID    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x828, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_UNELEVATE_PID  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x829, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* ========================================================================
  *  全局变量
@@ -236,7 +241,27 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             (SIZE_T)req->Size);
         break;
     }
+    case IOCTL_SVM_ELEVATE_PID:
+    {
+        if (inLen < sizeof(PROTECT_INFO) || !buffer) {
+            status = STATUS_INVALID_PARAMETER; break;
+        }
+        PPROTECT_INFO pi = (PPROTECT_INFO)buffer;
+        AddElevatedPid((HANDLE)pi->Pid);
+        SvmDebugPrint("[IOCTL] ELEVATE_PID: %llu\n", pi->Pid);
+        break;
+    }
 
+    case IOCTL_SVM_UNELEVATE_PID:
+    {
+        if (inLen < sizeof(PROTECT_INFO) || !buffer) {
+            status = STATUS_INVALID_PARAMETER; break;
+        }
+        PPROTECT_INFO pi = (PPROTECT_INFO)buffer;
+        RemoveElevatedPid((HANDLE)pi->Pid);
+        SvmDebugPrint("[IOCTL] UNELEVATE_PID: %llu\n", pi->Pid);
+        break;
+    }
     case IOCTL_HV_WRITE_MEMORY:
     {
         if (inLen < sizeof(HV_MEMORY_REQUEST) || !buffer) {
@@ -252,9 +277,27 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     }
 
-    default:
-        status = STATUS_INVALID_DEVICE_REQUEST;
+    /* ---- 读取日志环形缓冲区 (R3 轮询) ---- */
+    case IOCTL_SVM_READ_LOG:
+    {
+        ULONG outLen = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+        ULONG bytesWritten = 0;
+        status = SvmLogRead(buffer, outLen, &bytesWritten);
+        info = bytesWritten;
         break;
+    }
+
+    default:
+    {
+        /* Try DebugApi IOCTL dispatch (0x830-0x838) */
+        ULONG outLen = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+        ULONG bytesReturned = 0;
+        status = DbgDispatchIoctl(ioctl, buffer, inLen, buffer, outLen, &bytesReturned);
+        if (NT_SUCCESS(status)) {
+            info = bytesReturned;
+        }
+        break;
+    }
     }
 
     Irp->IoStatus.Status = status;
@@ -336,28 +379,47 @@ VOID CommunicationThread(PVOID Context)
 
     {
         LARGE_INTEGER hookDrainDelay;
-        hookDrainDelay.QuadPart = -30000000LL; // 3s — 增加等待，确保 win32k 永久线程完成
+        hookDrainDelay.QuadPart = -30000000LL; // 3s
         KeDelayExecutionThread(KernelMode, FALSE, &hookDrainDelay);
     }
 
+    /* ================================================================
+     * [FIX] 完全退出 SVM — 使用 SvmRun.asm 中的 SvSwitchStack
+     *
+     * SvSwitchStack 流程 (在每个 CPU 的 Host 上下文中执行):
+     *   1. STGI — 恢复全局中断
+     *   2. VMLOAD Guest VMCB — 恢复 FS/GS/TR/LDTR/KernelGsBase
+     *   3. 清除 EFER.SVME — 禁用 SVM
+     *   4. 从 VMCB 构建 IRETQ 帧 (SS/RSP/RFLAGS/CS/RIP)
+     *   5. 恢复 Guest GPRs
+     *   6. IRETQ — 跳转到 IpiUnloadBroadcastCallback 中 __cpuid 之后
+     *
+     * 关键: CPUID VMEXIT handler 已通过 NRip 推进 Guest RIP,
+     *        所以 IRETQ 的目标是 __cpuid() 的下一条指令。
+     * ================================================================ */
+    SvmDebugPrint("[INFO] Exiting SVM on all cores...\n");
     KeIpiGenericCall(IpiUnloadBroadcastCallback, 0);
     SvmDebugPrint("[INFO] All cores exited SVM mode.\n");
 
     {
         LARGE_INTEGER drainDelay2;
-        drainDelay2.QuadPart = -30000000LL; // 3s
+        drainDelay2.QuadPart = -10000000LL; // 1s
         KeDelayExecutionThread(KernelMode, FALSE, &drainDelay2);
     }
 
+    /* SVM 已完全退出, 安全释放所有资源 */
     HvFreeSharedContext();
+    DbgUninitialize();
     CleanupAllNptHooks();
     ReleaseDriverResources();
+
     if (g_CsrssProcess) {
         ObDereferenceObject(g_CsrssProcess);
         g_CsrssProcess = NULL;
     }
 
     SvmDebugPrint("[INFO] Cleanup complete. System is back to normal.\n");
+    SvmLogFree();
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -395,6 +457,14 @@ VOID DelayedHookWorkItemRoutine(PVOID Context)
     }
 
     LinkTrampolineAddresses();
+
+    /* Prepare debug-related NPT hooks */
+    PrepareDebugNptHookResources();
+    LinkDebugTrampolineAddresses();
+    ULONG deepOk = 0;
+    PrepareDeepHookResources(&deepOk);
+    LinkDeepTrampolineAddresses();
+    SvmDebugPrint("[INFO] Deep hooks: %lu prepared\n", deepOk);
 
     ULONG n_cout = KeQueryActiveProcessorCount(0);
     if (n_cout > 64) n_cout = 64;
@@ -564,7 +634,13 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject)
     MemoryBarrier();
 
     if (g_WorkerThreadHandle) {
-        ZwWaitForSingleObject(g_WorkerThreadHandle, FALSE, NULL);
+        /* 等待 CommunicationThread 完成清理, 最多30秒 */
+        LARGE_INTEGER waitTimeout;
+        waitTimeout.QuadPart = -300000000LL; // 30 seconds
+        NTSTATUS waitStatus = ZwWaitForSingleObject(g_WorkerThreadHandle, FALSE, &waitTimeout);
+        if (waitStatus == STATUS_TIMEOUT) {
+            SvmDebugPrint("[DrvMain] WARNING: CommunicationThread wait timed out!\n");
+        }
         ZwClose(g_WorkerThreadHandle);
         g_WorkerThreadHandle = NULL;
     }
@@ -681,6 +757,16 @@ VOID SvmInitSystemThread(PVOID StartContext)
     SvmDebugPrint("[SVM] All CPU resources allocated. Initializing shared context...\n");
     HvInitSharedContext();
 
+    /* Initialize debug subsystem */
+    {
+        NTSTATUS dbgStatus = DbgInitialize();
+        if (NT_SUCCESS(dbgStatus)) {
+            SvmDebugPrint("[SVM] Debug subsystem initialized.\n");
+        } else {
+            SvmDebugPrint("[WARN] DbgInitialize failed: 0x%X (non-fatal)\n", dbgStatus);
+        }
+    }
+
     g_SuccessfulSvmCores = 0;
     KeIpiGenericCall(IpiInstallBroadcastCallback, 0);
 
@@ -745,6 +831,9 @@ EXTERN_C NTSTATUS DriverEntry(
     _In_ PUNICODE_STRING RegistryPath)
 {
     UNREFERENCED_PARAMETER(RegistryPath);
+
+    /* 初始化日志环形缓冲区 (必须最先, SvmDebugPrint 依赖它) */
+    SvmLogInit();
 
     SvmDebugPrint("[DrvMain] DriverEntry (standard loading).\n");
 

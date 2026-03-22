@@ -253,6 +253,50 @@ typedef enum _HOOK_INDEX {
     /* ---- 内部函数 (通过模式扫描定位的未导出函数) ---- */
     HOOK_PspReferenceCidTableEntry, // CID表项引用 — PID/TID查找的底层函数
 
+
+    /* ---- Debug API Hooks (DebugApi module, shadow debug port) ---- */
+    HOOK_NtCreateDebugObject_Dbg,       // NtCreateDebugObject -> custom object type
+    HOOK_NtSetInfoDebugObject_Dbg,      // NtSetInformationDebugObject
+    HOOK_NtDebugActiveProcess_Dbg,      // NtDebugActiveProcess -> shadow debug port
+    HOOK_NtWaitForDebugEvent_Dbg,       // NtWaitForDebugEvent -> custom event queue
+    HOOK_NtRemoveProcessDebug_Dbg,      // NtRemoveProcessDebug
+    HOOK_NtDebugContinue_Dbg,           // NtDebugContinue -> wake suspended thread
+    HOOK_DbgkForwardException_Dbg,      // DbgkForwardException -> forward to shadow port
+    HOOK_DbgkCreateThread_Dbg,          // DbgkCreateThread -> thread creation notify
+    HOOK_DbgkExitThread_Dbg,            // DbgkExitThread -> thread exit notify
+    HOOK_DbgkExitProcess_Dbg,           // DbgkExitProcess -> process exit notify
+    HOOK_DbgkMapViewOfSection_Dbg,      // DbgkMapViewOfSection -> DLL load notify
+    HOOK_DbgkUnMapViewOfSection_Dbg,    // DbgkUnMapViewOfSection -> DLL unload notify
+    HOOK_DbgkpQueueMessage_Dbg,         // DbgkpQueueMessage -> event queue core
+
+    HOOK_ObRefByHandleWithTag,
+    HOOK_ObfDereferenceObject,
+    HOOK_ObfDereferenceObjectWithTag,
+
+    /* --- 深度进程/线程 Hook --- */
+    HOOK_PspInsertThread,
+    HOOK_PspCallThreadNotifyRoutines,
+    HOOK_PspExitThread,
+    /* --- 深度内存管理 Hook --- */
+    HOOK_MmProtectVirtualMemory_Deep,
+    HOOK_MiObtainReferencedVadEx,
+
+    /* --- 深度异常/调度 Hook --- */
+    HOOK_KiDispatchException,
+    HOOK_KiStackAttachProcess,
+
+    /* --- Phase 2 深度 Hook: APC / 物理内存 / 句柄表 / 进程生命周期 --- */
+    HOOK_KiInsertQueueApc,              // APC 注入拦截 — 阻止向保护线程投递恶意 APC
+    HOOK_MmGetPhysicalAddress_Deep,     // 物理地址转换拦截 — 阻止扫描保护进程物理页
+    HOOK_MmMapIoSpace_Deep,             // IO 空间映射拦截 — 阻止直接映射保护进程物理内存
+    HOOK_MmMapLockedPages_Deep,         // 锁定页映射拦截 — 阻止 MDL 方式读取保护进程内存
+    HOOK_ExpLookupHandleTableEntry,     // 句柄表查询拦截 — 从 PspCidTable 中隐藏保护对象
+    HOOK_PspInsertProcess,              // 进程插入拦截 — 掌控进程生命周期源头
+    HOOK_PspGetContextThreadInternal,   // 底层上下文获取拦截 — 清除 DR0-DR7 硬件断点
+
+    /* ---- 反调试检测防御 Hook (Hide module) ---- */
+    HOOK_NtSetInformationThread,        // 拦截 ThreadHideFromDebugger — 防止反作弊隐藏线程
+
     HOOK_MAX_ENUM_COUNT // 枚举计数哨兵, 用于数组边界检查
 } HOOK_INDEX;
 

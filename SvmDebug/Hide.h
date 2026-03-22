@@ -15,7 +15,15 @@
 
 #include "winApiDef.h"   // 所有函数指针 typedef 都在这里
 
+#define MAX_ELEVATED_PIDS  10
 
+extern HANDLE   g_ElevatedPIDs[MAX_ELEVATED_PIDS];
+extern volatile LONG g_ElevatedPidCount;
+
+BOOLEAN AddElevatedPid(HANDLE Pid);
+BOOLEAN RemoveElevatedPid(HANDLE Pid);
+BOOLEAN IsElevatedPid(HANDLE Pid);
+VOID    ClearAllElevatedPids();
 
  /* ========================================================================
   *  权限常量 — 进程/线程访问权限掩码, 用于句柄权限裁剪
@@ -310,6 +318,13 @@ ULONG GetSssdtIndexDynamic(PCSTR FunctionName);
  * @return 函数虚拟地址, 未找到返回NULL
  */
 PVOID ScanForPspReferenceCidTableEntry();
+
+/**
+ * @brief 通过ntdll导出表解析syscall索引, 再查SSDT获取Nt函数内核地址
+ * @param [in] NtFuncName - Nt函数名(如 "NtCreateDebugObject")
+ * @return Nt函数虚拟地址, 失败返回NULL
+ */
+PVOID GetSsdtAddressByNtdllName(PCSTR NtFuncName);
 
 
 
