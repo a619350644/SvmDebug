@@ -1126,6 +1126,50 @@ static NTSTATUS NTAPI Fake_NtQuerySystemInformation(
             }
             handleInfoEx->NumberOfHandles = dest;
         }
+
+        /* [FIX] 过滤内核模块列表 — 隐藏 SvmDebug/yeshen/dbk64 驱动
+         * 反作弊系统通过 NtQuerySystemInformation(SystemModuleInformation=11)
+         * 枚举所有内核模块, 可发现我们的驱动。过滤方式与句柄列表相同: 原地压缩数组。
+         */
+        else if (SystemInformationClass == 11 /* SystemModuleInformation */) {
+            typedef struct _RTL_PROCESS_MODULE_INFORMATION_LITE {
+                HANDLE Section;
+                PVOID  MappedBase;
+                PVOID  ImageBase;
+                ULONG  ImageSize;
+                ULONG  Flags;
+                USHORT LoadOrderIndex;
+                USHORT InitOrderIndex;
+                USHORT LoadCount;
+                USHORT OffsetToFileName;
+                UCHAR  FullPathName[256];
+            } RTL_PROCESS_MODULE_INFORMATION_LITE;
+
+            typedef struct _RTL_PROCESS_MODULES_LITE {
+                ULONG NumberOfModules;
+                RTL_PROCESS_MODULE_INFORMATION_LITE Modules[1];
+            } RTL_PROCESS_MODULES_LITE;
+
+            RTL_PROCESS_MODULES_LITE* mods = (RTL_PROCESS_MODULES_LITE*)SystemInformation;
+            if ((ULONG_PTR)mods + sizeof(ULONG) <= (ULONG_PTR)SystemInformation + SystemInformationLength) {
+                ULONG dest = 0;
+                for (ULONG i = 0; i < mods->NumberOfModules; i++) {
+                    PCSTR name = (PCSTR)(mods->Modules[i].FullPathName +
+                                         mods->Modules[i].OffsetToFileName);
+                    /* 过滤: SvmDebug.sys, yeshen.sys, dbk64.sys, yeshen64.sys */
+                    if (_stricmp(name, "SvmDebug.sys") != 0 &&
+                        _stricmp(name, "yeshen.sys") != 0 &&
+                        _stricmp(name, "yeshen64.sys") != 0 &&
+                        _stricmp(name, "dbk64.sys") != 0)
+                    {
+                        if (dest != i)
+                            mods->Modules[dest] = mods->Modules[i];
+                        dest++;
+                    }
+                }
+                mods->NumberOfModules = dest;
+            }
+        }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 

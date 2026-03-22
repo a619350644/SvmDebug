@@ -48,6 +48,9 @@ PVCPU_CONTEXT g_nVMCB[64] = { 0 };
 
 PDEVICE_OBJECT g_DeviceObject = NULL;
 
+/* [FIX] 保存驱动对象, 用于 HideDriver 隐藏自身 */
+PDRIVER_OBJECT g_SvmDriverObject = NULL;
+
 HANDLE g_PendingProtectPID = (HANDLE)0;
 HANDLE g_WorkerThreadHandle = NULL;
 volatile BOOLEAN g_DriverUnloading = FALSE;
@@ -535,6 +538,15 @@ VOID DelayedHookWorkItemRoutine(PVOID Context)
     KeIpiGenericCall(IpiActivateHookBroadcastCallback, 0);
     SvmDebugPrint("[INFO] SUCCESS! All NPT hooks safely activated.\n");
 
+    /* [FIX] 隐藏 SvmDebug 驱动自身 — 从 PsLoadedModuleList 中摘除
+     * 必须在所有 Hook 激活之后调用, 因为 HideDriver 之后
+     * 驱动不再出现在模块枚举中, 配合 Fake_NtQuerySystemInformation
+     * 的 SystemModuleInformation 过滤实现双重保险 */
+    if (g_SvmDriverObject) {
+        HideDriver(g_SvmDriverObject);
+        SvmDebugPrint("[INFO] SvmDebug driver hidden from module enumeration.\n");
+    }
+
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
@@ -831,6 +843,9 @@ EXTERN_C NTSTATUS DriverEntry(
     _In_ PUNICODE_STRING RegistryPath)
 {
     UNREFERENCED_PARAMETER(RegistryPath);
+
+    /* [FIX] 保存 DriverObject 全局引用, 用于后续 HideDriver 调用 */
+    g_SvmDriverObject = DriverObject;
 
     /* 初始化日志环形缓冲区 (必须最先, SvmDebugPrint 依赖它) */
     SvmLogInit();
