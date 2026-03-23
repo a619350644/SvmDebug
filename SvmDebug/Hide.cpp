@@ -15,12 +15,12 @@
  */
 #include "Hide.h"
 #include "DebugApi.h"       // IsDebugger() — 区分调试器(CE)与被保护游戏进程
+#include "HvMemory.h"       // [FIX-v10] HvReadProcessMemory — 物理内存直读, 绕过 NPT Hook 链
 #include <ntstrsafe.h>
 #include <ntimage.h>
 #pragma warning(disable: 4505)
 
 #define SEC_IMAGE 0x01000000
-
 
 #pragma section(".drv_rw", read, write)
 #pragma comment(linker, "/SECTION:.drv_rw,RW")
@@ -1155,7 +1155,7 @@ static NTSTATUS NTAPI Fake_NtQuerySystemInformation(
                 ULONG dest = 0;
                 for (ULONG i = 0; i < mods->NumberOfModules; i++) {
                     PCSTR name = (PCSTR)(mods->Modules[i].FullPathName +
-                                         mods->Modules[i].OffsetToFileName);
+                        mods->Modules[i].OffsetToFileName);
                     /* 过滤: SvmDebug.sys, yeshen.sys, dbk64.sys, yeshen64.sys */
                     if (_stricmp(name, "SvmDebug.sys") != 0 &&
                         _stricmp(name, "yeshen.sys") != 0 &&
@@ -1437,12 +1437,32 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
         return g_OrigNtQueryVirtualMemory(
             ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
 
+    /* 外部进程查询保护进程 - 拒绝 */
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
         return STATUS_ACCESS_DENIED;
 
-    return g_OrigNtQueryVirtualMemory(
+    /* 调用原函数获取真实内存信息 */
+    NTSTATUS status = g_OrigNtQueryVirtualMemory(
         ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
+
+    /* 如果查询成功且是 MemoryBasicInformation (class 0) */
+    if (NT_SUCCESS(status) && MemInfoClass == 0 &&
+        MemInfo && MemInfoLength >= sizeof(MEMORY_BASIC_INFORMATION))
+    {
+        PMEMORY_BASIC_INFORMATION mbi = (PMEMORY_BASIC_INFORMATION)MemInfo;
+
+        /* 检查是否是可疑的可执行内存页 */
+        if (mbi->State == MEM_COMMIT && mbi->Type == MEM_PRIVATE &&
+            (mbi->Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+        {
+            /* 伪造为只读页，隐藏执行权限 */
+            mbi->Protect = PAGE_READONLY;
+            mbi->AllocationProtect = PAGE_READONLY;
+        }
+    }
+
+    return status;
 }
 
 /**
@@ -1571,48 +1591,43 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
     if (!g_OrigNtReadVirtualMemory) return STATUS_UNSUCCESSFUL;
 
     /* ================================================================
-     * CE 读升权目标 → 完全绕过句柄系统, 直接 MmCopyVirtualMemory
+     * [FIX-v12] CE (保护进程) 读取其他进程的内存
      *
-     * 为什么不能走原 NtReadVirtualMemory:
-     *   原函数内部 ObReferenceObjectByHandle(handle, VM_READ, UserMode)
-     *   → ACE 把句柄 GrantedAccess 剥到 0x1000
-     *   → (0x1000 & VM_READ) == 0 → ACCESS_DENIED
-     *
-     * 为什么不用 g_OrigObpRefByHandleWithTag:
-     *   ObpRef 扫描在某些 build 上失败 → trampoline 为 NULL
-     *
-     * 方案: 直接调 ObReferenceObjectByHandle (ntoskrnl 导出)
-     *   传 DesiredAccess=0, KernelMode → 内部跳过所有权限检查
-     *   这是系统导出函数, 不依赖任何扫描/trampoline
+     * 策略:
+     *   - 升权目标 (ACE游戏): 走 HvReadProcessMemory 物理直读
+     *     (绕过 ACE 的 ObRegisterCallbacks 句柄降权)
+     *   - 普通目标: 直接透传原函数 (最稳定, 不破坏 Memory View)
      * ================================================================ */
-    if (IsCallerProtected() && g_ElevatedPidCount > 0 &&
-        g_OrigMmCopyVirtualMemory &&
+    if (IsCallerProtected() &&
         ProcessHandle && ProcessHandle != NtCurrentProcess())
     {
-        PEPROCESS targetProc = NULL;
-        /* 直接调 ntoskrnl 导出: DesiredAccess=0, KernelMode → 绕过 ACE */
-        NTSTATUS status = ObReferenceObjectByHandle(
-            ProcessHandle, 0, *PsProcessType, KernelMode,
-            (PVOID*)&targetProc, NULL);
-
-        if (NT_SUCCESS(status) && targetProc) {
-            if (IsElevatedPid(PsGetProcessId(targetProc))) {
-                SIZE_T bytesCopied = 0;
-                status = g_OrigMmCopyVirtualMemory(
-                    targetProc, BaseAddress,
-                    PsGetCurrentProcess(), Buffer,
-                    Size, KernelMode, &bytesCopied);
-
+        /* 检查目标是否是升权进程 (ACE游戏) */
+        BOOLEAN usePhysical = FALSE;
+        if (g_ElevatedPidCount > 0) {
+            PEPROCESS targetProc = NULL;
+            NTSTATUS st = ObReferenceObjectByHandle(
+                ProcessHandle, 0, *PsProcessType, KernelMode,
+                (PVOID*)&targetProc, NULL);
+            if (NT_SUCCESS(st) && targetProc) {
+                HANDLE targetPid = PsGetProcessId(targetProc);
+                usePhysical = IsElevatedPid(targetPid);
                 ObDereferenceObject(targetProc);
 
-                if (NumberOfBytesRead) {
-                    __try { *NumberOfBytesRead = bytesCopied; }
-                    __except (EXCEPTION_EXECUTE_HANDLER) {}
+                if (usePhysical) {
+                    NTSTATUS status = HvReadProcessMemory(
+                        (ULONG64)(ULONG_PTR)targetPid, BaseAddress, Buffer, Size);
+                    if (NumberOfBytesRead) {
+                        __try { *NumberOfBytesRead = NT_SUCCESS(status) ? Size : 0; }
+                        __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    }
+                    return status;
                 }
-                return status;
             }
-            ObDereferenceObject(targetProc);
         }
+
+        /* 普通目标: 透传原函数 (CE读普通进程, 走正常内核路径) */
+        return g_OrigNtReadVirtualMemory(
+            ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesRead);
     }
 
     /* ElevatedPid 调用者放行 */
@@ -1653,9 +1668,9 @@ static NTSTATUS NTAPI Fake_NtWriteVirtualMemory(
     FAKE_PRINT_ONCE_FOR(HOOK_NtWriteVirtualMemory);
     if (!g_OrigNtWriteVirtualMemory) return STATUS_UNSUCCESSFUL;
 
-    /* CE 写升权目标 → 直接 MmCopyVirtualMemory, 绕过句柄系统 */
-    if (IsCallerProtected() && g_ElevatedPidCount > 0 &&
-        g_OrigMmCopyVirtualMemory &&
+    /* [FIX-v10] CE 写入任何其他进程 → HvWriteProcessMemory 物理直写
+     * 绕过 NPT Hook trampoline 链, 同 Fake_NtReadVirtualMemory 的修复 */
+    if (IsCallerProtected() &&
         ProcessHandle && ProcessHandle != NtCurrentProcess())
     {
         PEPROCESS targetProc = NULL;
@@ -1664,22 +1679,18 @@ static NTSTATUS NTAPI Fake_NtWriteVirtualMemory(
             (PVOID*)&targetProc, NULL);
 
         if (NT_SUCCESS(status) && targetProc) {
-            if (IsElevatedPid(PsGetProcessId(targetProc))) {
-                SIZE_T bytesCopied = 0;
-                status = g_OrigMmCopyVirtualMemory(
-                    PsGetCurrentProcess(), Buffer,
-                    targetProc, BaseAddress,
-                    Size, KernelMode, &bytesCopied);
-
-                ObDereferenceObject(targetProc);
-
-                if (NumberOfBytesWritten) {
-                    __try { *NumberOfBytesWritten = bytesCopied; }
-                    __except (EXCEPTION_EXECUTE_HANDLER) {}
-                }
-                return status;
-            }
+            ULONG64 targetPid = (ULONG64)(ULONG_PTR)PsGetProcessId(targetProc);
             ObDereferenceObject(targetProc);
+
+            status = HvWriteProcessMemory(targetPid, BaseAddress, Buffer, Size);
+
+            if (NumberOfBytesWritten) {
+                __try {
+                    *NumberOfBytesWritten = NT_SUCCESS(status) ? Size : 0;
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+            }
+            return status;
         }
     }
 
@@ -2032,10 +2043,21 @@ static NTSTATUS NTAPI Fake_NtQueryInformationThread(
         return STATUS_ACCESS_DENIED;
     }
 
-    LeaveHookGuard(oldIrql);
-    return g_OrigNtQueryInformationThread(
+    /* 调用原函数 */
+    NTSTATUS status = g_OrigNtQueryInformationThread(
         ThreadHandle, ThreadInformationClass,
         ThreadInformation, ThreadInformationLength, ReturnLength);
+
+    /* ThreadQuerySetWin32StartAddress (9) - 隐藏线程入口点 */
+    if (NT_SUCCESS(status) && ThreadInformationClass == 9 &&
+        ThreadInformation && ThreadInformationLength >= sizeof(PVOID))
+    {
+        /* 伪造为 ntdll!RtlUserThreadStart */
+        *(PVOID*)ThreadInformation = (PVOID)0x7FFE0000;
+    }
+
+    LeaveHookGuard(oldIrql);
+    return status;
 }
 
 /**
@@ -2128,6 +2150,17 @@ static NTSTATUS NTAPI Fake_ObpRefByHandleWithTag(
         return g_OrigObpRefByHandleWithTag(
             Handle, DesiredAccess, ObjectType, AccessMode,
             Tag, Object, HandleInfo, Flags);
+
+    /* [FIX-v14] SvmDebug 内部操作 (HvRead/Write/Query) bypass
+     * HvMemory.cpp 在 KeStackAttachProcess 前置位 per-CPU 标志,
+     * 这里检测到后直接透传原函数, 不做任何升权/降权修改。
+     * 这是解决 "升权后 Memory View 全问号" 的根本修复。 */
+    if (HvIsInternalOp()) {
+        LeaveHookGuard(oldIrql);
+        return g_OrigObpRefByHandleWithTag(
+            Handle, DesiredAccess, ObjectType, AccessMode,
+            Tag, Object, HandleInfo, Flags);
+    }
 
     /*
      * CE(受保护进程)的所有 ObpRef 调用: 无条件 DesiredAccess=0, KernelMode

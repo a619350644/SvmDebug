@@ -34,6 +34,49 @@ PHV_DEBUG_CONTEXT g_HvDebugContext = nullptr;
 ULONG64 g_HvDebugContextPa = 0;
 FAST_MUTEX g_HvDebugMutex;
 
+/* ========================================================================
+ * [FIX-v7] DebugPort 隐藏 — Windows Debugger 模式
+ *
+ * 问题: CE Windows Debugger 模式透传 NtDebugActiveProcess 后,
+ *       EPROCESS.DebugPort 被设为真实的 DebugObject 指针。
+ *       ACE 直接读 EPROCESS+0x578 发现非NULL → 检测到调试器
+ *
+ * 修复: 透传后立即保存并清零 DebugPort,
+ *       仅在 CE 调用 NtWaitForDebugEvent/NtDebugContinue 时临时恢复
+ * ======================================================================== */
+#define EPROCESS_DEBUGPORT_OFFSET  0x578  /* Win10 19041 (2004) */
+
+static PEPROCESS g_WinDbgTargetProcess = NULL;
+static PVOID     g_SavedDebugPort = NULL;
+
+static VOID DbgHideDebugPort(PEPROCESS Process)
+{
+    if (!Process) return;
+    PVOID* pPort = (PVOID*)((PUCHAR)Process + EPROCESS_DEBUGPORT_OFFSET);
+    PVOID current = *pPort;
+    if (current != NULL) {
+        g_SavedDebugPort = current;
+        g_WinDbgTargetProcess = Process;
+        *pPort = NULL;
+    }
+}
+
+static VOID DbgRestoreDebugPort(void)
+{
+    if (g_WinDbgTargetProcess && g_SavedDebugPort) {
+        PVOID* pPort = (PVOID*)((PUCHAR)g_WinDbgTargetProcess + EPROCESS_DEBUGPORT_OFFSET);
+        *pPort = g_SavedDebugPort;
+    }
+}
+
+static VOID DbgClearDebugPortAgain(void)
+{
+    if (g_WinDbgTargetProcess) {
+        PVOID* pPort = (PVOID*)((PUCHAR)g_WinDbgTargetProcess + EPROCESS_DEBUGPORT_OFFSET);
+        *pPort = NULL;
+    }
+}
+
 /* NPT 隐形断点全局表 */
 NPT_BREAKPOINT g_NptBreakpoints[MAX_NPT_BREAKPOINTS] = { 0 };
 volatile LONG  g_NptBreakpointCount = 0;
@@ -164,6 +207,62 @@ NTSTATUS DbgInitialize()
  */
 VOID DbgUninitialize()
 {
+    /* ================================================================
+     * [FIX-v14] 先唤醒所有阻塞在调试事件上的内核线程
+     *
+     * 场景: CE attach 目标进程 → 目标线程触发 DbgkForwardException
+     *   → Fake_DbgkpQueueMessage 同步等待 ContinueEvent (无超时)
+     *   → CE 未调用 NtDebugContinue → 该内核线程永远阻塞
+     *   → SvmDebug 卸载时 KeIpiGenericCall 等该 CPU → 死锁
+     *
+     * 修复: 遍历所有 DebugObject, 标记 DELETE_PENDING,
+     *       唤醒 EventsPresent (WaitForDebugEvent) 和所有 ContinueEvent
+     * ================================================================ */
+    SvmDebugPrint("[DebugApi] Waking all blocked debug threads...\n");
+
+    ExAcquireFastMutex(&g_DbgHandleTableMutex);
+    for (ULONG i = 0; i < DBG_MAX_HANDLES; i++) {
+        PDEBUG_OBJECT dbgObj = g_DbgHandleTable[i];
+        if (!dbgObj) continue;
+
+        ExAcquireFastMutex(&dbgObj->Mutex);
+        dbgObj->Flags |= DEBUG_OBJECT_DELETE_PENDING;
+
+        /* 唤醒 Fake_NtWaitForDebugEvent 中的 KeWaitForSingleObject */
+        KeSetEvent(&dbgObj->EventsPresent, IO_NO_INCREMENT, FALSE);
+
+        /* 唤醒所有 Fake_DbgkpQueueMessage 中同步等待 ContinueEvent 的线程 */
+        for (PLIST_ENTRY entry = dbgObj->EventList.Flink;
+            entry != &dbgObj->EventList;
+            entry = entry->Flink)
+        {
+            PDEBUG_EVENT evt = CONTAINING_RECORD(entry, DEBUG_EVENT, EventList);
+            evt->Status = STATUS_DEBUGGER_INACTIVE;
+            KeSetEvent(&evt->ContinueEvent, IO_NO_INCREMENT, FALSE);
+        }
+        ExReleaseFastMutex(&dbgObj->Mutex);
+    }
+    ExReleaseFastMutex(&g_DbgHandleTableMutex);
+
+    /* 给阻塞线程时间醒来并退出 */
+    {
+        LARGE_INTEGER wakeDelay;
+        wakeDelay.QuadPart = -20000000LL; /* 2 秒 */
+        KeDelayExecutionThread(KernelMode, FALSE, &wakeDelay);
+    }
+
+    /* 现在可以安全释放 DebugObject 内存 */
+    ExAcquireFastMutex(&g_DbgHandleTableMutex);
+    for (ULONG i = 0; i < DBG_MAX_HANDLES; i++) {
+        if (g_DbgHandleTable[i]) {
+            DbgFreeDebugObject(g_DbgHandleTable[i]);
+            g_DbgHandleTable[i] = NULL;
+        }
+    }
+    ExReleaseFastMutex(&g_DbgHandleTableMutex);
+
+    SvmDebugPrint("[DebugApi] All debug objects drained.\n");
+
     /* 清理调试进程链表 */
     ExAcquireFastMutex(&g_DebugProcessListMutex);
     while (!IsListEmpty(&g_DebugProcessListHead)) {
@@ -892,8 +991,24 @@ NTSTATUS NTAPI Fake_NtDebugActiveProcess(
             ProcessHandle, DebugHandle, (ULONG64)PsGetCurrentProcessId());
 
         if (g_OrigNtDebugActiveProcess) {
+            /* 先获取目标 EPROCESS (透传前, 句柄还有效) */
+            PEPROCESS TargetProc = NULL;
+            ObReferenceObjectByHandle(ProcessHandle, 0, *PsProcessType,
+                KernelMode, (PVOID*)&TargetProc, NULL);
+
             Status = g_OrigNtDebugActiveProcess(ProcessHandle, DebugHandle);
             SvmDebugPrint("[DebugApi] NtDebugActiveProcess passthrough Status=0x%X\n", Status);
+
+            /* [FIX-v7] 透传成功后, 保存并清零 DebugPort
+             * ACE 直接读 EPROCESS+0x578, 我们不让它看到非NULL值
+             * CE 的 NtWaitForDebugEvent 会在 Fake 函数中临时恢复 */
+            if (NT_SUCCESS(Status) && TargetProc) {
+                DbgHideDebugPort(TargetProc);
+                SvmDebugPrint("[DebugApi] DebugPort saved and cleared for PID=%lld\n",
+                    (ULONG64)PsGetProcessId(TargetProc));
+            }
+
+            if (TargetProc) ObDereferenceObject(TargetProc);
             return Status;
         }
         return STATUS_ACCESS_DENIED;
@@ -997,12 +1112,15 @@ NTSTATUS NTAPI Fake_NtWaitForDebugEvent(
         return STATUS_ACCESS_DENIED;
     }
 
-    /* [FIX] CE "Windows Debugger" 模式: DebugHandle 是系统真正的
-     * DebugObject 句柄, 不是自定义句柄。必须透传给原始函数,
-     * 让系统从真正的 EPROCESS.DebugPort 读取调试事件。 */
+    /* [FIX-v7] CE "Windows Debugger" 模式: 临时恢复 DebugPort,
+     * 调用原始函数, 然后立即再次清零 */
     if (IsDebugger(PsGetCurrentProcess()) && !bIsCustomHandle) {
-        if (g_OrigNtWaitForDebugEvent)
-            return g_OrigNtWaitForDebugEvent(DebugHandle, Alertable, Timeout, StateChange);
+        if (g_OrigNtWaitForDebugEvent) {
+            DbgRestoreDebugPort();
+            NTSTATUS r = g_OrigNtWaitForDebugEvent(DebugHandle, Alertable, Timeout, StateChange);
+            DbgClearDebugPortAgain();
+            return r;
+        }
         return STATUS_ACCESS_DENIED;
     }
 
@@ -1145,10 +1263,14 @@ NTSTATUS NTAPI Fake_NtDebugContinue(
         return STATUS_ACCESS_DENIED;
     }
 
-    /* [FIX] Windows Debugger 模式: 系统句柄, 透传 */
+    /* [FIX-v7] Windows Debugger 模式: 临时恢复 DebugPort */
     if (IsDebugger(PsGetCurrentProcess()) && !bIsCustomHandle) {
-        if (g_OrigNtDebugContinue)
-            return g_OrigNtDebugContinue(DebugObjectHandle, ClientId, ContinueStatus);
+        if (g_OrigNtDebugContinue) {
+            DbgRestoreDebugPort();
+            NTSTATUS r = g_OrigNtDebugContinue(DebugObjectHandle, ClientId, ContinueStatus);
+            DbgClearDebugPortAgain();
+            return r;
+        }
         return STATUS_ACCESS_DENIED;
     }
 
@@ -1235,10 +1357,17 @@ NTSTATUS NTAPI Fake_NtRemoveProcessDebug(
         return STATUS_ACCESS_DENIED;
     }
 
-    /* [FIX] Windows Debugger 模式: 系统句柄, 透传 */
+    /* [FIX-v7] Windows Debugger 模式: 恢复 DebugPort 让 detach 正常工作,
+     * detach 后系统会自动清零 DebugPort */
     if (IsDebugger(PsGetCurrentProcess()) && !bIsCustomHandle) {
-        if (g_OrigNtRemoveProcessDebug)
-            return g_OrigNtRemoveProcessDebug(ProcessHandle, DebugObjectHandle);
+        if (g_OrigNtRemoveProcessDebug) {
+            DbgRestoreDebugPort();
+            NTSTATUS r = g_OrigNtRemoveProcessDebug(ProcessHandle, DebugObjectHandle);
+            /* detach 后 DebugPort 已被系统清零, 清除我们的保存状态 */
+            g_SavedDebugPort = NULL;
+            g_WinDbgTargetProcess = NULL;
+            return r;
+        }
         return STATUS_ACCESS_DENIED;
     }
 

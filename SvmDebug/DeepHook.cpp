@@ -16,6 +16,7 @@
 #include "DebugApi.h"
 #include "SVM.h"
 #include "NPT.h"
+#include "HvMemory.h"
 
 #include <ntimage.h>
 #include <ntstrsafe.h>
@@ -879,6 +880,15 @@ NTSTATUS NTAPI Fake_ObReferenceObjectByHandleWithTag(
         return g_OrigObRefByHandleWithTag(Handle, DesiredAccess, ObjectType,
             AccessMode, Tag, Object, HandleInformation);
 
+    /* [FIX-v14] SvmDebug 内部操作 bypass — 与 Hide.cpp 同步
+     * HvMemory.cpp 在 KeStackAttachProcess 前置位 per-CPU 标志,
+     * 防止 SvmDebug 自己的 ZwQueryVirtualMemory 被升权逻辑干扰 */
+    if (HvIsInternalOp()) {
+        DeepLeaveGuard(oldIrql);
+        return g_OrigObRefByHandleWithTag(Handle, DesiredAccess, ObjectType,
+            AccessMode, Tag, Object, HandleInformation);
+    }
+
     /* CE 调用: 无条件 DesiredAccess=0 + KernelMode (与参考代码一致)
      * 不检查 ElevatedPidCount — CE 的所有句柄操作都需要绕过 ACE */
     if (g_ProtectedPidCount > 0 && IsCallerProtected()) {
@@ -1307,10 +1317,72 @@ PHYSICAL_ADDRESS NTAPI Fake_MmGetPhysicalAddress_Deep(PVOID BaseAddress)
 }
 
 /**
+ * @brief IsPhysicalAddressInProtectedProcess — 检查物理地址范围是否属于受保护进程
+ *
+ * 遍历所有受保护进程的CR3页表，对请求映射的每个物理页逐一比对。
+ * 只在 PASSIVE/APC_LEVEL 调用（MmMapIoSpace 本身要求 PASSIVE_LEVEL）。
+ *
+ * @param StartPa  请求映射的起始物理地址（页对齐）
+ * @param NumBytes 请求映射的字节数
+ * @return TRUE = 物理地址属于受保护进程，应拦截
+ */
+static BOOLEAN IsPhysicalAddressInProtectedProcess(ULONG64 StartPa, SIZE_T NumBytes)
+{
+    if (g_ProtectedPidCount == 0) return FALSE;
+
+    /* 计算请求覆盖的物理页范围 */
+    ULONG64 paStart = StartPa & ~0xFFFULL;
+    ULONG64 paEnd   = (StartPa + NumBytes + 0xFFF) & ~0xFFFULL;
+
+    LONG count = g_ProtectedPidCount;
+    for (LONG i = 0; i < count && i < MAX_PROTECTED_PIDS; i++) {
+        HANDLE pid = g_ProtectedPIDs[i];
+        if (!pid) continue;
+
+        PEPROCESS proc = NULL;
+        if (!NT_SUCCESS(PsLookupProcessByProcessId(pid, &proc)) || !proc)
+            continue;
+
+        /* 读取 DirectoryTableBase (EPROCESS+0x28) */
+        ULONG64 cr3 = 0;
+        __try {
+            cr3 = *(PULONG64)((PUCHAR)proc + 0x28);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            ObDereferenceObject(proc);
+            continue;
+        }
+        ObDereferenceObject(proc);
+
+        if (!cr3) continue;
+
+        /* 遍历用户态虚拟地址空间，通过页表找出所有物理页，
+         * 检查是否与请求的物理地址范围重叠。
+         * 步长4KB，用户态上限0x7FFFFFFFFFFF。
+         * 为避免耗时过长，只扫描前256MB（CE扫描通常针对低地址区域）。
+         * 如需全量扫描可去掉 scanLimit 限制。 */
+        ULONG64 scanLimit = 0x10000000ULL; /* 256MB */
+        for (ULONG64 va = 0x10000; va < scanLimit; va += 0x1000) {
+            /* TranslateGuestVaToPa_Ext: 页表遍历 VA->PA，已在HvMemory.cpp实现 */
+            ULONG64 pa = TranslateGuestVaToPa_Ext(cr3, va);
+            if (!pa) continue;
+
+            ULONG64 pageBase = pa & ~0xFFFULL;
+            if (pageBase >= paStart && pageBase < paEnd) {
+                SvmDebugPrint("[DeepFake] MmMapIoSpace BLOCKED: PA=0x%llX hits protected PID=%llu VA=0x%llX\n",
+                    StartPa, (ULONG64)pid, va);
+                return TRUE;
+            }
+        }
+    }
+    return FALSE;
+}
+
+/**
  * @brief Fake_MmMapIoSpace_Deep — IO 空间映射拦截
  *
- * 策略: 记录所有映射请求, 如果物理地址命中保护进程的内存页则拒绝。
- * 注意: 完整实现需要维护保护进程的物理页列表, 当前版本仅做日志 + 基本拦截。
+ * 策略: 遍历受保护进程页表，检查请求的物理地址是否属于受保护进程内存页。
+ * 如果命中则返回NULL，阻止CE驱动通过物理内存直读绕过虚拟内存Hook。
  */
 PVOID NTAPI Fake_MmMapIoSpace_Deep(
     PHYSICAL_ADDRESS PhysicalAddress,
@@ -1320,12 +1392,27 @@ PVOID NTAPI Fake_MmMapIoSpace_Deep(
     DEEP_PRINT_ONCE(HOOK_MmMapIoSpace_Deep);
     if (!g_OrigMmMapIoSpace) return NULL;
 
+    /* 只在 PASSIVE/APC_LEVEL 做页表遍历 */
+    if (KeGetCurrentIrql() > APC_LEVEL)
+        return g_OrigMmMapIoSpace(PhysicalAddress, NumberOfBytes, CacheType);
+
+    /* 保护进程自身/无保护目标 → 放行 */
     if (g_ProtectedPidCount == 0 || IsCallerProtected())
         return g_OrigMmMapIoSpace(PhysicalAddress, NumberOfBytes, CacheType);
 
-    /* 可疑检查: 大范围映射 (>4KB) 可能是内存扫描 */
-    /* 实际部署时应比对保护进程的 DirectoryTableBase 对应的物理页 */
-    /* 当前版本: 仅日志, 全部放行 */
+    /* Guard防递归: TranslateGuestVaToPa_Ext内部会再次调用MmMapIoSpace(页表页映射)
+     * 递归调用时Guard已占用 → 直接透传原函数，避免死递归 */
+    KIRQL oldIrql;
+    if (!DeepEnterGuard(&oldIrql))
+        return g_OrigMmMapIoSpace(PhysicalAddress, NumberOfBytes, CacheType);
+
+    BOOLEAN blocked = IsPhysicalAddressInProtectedProcess(
+        (ULONG64)PhysicalAddress.QuadPart, NumberOfBytes);
+
+    DeepLeaveGuard(oldIrql);
+
+    if (blocked)
+        return NULL;
 
     return g_OrigMmMapIoSpace(PhysicalAddress, NumberOfBytes, CacheType);
 }

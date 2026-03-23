@@ -23,14 +23,14 @@
 #include "DeepHook.h"
 #include "SvmLog.h"
 
-/* ========================================================================
- *  设备名 / 符号链接 / IOCTL 定义
- *  正常加载方式: sc create / ZwLoadDriver / inf 安装
- * ======================================================================== */
+ /* ========================================================================
+  *  设备名 / 符号链接 / IOCTL 定义
+  *  正常加载方式: sc create / ZwLoadDriver / inf 安装
+  * ======================================================================== */
 #define SVM_DEVICE_NAME     L"\\Device\\SvmDebug"
 #define SVM_SYMLINK_NAME    L"\\DosDevices\\SvmDebug"
 
-/* 保护命令 IOCTL (0x820 起, 避开 HvMemory.h 中 0x810-0x812) */
+  /* 保护命令 IOCTL (0x820 起, 避开 HvMemory.h 中 0x810-0x812) */
 #define IOCTL_SVM_PROTECT_PID           CTL_CODE(FILE_DEVICE_UNKNOWN, 0x820, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SVM_PROTECT_HWND          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x821, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SVM_PROTECT_CHILD_HWND    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x822, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -76,12 +76,12 @@ VOID DelayedHookWorkItemRoutine(PVOID Context);
 /* ========================================================================
  *  资源释放
  * ======================================================================== */
-/**
- * @brief 释放所有驱动资源 - VCPU上下文、Host栈、NPT页表、TrampolinePage
- * @author yewilliam
- * @date 2026/03/16
- * @note TrampolinePage在此统一释放(CleanupAllNptHooks故意保留以防执行中崩溃)
- */
+ /**
+  * @brief 释放所有驱动资源 - VCPU上下文、Host栈、NPT页表、TrampolinePage
+  * @author yewilliam
+  * @date 2026/03/16
+  * @note TrampolinePage在此统一释放(CleanupAllNptHooks故意保留以防执行中崩溃)
+  */
 static VOID ReleaseDriverResources()
 {
     ULONG n_cout = KeQueryActiveProcessorCount(0);
@@ -139,7 +139,7 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
     switch (ioctl)
     {
-    /* ---- 保护 PID ---- */
+        /* ---- 保护 PID ---- */
     case IOCTL_SVM_PROTECT_PID:
     {
         if (inLen < sizeof(PROTECT_INFO) || !buffer) {
@@ -279,7 +279,42 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             (SIZE_T)req->Size);
         break;
     }
+    case IOCTL_HV_QUERY_VM:
+    {
+        ULONG outLen = irpSp->Parameters.DeviceIoControl.OutputBufferLength;
+        if (inLen < sizeof(HV_QUERY_VM_REQUEST) || !buffer) {
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+        PHV_QUERY_VM_REQUEST req = (PHV_QUERY_VM_REQUEST)buffer;
+        ULONG64 baseAddr = 0;
+        ULONG64 regionSize = 0;
+        ULONG   protection = 0;
+        ULONG   state = 0;
+        ULONG   type = 0;
 
+        status = HvQueryVirtualMemory(
+            req->TargetPid,
+            req->StartAddress,
+            &baseAddr,
+            &regionSize,
+            &protection,
+            &state,
+            &type);
+
+        if (NT_SUCCESS(status)) {
+            if (outLen >= sizeof(HV_QUERY_VM_RESPONSE)) {
+                PHV_QUERY_VM_RESPONSE resp = (PHV_QUERY_VM_RESPONSE)buffer;
+                resp->BaseAddress = baseAddr;
+                resp->RegionSize = regionSize;
+                resp->Protection = protection;
+                resp->State = state;
+                resp->Type = type;
+                info = sizeof(HV_QUERY_VM_RESPONSE);
+            }
+        }
+        break;
+    }
     /* ---- 读取日志环形缓冲区 (R3 轮询) ---- */
     case IOCTL_SVM_READ_LOG:
     {
@@ -313,14 +348,14 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
  *  Communication thread (runs at PASSIVE_LEVEL)
  * ======================================================================== */
 
-/**
- * @brief 通信工作线程 - 轮询保护请求、执行PEB伪装、卸载时统一清理
- * @author yewilliam
- * @date 2026/03/16
- * @param [in] Context - 未使用
- * @note 运行在PASSIVE_LEVEL, 1秒轮询间隔
- *       卸载流程: 清除保护→drain等待→IPI卸载Hook→IPI退出SVM→释放资源
- */
+ /**
+  * @brief 通信工作线程 - 轮询保护请求、执行PEB伪装、卸载时统一清理
+  * @author yewilliam
+  * @date 2026/03/16
+  * @param [in] Context - 未使用
+  * @note 运行在PASSIVE_LEVEL, 1秒轮询间隔
+  *       卸载流程: 清除保护→drain等待→IPI卸载Hook→IPI退出SVM→释放资源
+  */
 VOID CommunicationThread(PVOID Context)
 {
     UNREFERENCED_PARAMETER(Context);
@@ -362,27 +397,44 @@ VOID CommunicationThread(PVOID Context)
     }
 
     // ================================================================
-    // 统一卸载清理流程
+    // [FIX-v14] 统一卸载清理流程
+    //
+    // 关键改动:
+    //   1. 先清除保护/升权列表 → Hook 快速路径 (count==0 → 直接返回)
+    //   2. 先 drain 调试线程 (DbgUninitialize) → 唤醒所有阻塞的 KeWait
+    //   3. 增加 drain 时间 → 确保所有 CPU 退出 Hook 函数
+    //   4. 再 IPI 卸载 Hook → 此时无 CPU 在 Hook 中持有锁
     // ================================================================
     SvmDebugPrint("[INFO] CommunicationThread: Unload signal received, starting cleanup...\n");
 
+    /* Step 1: 清除所有保护/升权列表
+     * Hook 函数看到 count==0 → 直接调原函数, 不获取任何锁 */
     ClearAllProtectedTargets();
+    ClearAllElevatedPids();
     MemoryBarrier();
 
+    /* Step 2: 唤醒所有阻塞在调试事件上的线程
+     * DbgUninitialize 内部: 标记 DELETE_PENDING → KeSetEvent 唤醒 → 等 2s drain
+     * 必须在 IPI 之前做, 否则阻塞的线程占住 CPU → IPI 死锁 */
+    SvmDebugPrint("[INFO] Draining debug subsystem...\n");
+    DbgUninitialize();
+    SvmDebugPrint("[INFO] Debug subsystem drained.\n");
+
+    /* Step 3: 等待所有 Hook 执行完毕 (保护列表已清零, Hook 会快速返回) */
     {
         LARGE_INTEGER drainDelay;
-        drainDelay.QuadPart = -20000000LL; // 2s
+        drainDelay.QuadPart = -50000000LL; /* 5s (原来 2s, 32 核需要更长) */
         KeDelayExecutionThread(KernelMode, FALSE, &drainDelay);
     }
     SvmDebugPrint("[INFO] Hook drain complete.\n");
 
-
+    /* Step 4: IPI 卸载 NPT Hook (恢复原始页面) */
     KeIpiGenericCall(IpiUninstallHookBroadcastCallback, 0);
     SvmDebugPrint("[INFO] All NPT hooks deactivated (original pages restored).\n");
 
     {
         LARGE_INTEGER hookDrainDelay;
-        hookDrainDelay.QuadPart = -30000000LL; // 3s
+        hookDrainDelay.QuadPart = -30000000LL; /* 3s */
         KeDelayExecutionThread(KernelMode, FALSE, &hookDrainDelay);
     }
 
@@ -406,13 +458,13 @@ VOID CommunicationThread(PVOID Context)
 
     {
         LARGE_INTEGER drainDelay2;
-        drainDelay2.QuadPart = -10000000LL; // 1s
+        drainDelay2.QuadPart = -10000000LL; /* 1s */
         KeDelayExecutionThread(KernelMode, FALSE, &drainDelay2);
     }
 
     /* SVM 已完全退出, 安全释放所有资源 */
     HvFreeSharedContext();
-    DbgUninitialize();
+    /* DbgUninitialize 已在 Step 2 完成, 不重复调用 */
     CleanupAllNptHooks();
     ReleaseDriverResources();
 
@@ -431,15 +483,15 @@ VOID CommunicationThread(PVOID Context)
  *  Delayed hook activation thread
  * ======================================================================== */
 
-/**
- * @brief 延迟Hook安装线程 - 初始化Hook→准备资源→拆分大页→激活NPT Hook
- * @author yewilliam
- * @date 2026/03/16
- * @param [in] Context - 未使用
- * @note 完整流程: InitializeProcessHideHooks → PrepareAllNptHookResources
- *       → LinkTrampolineAddresses → 解析TargetPa → PreSplitLargePageByPa
- *       → PrewarmPtVaCache → ActivateAllNptHooks → IPI广播激活
- */
+ /**
+  * @brief 延迟Hook安装线程 - 初始化Hook→准备资源→拆分大页→激活NPT Hook
+  * @author yewilliam
+  * @date 2026/03/16
+  * @param [in] Context - 未使用
+  * @note 完整流程: InitializeProcessHideHooks → PrepareAllNptHookResources
+  *       → LinkTrampolineAddresses → 解析TargetPa → PreSplitLargePageByPa
+  *       → PrewarmPtVaCache → ActivateAllNptHooks → IPI广播激活
+  */
 VOID DelayedHookWorkItemRoutine(PVOID Context)
 {
     UNREFERENCED_PARAMETER(Context);
@@ -554,13 +606,13 @@ VOID DelayedHookWorkItemRoutine(PVOID Context)
  *  IPI 回调
  * ======================================================================== */
 
-/**
- * @brief IPI回调: 在所有CPU上通过CPUID超级调用刷新NPT TLB激活Hook
- * @author yewilliam
- * @date 2026/03/16
- * @param [in] Argument - 未使用
- * @return 0
- */
+ /**
+  * @brief IPI回调: 在所有CPU上通过CPUID超级调用刷新NPT TLB激活Hook
+  * @author yewilliam
+  * @date 2026/03/16
+  * @param [in] Argument - 未使用
+  * @return 0
+  */
 ULONG_PTR IpiActivateHookBroadcastCallback(ULONG_PTR Argument)
 {
     UNREFERENCED_PARAMETER(Argument);
@@ -630,12 +682,12 @@ ULONG_PTR IpiUninstallHookBroadcastCallback(ULONG_PTR Argument)
 /* ========================================================================
  *  DriverUnload — 删除设备/符号链接, 通知 CommunicationThread 退出
  * ======================================================================== */
-/**
- * @brief 驱动卸载入口 - 通知CommunicationThread退出并等待, 删除设备/符号链接
- * @author yewilliam
- * @date 2026/03/16
- * @param [in] DriverObject - 驱动对象
- */
+ /**
+  * @brief 驱动卸载入口 - 通知CommunicationThread退出并等待, 删除设备/符号链接
+  * @author yewilliam
+  * @date 2026/03/16
+  * @param [in] DriverObject - 驱动对象
+  */
 void UnloadDriver(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
@@ -646,9 +698,11 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject)
     MemoryBarrier();
 
     if (g_WorkerThreadHandle) {
-        /* 等待 CommunicationThread 完成清理, 最多30秒 */
+        /* [FIX-v14] 等待 CommunicationThread 完成清理
+         * 新的卸载流程: DbgUninitialize(2s) + drain(5s) + IPI(3s) + SVM exit(1s) ≈ 11s
+         * 设 60s 超时留足够余量 */
         LARGE_INTEGER waitTimeout;
-        waitTimeout.QuadPart = -300000000LL; // 30 seconds
+        waitTimeout.QuadPart = -600000000LL; // 60 seconds
         NTSTATUS waitStatus = ZwWaitForSingleObject(g_WorkerThreadHandle, FALSE, &waitTimeout);
         if (waitStatus == STATUS_TIMEOUT) {
             SvmDebugPrint("[DrvMain] WARNING: CommunicationThread wait timed out!\n");
@@ -699,15 +753,15 @@ VOID TriggerGlobalHookActivation() {
  *  SVM 初始化系统线程
  * ======================================================================== */
 
-/**
- * @brief SVM初始化系统线程 - 分配VCPU资源、构建NPT、IPI广播启动SVM
- * @author yewilliam
- * @date 2026/03/16
- * @param [in] StartContext - 未使用
- * @note 在System进程上下文运行, 独立线程避免阻塞DriverEntry返回
- *       流程: AMD支持检查 → 分配VCPU_CONTEXT × N核 → PrepareNPT
- *       → HvInitSharedContext → IPI InitSVMCORE → 启动通信线程和Hook线程
- */
+ /**
+  * @brief SVM初始化系统线程 - 分配VCPU资源、构建NPT、IPI广播启动SVM
+  * @author yewilliam
+  * @date 2026/03/16
+  * @param [in] StartContext - 未使用
+  * @note 在System进程上下文运行, 独立线程避免阻塞DriverEntry返回
+  *       流程: AMD支持检查 → 分配VCPU_CONTEXT × N核 → PrepareNPT
+  *       → HvInitSharedContext → IPI InitSVMCORE → 启动通信线程和Hook线程
+  */
 VOID SvmInitSystemThread(PVOID StartContext)
 {
     UNREFERENCED_PARAMETER(StartContext);
@@ -774,7 +828,8 @@ VOID SvmInitSystemThread(PVOID StartContext)
         NTSTATUS dbgStatus = DbgInitialize();
         if (NT_SUCCESS(dbgStatus)) {
             SvmDebugPrint("[SVM] Debug subsystem initialized.\n");
-        } else {
+        }
+        else {
             SvmDebugPrint("[WARN] DbgInitialize failed: 0x%X (non-fatal)\n", dbgStatus);
         }
     }
@@ -830,14 +885,14 @@ VOID SvmInitSystemThread(PVOID StartContext)
  *    sc stop   SvmDebug
  *    sc delete SvmDebug
  * ======================================================================== */
-/**
- * @brief 驱动主入口 - 创建设备对象/符号链接, 启动SVM初始化线程
- * @author yewilliam
- * @date 2026/03/16
- * @param [in] DriverObject - WDM驱动对象
- * @param [in] RegistryPath - 注册表路径(未使用)
- * @return STATUS_SUCCESS或设备创建/线程创建错误码
- */
+ /**
+  * @brief 驱动主入口 - 创建设备对象/符号链接, 启动SVM初始化线程
+  * @author yewilliam
+  * @date 2026/03/16
+  * @param [in] DriverObject - WDM驱动对象
+  * @param [in] RegistryPath - 注册表路径(未使用)
+  * @return STATUS_SUCCESS或设备创建/线程创建错误码
+  */
 EXTERN_C NTSTATUS DriverEntry(
     _In_ PDRIVER_OBJECT  DriverObject,
     _In_ PUNICODE_STRING RegistryPath)
@@ -883,10 +938,10 @@ EXTERN_C NTSTATUS DriverEntry(
     }
 
     /* ---- IRP 派发表 ---- */
-    DriverObject->MajorFunction[IRP_MJ_CREATE]         = DispatchCreateClose;
-    DriverObject->MajorFunction[IRP_MJ_CLOSE]          = DispatchCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CREATE] = DispatchCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLOSE] = DispatchCreateClose;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = DispatchDeviceControl;
-    DriverObject->DriverUnload                         = UnloadDriver;
+    DriverObject->DriverUnload = UnloadDriver;
 
     /* ---- 启动 SVM 初始化线程 (不阻塞 DriverEntry 返回) ---- */
     HANDLE hThread;

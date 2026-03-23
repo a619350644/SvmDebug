@@ -61,6 +61,7 @@ NTSTATUS HideDriver(PDRIVER_OBJECT DriverObject)
 
     PKLDR_DATA_TABLE_ENTRY pLdrEntry = (PKLDR_DATA_TABLE_ENTRY)DriverObject->DriverSection;
 
+    /* 从 PsLoadedModuleList 链表中摘除 — 驱动枚举不可见 */
     if (pLdrEntry->InLoadOrderLinks.Flink && pLdrEntry->InLoadOrderLinks.Blink) {
         PLIST_ENTRY Prev = pLdrEntry->InLoadOrderLinks.Blink;
         PLIST_ENTRY Next = pLdrEntry->InLoadOrderLinks.Flink;
@@ -72,7 +73,9 @@ NTSTATUS HideDriver(PDRIVER_OBJECT DriverObject)
 
     DriverObject->DriverInit = NULL;
     DriverObject->DriverStartIo = NULL;
-    DriverObject->DriverUnload = NULL;
+    /* [FIX] 不置空 DriverUnload — 否则 sc stop 无法调用卸载函数!
+     * DriverUnload 指针不在模块枚举结果中, 保留它不影响隐蔽性 */
+     // DriverObject->DriverUnload = NULL;  // 删除这行!
     DriverObject->DriverSize = 0;
 
     if (DriverObject->DriverName.Buffer) {
@@ -80,9 +83,10 @@ NTSTATUS HideDriver(PDRIVER_OBJECT DriverObject)
         DriverObject->DriverName.Length = 0;
     }
 
-    SvmDebugPrint("[INFO] Driver successfully unlinked and hidden.\n");
+    SvmDebugPrint("[INFO] Driver successfully unlinked and hidden (unload preserved).\n");
     return STATUS_SUCCESS;
 }
+
 /**
  * @brief 获取SSDT中Nt函数的真实内核地址 - 通过Zw桩函数提取索引再查SSDT
  * @author yewilliam

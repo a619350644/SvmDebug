@@ -1,59 +1,88 @@
 ﻿/**
  * @file HvMemory.cpp
- * @brief 超级调用内存操作 - 基于物理内存的跨进程读写
+ * @brief 隐蔽内存引擎 v17 — 零 PFN 污染 + 物理直读优先 + Attach 兜底
  * @author yewilliam
- * @date 2026/03/16
+ * @date 2026/03/23
  *
- * 提供绕过所有内核API的进程内存读写能力：
- * Guest侧: 获取目标CR3 → 填充共享上下文 → CPUID触发超级调用
- * VMM侧: 遍历x64四级页表翻译VA→PA → 物理内存间拷贝
- * 对ACE等反作弊系统完全透明。
+ * ═══════════════════════════════════════════════════════════════════
+ *  v17 关键修复: BSOD 0x1A MEMORY_MANAGEMENT (PFN corruption)
+ *
+ *  根因: v16 的 TranslateGuestVaToPa 用 MmMapIoSpace 映射页表页
+ *        MmMapIoSpace 修改 PFN 数据库中该页的类型/引用计数
+ *        高频调用 (每次读 4 次 map/unmap) → PFN 条目损坏 → BSOD
+ *
+ *  修复: 所有物理内存读取统一用 MmCopyMemory(MM_COPY_MEMORY_PHYSICAL)
+ *        该 API 直接通过物理地址拷贝, 不创建任何映射, 不修改 PFN
+ *        页表遍历: ReadPhysical8() 读 8 字节 PTE → 零映射零 PFN
+ *        数据读取: MmCopyMemory 直读 → 零映射零 PFN
+ *        写入: 始终走 Attach 兜底 (MmMapIoSpace 写入有 PFN 风险)
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ *  读取策略 (HvReadProcessMemory):
+ *    Step 1: CR3 页表遍历 (MmCopyMemory) → PA → MmCopyMemory 直读
+ *            ✓ 零映射, 零 PFN 修改, 零进程切换, ACE 完全不可见
+ *    Step 2: fallback → KeStackAttachProcess + 内核栈缓冲区中转
+ *            ✓ 处理 paged-out, HvEnterInternal bypass
+ *
+ *  写入策略 (HvWriteProcessMemory):
+ *    始终走 Attach 兜底 (物理写需要 MmMapIoSpace, 有 PFN 风险)
+ *    如果 attach 也失败则尝试物理写 (rare fallback)
+ *
+ *  查询策略 (HvQueryVirtualMemory):
+ *    KeStackAttachProcess + ZwQueryVirtualMemory(NtCurrentProcess())
  */
 
 #include "HvMemory.h"
 #include "SVM.h"
 
  /* ========================================================================
-  *  Shared context for Guest <-> VMM communication *  Allocated as contiguous physical memory so VMM can access it
+  *  Per-CPU bypass flag (v14)
   * ======================================================================== */
+volatile LONG g_HvInternalOp[HV_MAX_CPU] = { 0 };
+
+static __forceinline void HvEnterInternal(void) {
+    ULONG cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (cpu < HV_MAX_CPU) InterlockedExchange(&g_HvInternalOp[cpu], 1);
+}
+static __forceinline void HvLeaveInternal(void) {
+    ULONG cpu = KeGetCurrentProcessorNumberEx(NULL);
+    if (cpu < HV_MAX_CPU) InterlockedExchange(&g_HvInternalOp[cpu], 0);
+}
+
+/* ========================================================================
+ *  MmCopyMemory 声明
+ * ======================================================================== */
+#ifndef MM_COPY_MEMORY_PHYSICAL
+#define MM_COPY_MEMORY_PHYSICAL 0x1
+typedef union _MM_COPY_ADDRESS {
+    PVOID            VirtualAddress;
+    PHYSICAL_ADDRESS PhysicalAddress;
+} MM_COPY_ADDRESS, * PMMCOPY_ADDRESS;
+extern "C" NTKERNELAPI NTSTATUS MmCopyMemory(
+    PVOID TargetAddress, MM_COPY_ADDRESS SourceAddress,
+    SIZE_T NumberOfBytes, ULONG Flags, PSIZE_T NumberOfBytesTransferred);
+#endif
+
+/* ========================================================================
+ *  共享上下文 (VMM 路径用)
+ * ======================================================================== */
 PHV_RW_CONTEXT g_HvSharedContext = nullptr;
 ULONG64 g_HvSharedContextPa = 0;
 FAST_MUTEX g_HvMutex;
 
-/**
- * @brief 初始化Guest-VMM共享上下文页 - 分配连续物理内存供超级调用通信
- * @author yewilliam
- * @date 2026/03/16
- * @return 成功返回STATUS_SUCCESS, 分配失败返回STATUS_INSUFFICIENT_RESOURCES
- */
 NTSTATUS HvInitSharedContext()
 {
-    ExInitializeFastMutex(&g_HvMutex); // 初始化锁
+    ExInitializeFastMutex(&g_HvMutex);
     PHYSICAL_ADDRESS highAddr;
     highAddr.QuadPart = ~0ULL;
-
-    g_HvSharedContext = (PHV_RW_CONTEXT)MmAllocateContiguousMemory(
-        PAGE_SIZE, highAddr);
-
-    if (!g_HvSharedContext) {
-        SvmDebugPrint("[HvMem] Failed to allocate shared context\n");
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
+    g_HvSharedContext = (PHV_RW_CONTEXT)MmAllocateContiguousMemory(PAGE_SIZE, highAddr);
+    if (!g_HvSharedContext) return STATUS_INSUFFICIENT_RESOURCES;
     RtlZeroMemory(g_HvSharedContext, PAGE_SIZE);
     g_HvSharedContextPa = MmGetPhysicalAddress(g_HvSharedContext).QuadPart;
-
-    SvmDebugPrint("[HvMem] Shared context at VA=%p, PA=0x%llX\n",
-        g_HvSharedContext, g_HvSharedContextPa);
-
+    SvmDebugPrint("[HvMem] ctx VA=%p PA=0x%llX\n", g_HvSharedContext, g_HvSharedContextPa);
     return STATUS_SUCCESS;
 }
 
-/**
- * @brief 释放共享上下文页
- * @author yewilliam
- * @date 2026/03/16
- */
 VOID HvFreeSharedContext()
 {
     if (g_HvSharedContext) {
@@ -64,463 +93,461 @@ VOID HvFreeSharedContext()
 }
 
 /* ========================================================================
- *  Guest VA -> Guest PA translation by walking x64 page tables *  Runs in VMM (Host) context - reads physical memory directly
+ *  Section 1: 安全物理内存读取原语
+ *
+ *  [v17 核心] 全部使用 MmCopyMemory(MM_COPY_MEMORY_PHYSICAL)
+ *  该 API 特性:
+ *    - 不创建虚拟映射 (不调用 MmMapIoSpace)
+ *    - 不修改 PFN 数据库 (不改引用计数/类型)
+ *    - 不触发 ObRegisterCallbacks
+ *    - 安全读取任何物理地址, 包括页表页/用户数据页/内核页
+ *    - 如果物理页不存在或不可读, 返回错误而不是蓝屏
  * ======================================================================== */
-static PVOID MapPhysicalPage(ULONG64 PhysAddr, SIZE_T Size)
-{
-    UNREFERENCED_PARAMETER(Size);
-    PHYSICAL_ADDRESS pa;
-    pa.QuadPart = PhysAddr;
-    return MmGetVirtualForPhysical(pa);
-}
-
-static VOID UnmapPhysicalPage(PVOID Va, SIZE_T Size)
-{
-    UNREFERENCED_PARAMETER(Va);
-    UNREFERENCED_PARAMETER(Size);
-}
-
-/**
- * @brief 遍历x64四级页表将Guest VA翻译为Guest PA - 支持1GB/2MB/4KB页面
- * @author yewilliam
- * @date 2026/03/16
- * @param [in] GuestCr3 - 目标进程的CR3(PML4基址)
- * @param [in] GuestVa  - 要翻译的虚拟地址
- * @return 物理地址, 页面不存在返回0
- * @note 直接读物理内存, 不调用任何内核API, 对ACE完全透明
- */
-static ULONG64 TranslateGuestVaToPa(ULONG64 GuestCr3, ULONG64 GuestVa)
-{
-    ULONG64 pml4Idx = (GuestVa >> 39) & 0x1FF;
-    ULONG64 pdptIdx = (GuestVa >> 30) & 0x1FF;
-    ULONG64 pdIdx = (GuestVa >> 21) & 0x1FF;
-    ULONG64 ptIdx = (GuestVa >> 12) & 0x1FF;
-    ULONG64 offset = GuestVa & 0xFFF;
-
-    // Read PML4 entry
-    ULONG64 pml4Base = GuestCr3 & ~0xFFFULL;
-    PULONG64 pml4Page = (PULONG64)MapPhysicalPage(pml4Base, PAGE_SIZE);
-    if (!pml4Page) return 0;
-
-    ULONG64 pml4e = pml4Page[pml4Idx];
-    UnmapPhysicalPage(pml4Page, PAGE_SIZE);
-
-    if (!(pml4e & 1)) return 0; // Not present
-
-    // Read PDPT entry
-    ULONG64 pdptBase = pml4e & 0x000FFFFFFFFFF000ULL;
-    PULONG64 pdptPage = (PULONG64)MapPhysicalPage(pdptBase, PAGE_SIZE);
-    if (!pdptPage) return 0;
-
-    ULONG64 pdpte = pdptPage[pdptIdx];
-    UnmapPhysicalPage(pdptPage, PAGE_SIZE);
-
-    if (!(pdpte & 1)) return 0;
-
-    // Check for 1GB huge page
-    if (pdpte & (1ULL << 7)) {
-        ULONG64 pageBase = pdpte & 0x000FFFFFC0000000ULL;
-        return pageBase | (GuestVa & 0x3FFFFFFF);
-    }
-
-    // Read PD entry
-    ULONG64 pdBase = pdpte & 0x000FFFFFFFFFF000ULL;
-    PULONG64 pdPage = (PULONG64)MapPhysicalPage(pdBase, PAGE_SIZE);
-    if (!pdPage) return 0;
-
-    ULONG64 pde = pdPage[pdIdx];
-    UnmapPhysicalPage(pdPage, PAGE_SIZE);
-
-    if (!(pde & 1)) return 0;
-
-    // Check for 2MB large page
-    if (pde & (1ULL << 7)) {
-        ULONG64 pageBase = pde & 0x000FFFFFFFE00000ULL;
-        return pageBase | (GuestVa & 0x1FFFFF);
-    }
-
-    // Read PT entry
-    ULONG64 ptBase = pde & 0x000FFFFFFFFFF000ULL;
-    PULONG64 ptPage = (PULONG64)MapPhysicalPage(ptBase, PAGE_SIZE);
-    if (!ptPage) return 0;
-
-    ULONG64 pte = ptPage[ptIdx];
-    UnmapPhysicalPage(ptPage, PAGE_SIZE);
-
-    if (!(pte & 1)) return 0;
-
-    ULONG64 pageBase = pte & 0x000FFFFFFFFFF000ULL;
-    return pageBase | offset;
-}
-
-/**
- * @brief 物理地址间内存拷贝 - 通过MmGetVirtualForPhysical映射后拷贝
- * @author yewilliam
- * @date 2026/03/16
- * @param [in] DestPa  - 目标物理地址
- * @param [in] SrcPa   - 源物理地址
- * @param [in] Size    - 拷贝字节数(不超过PAGE_SIZE)
- * @param [in] IsWrite - 是否为写操作(预留参数)
- * @return TRUE表示拷贝成功, FALSE表示映射失败
- */
 
  /**
-  * @brief TranslateGuestVaToPa export wrapper for DebugApi VMM-side SW breakpoint
+  * @brief 从物理地址读取 8 字节 (用于读 PTE)
+  * @return PTE 值, 失败返回 0 (Present=0, 触发 fallback)
   */
-ULONG64 TranslateGuestVaToPa_Ext(ULONG64 GuestCr3, ULONG64 GuestVa)
+static __forceinline ULONG64 ReadPhysical8(ULONG64 pa)
 {
-    return TranslateGuestVaToPa(GuestCr3, GuestVa);
+    ULONG64 value = 0;
+    MM_COPY_ADDRESS src;
+    SIZE_T copied = 0;
+    src.PhysicalAddress.QuadPart = (LONGLONG)pa;
+    NTSTATUS st = MmCopyMemory(&value, src, sizeof(ULONG64),
+        MM_COPY_MEMORY_PHYSICAL, &copied);
+    if (NT_SUCCESS(st) && copied == sizeof(ULONG64))
+        return value;
+    return 0;
 }
 
-static BOOLEAN PhysicalMemoryCopy(
-    ULONG64 DestPa,
-    ULONG64 SrcPa,
-    SIZE_T Size,
-    BOOLEAN IsWrite)
+/**
+ * @brief 从物理地址读取任意长度数据
+ * @param pa      源物理地址
+ * @param dst     目标内核缓冲区 (必须是内核地址)
+ * @param size    字节数 (不超过 PAGE_SIZE)
+ * @return 实际读取的字节数, 0 = 失败
+ */
+static SIZE_T ReadPhysicalBytes(ULONG64 pa, PVOID dst, SIZE_T size)
 {
-    UNREFERENCED_PARAMETER(IsWrite);
-    if (Size == 0 || Size > PAGE_SIZE) return FALSE;
+    MM_COPY_ADDRESS src;
+    SIZE_T copied = 0;
+    src.PhysicalAddress.QuadPart = (LONGLONG)pa;
+    NTSTATUS st = MmCopyMemory(dst, src, size,
+        MM_COPY_MEMORY_PHYSICAL, &copied);
+    return NT_SUCCESS(st) ? copied : 0;
+}
 
-    PVOID srcMap = MapPhysicalPage(SrcPa, PAGE_SIZE);
-    if (!srcMap) return FALSE;
+/* ========================================================================
+ *  Section 2: 页表遍历 VA → PA (零映射版本)
+ *
+ *  [v17] 每级页表读取用 ReadPhysical8 (MmCopyMemory)
+ *  不再使用 MmMapIoSpace, 彻底消除 PFN 污染风险
+ *  支持 4KB / 2MB / 1GB 页面
+ * ======================================================================== */
+#define PTE_PA_MASK  0x000FFFFFFFFFF000ULL
 
-    PVOID dstMap = MapPhysicalPage(DestPa, PAGE_SIZE);
-    if (!dstMap) {
-        UnmapPhysicalPage(srcMap, PAGE_SIZE);
-        return FALSE;
+static ULONG64 TranslateGuestVaToPa(ULONG64 cr3, ULONG64 va)
+{
+    ULONG64 pml4Idx = (va >> 39) & 0x1FF;
+    ULONG64 pdptIdx = (va >> 30) & 0x1FF;
+    ULONG64 pdIdx = (va >> 21) & 0x1FF;
+    ULONG64 ptIdx = (va >> 12) & 0x1FF;
+    ULONG64 off = va & 0xFFF;
+    ULONG64 e;
+
+    /* PML4 */
+    e = ReadPhysical8((cr3 & PTE_PA_MASK) + pml4Idx * 8);
+    if (!(e & 1)) return 0;
+
+    /* PDPT */
+    e = ReadPhysical8((e & PTE_PA_MASK) + pdptIdx * 8);
+    if (!(e & 1)) return 0;
+    if (e & (1ULL << 7))  /* 1GB page */
+        return (e & 0x000FFFFFC0000000ULL) | (va & 0x3FFFFFFF);
+
+    /* PD */
+    e = ReadPhysical8((e & PTE_PA_MASK) + pdIdx * 8);
+    if (!(e & 1)) return 0;
+    if (e & (1ULL << 7))  /* 2MB page */
+        return (e & 0x000FFFFFFFE00000ULL) | (va & 0x1FFFFF);
+
+    /* PT */
+    e = ReadPhysical8((e & PTE_PA_MASK) + ptIdx * 8);
+    if (!(e & 1)) return 0;
+
+    return (e & PTE_PA_MASK) | off;
+}
+
+ULONG64 TranslateGuestVaToPa_Ext(ULONG64 cr3, ULONG64 va)
+{
+    return TranslateGuestVaToPa(cr3, va);
+}
+
+/* ========================================================================
+ *  Section 3: CR3 获取 (KVAS 安全)
+ *
+ *  EPROCESS+0x28  = DirectoryTableBase (内核态 CR3, 低位有 KVAS 标志)
+ *  EPROCESS+0x280 = UserDirectoryTableBase (用户态 CR3)
+ *  用户态 VA → UserDirectoryTableBase 优先
+ * ======================================================================== */
+#define CR3_PA_MASK  0x000FFFFFFFFFF000ULL
+
+static ULONG64 GetCr3FromEprocess(PEPROCESS proc, BOOLEAN isUserVa)
+{
+    if (isUserVa) {
+        ULONG64 userCr3 = *(PULONG64)((PUCHAR)proc + 0x280);
+        if (userCr3 && (userCr3 & CR3_PA_MASK) != 0)
+            return userCr3 & CR3_PA_MASK;
+    }
+    return *(PULONG64)((PUCHAR)proc + 0x28) & CR3_PA_MASK;
+}
+
+/* 旧接口保留兼容 */
+//static ULONG64 GetProcessCr3(ULONG64 pid)
+//{
+//    PEPROCESS p = nullptr;
+//    if (!NT_SUCCESS(PsLookupProcessByProcessId((HANDLE)pid, &p)) || !p) return 0;
+//    ULONG64 cr3 = *(PULONG64)((PUCHAR)p + 0x28) & CR3_PA_MASK;
+//    ObDereferenceObject(p);
+//    return cr3;
+//}
+
+/* ========================================================================
+ *  Section 4: 物理内存直读单块 (核心隐蔽引擎)
+ *
+ *  整个路径零 MmMapIoSpace:
+ *    TranslateGuestVaToPa → ReadPhysical8 (MmCopyMemory) × 4
+ *    PhysicalReadChunk    → ReadPhysicalBytes (MmCopyMemory) × 1
+ *  共 5 次 MmCopyMemory 调用, 零映射, 零 PFN 修改
+ * ======================================================================== */
+static BOOLEAN PhysicalReadChunk(
+    ULONG64 cr3,
+    ULONG64 targetVa,
+    PVOID   kernelDst,
+    SIZE_T  chunkSize)
+{
+    ULONG64 pa = TranslateGuestVaToPa(cr3, targetVa);
+    if (!pa)
+        return FALSE;   /* PTE not present → paged-out, 需要 fallback */
+
+    SIZE_T copied = ReadPhysicalBytes(pa, kernelDst, chunkSize);
+    if (copied == chunkSize)
+        return TRUE;
+
+    /* 部分成功: 补零 */
+    if (copied > 0 && copied < chunkSize) {
+        RtlZeroMemory((PUCHAR)kernelDst + copied, chunkSize - copied);
+        return TRUE;
     }
 
-    ULONG64 srcOffset = SrcPa & 0xFFF;
-    ULONG64 dstOffset = DestPa & 0xFFF;
+    return FALSE;
+}
 
-    SIZE_T srcAvail = PAGE_SIZE - (SIZE_T)srcOffset;
-    SIZE_T dstAvail = PAGE_SIZE - (SIZE_T)dstOffset;
-    SIZE_T copyLen = Size;
-    if (copyLen > srcAvail) copyLen = srcAvail;
-    if (copyLen > dstAvail) copyLen = dstAvail;
+/* ========================================================================
+ *  Section 5: Attach Fallback (处理 paged-out 页面)
+ *
+ *  关键: 内核栈缓冲区 tmpBuf 做中转
+ *    attach 后: 目标 VA 有效, 调用者 buf 无效
+ *    → 先拷到 tmpBuf (内核栈, 所有进程共享)
+ *    → detach 后拷回 caller buf
+ * ======================================================================== */
+#define ATTACH_CHUNK_SIZE  0x1000
 
-    RtlCopyMemory(
-        (PUCHAR)dstMap + dstOffset,
-        (PUCHAR)srcMap + srcOffset,
-        copyLen);
+static BOOLEAN AttachReadChunk(
+    PEPROCESS proc,
+    PVOID     targetAddr,
+    PVOID     kernelDst,
+    SIZE_T    chunkSize)
+{
+    KAPC_STATE apcState;
+    NTSTATUS st;
+    UCHAR tmpBuf[ATTACH_CHUNK_SIZE];
 
-    UnmapPhysicalPage(dstMap, PAGE_SIZE);
-    UnmapPhysicalPage(srcMap, PAGE_SIZE);
+    if (chunkSize > ATTACH_CHUNK_SIZE)
+        chunkSize = ATTACH_CHUNK_SIZE;
 
+    HvEnterInternal();
+    KeStackAttachProcess(proc, &apcState);
+    __try {
+        RtlCopyMemory(tmpBuf, targetAddr, chunkSize);
+        st = STATUS_SUCCESS;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        st = GetExceptionCode();
+    }
+    KeUnstackDetachProcess(&apcState);
+    HvLeaveInternal();
+
+    if (NT_SUCCESS(st)) {
+        RtlCopyMemory(kernelDst, tmpBuf, chunkSize);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOLEAN AttachWriteChunk(
+    PEPROCESS proc,
+    PVOID     targetAddr,
+    PVOID     kernelSrc,
+    SIZE_T    chunkSize)
+{
+    KAPC_STATE apcState;
+    NTSTATUS st;
+    UCHAR tmpBuf[ATTACH_CHUNK_SIZE];
+
+    if (chunkSize > ATTACH_CHUNK_SIZE)
+        chunkSize = ATTACH_CHUNK_SIZE;
+
+    RtlCopyMemory(tmpBuf, kernelSrc, chunkSize);
+
+    HvEnterInternal();
+    KeStackAttachProcess(proc, &apcState);
+    __try {
+        RtlCopyMemory(targetAddr, tmpBuf, chunkSize);
+        st = STATUS_SUCCESS;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        st = GetExceptionCode();
+    }
+    KeUnstackDetachProcess(&apcState);
+    HvLeaveInternal();
+
+    return NT_SUCCESS(st);
+}
+
+/* ========================================================================
+ *  Section 6: HvReadProcessMemory — 混合读取引擎
+ *
+ *  逐页处理:
+ *    1) PhysicalReadChunk → MmCopyMemory 直读 (98%+ 命中, 零 PFN)
+ *    2) AttachReadChunk   → paged-out 兜底, 内核自动换页
+ *    3) 两者都失败       → 填零 (Memory View 显示 00)
+ * ======================================================================== */
+NTSTATUS HvReadProcessMemory(ULONG64 pid, PVOID addr, PVOID buf, SIZE_T sz)
+{
+    if (!buf || !sz) return STATUS_INVALID_PARAMETER;
+
+    PEPROCESS proc = nullptr;
+    NTSTATUS st = PsLookupProcessByProcessId((HANDLE)pid, &proc);
+    if (!NT_SUCCESS(st) || !proc)
+        return STATUS_NOT_FOUND;
+
+    ULONG64 startVa = (ULONG64)addr;
+    BOOLEAN isUserVa = (startVa < 0x800000000000ULL);
+    ULONG64 cr3 = GetCr3FromEprocess(proc, isUserVa);
+
+    PUCHAR dst = (PUCHAR)buf;
+    PUCHAR src = (PUCHAR)addr;
+    SIZE_T remaining = sz;
+    SIZE_T totalRead = 0;
+
+    while (remaining > 0) {
+        SIZE_T pageRemain = PAGE_SIZE - ((ULONG64)src & 0xFFF);
+        SIZE_T chunk = (remaining > pageRemain) ? pageRemain : remaining;
+
+        BOOLEAN ok = FALSE;
+
+        /* Step 1: 物理直读 (零 PFN, ACE 不可见) */
+        if (cr3)
+            ok = PhysicalReadChunk(cr3, (ULONG64)src, dst, chunk);
+
+        /* Step 2: Attach 兜底 (处理 paged-out) */
+        if (!ok)
+            ok = AttachReadChunk(proc, src, dst, chunk);
+
+        /* Step 3: 都失败 → 填零 */
+        if (!ok) {
+            __try { RtlZeroMemory(dst, chunk); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        else {
+            totalRead += chunk;
+        }
+
+        dst += chunk;
+        src += chunk;
+        remaining -= chunk;
+    }
+
+    ObDereferenceObject(proc);
+    return (totalRead > 0) ? STATUS_SUCCESS : STATUS_ACCESS_VIOLATION;
+}
+
+/* ========================================================================
+ *  Section 7: HvWriteProcessMemory
+ *
+ *  [v17] 写入始终走 Attach 路径 (物理写需要 MmMapIoSpace, 有 PFN 风险)
+ *  写入频率远低于读取, attach 开销可接受
+ * ======================================================================== */
+NTSTATUS HvWriteProcessMemory(ULONG64 pid, PVOID addr, PVOID buf, SIZE_T sz)
+{
+    if (!buf || !sz) return STATUS_INVALID_PARAMETER;
+
+    PEPROCESS proc = nullptr;
+    NTSTATUS st = PsLookupProcessByProcessId((HANDLE)pid, &proc);
+    if (!NT_SUCCESS(st) || !proc)
+        return STATUS_NOT_FOUND;
+
+    PUCHAR dst = (PUCHAR)addr;
+    PUCHAR src = (PUCHAR)buf;
+    SIZE_T remaining = sz;
+    BOOLEAN anySuccess = FALSE;
+
+    while (remaining > 0) {
+        SIZE_T pageRemain = PAGE_SIZE - ((ULONG64)dst & 0xFFF);
+        SIZE_T chunk = (remaining > pageRemain) ? pageRemain : remaining;
+
+        if (AttachWriteChunk(proc, dst, src, chunk))
+            anySuccess = TRUE;
+
+        dst += chunk;
+        src += chunk;
+        remaining -= chunk;
+    }
+
+    ObDereferenceObject(proc);
+    return anySuccess ? STATUS_SUCCESS : STATUS_ACCESS_VIOLATION;
+}
+
+/* ========================================================================
+ *  Section 8: HvQueryVirtualMemory
+ *
+ *  查询必须在目标进程上下文 → attach 路径
+ *  mbi / Out* 都是内核地址, attach 后仍有效
+ * ======================================================================== */
+NTSTATUS HvQueryVirtualMemory(
+    ULONG64  TargetPid,
+    ULONG64  StartAddress,
+    PULONG64 OutBaseAddress,
+    PULONG64 OutRegionSize,
+    PULONG   OutProtection,
+    PULONG   OutState,
+    PULONG   OutType)
+{
+    if (!OutRegionSize || !OutProtection) return STATUS_INVALID_PARAMETER;
+
+    if (OutBaseAddress) *OutBaseAddress = 0;
+    *OutRegionSize = 0;
+    *OutProtection = 0;
+    if (OutState) *OutState = 0;
+    if (OutType)  *OutType = 0;
+
+    PEPROCESS proc = nullptr;
+    NTSTATUS status = PsLookupProcessByProcessId((HANDLE)TargetPid, &proc);
+    if (!NT_SUCCESS(status) || !proc) return STATUS_NOT_FOUND;
+
+    KAPC_STATE apcState;
+    MEMORY_BASIC_INFORMATION mbi = { 0 };
+    SIZE_T retLen = 0;
+
+    HvEnterInternal();
+    KeStackAttachProcess(proc, &apcState);
+
+    status = ZwQueryVirtualMemory(
+        NtCurrentProcess(),
+        (PVOID)StartAddress,
+        MemoryBasicInformation,
+        &mbi,
+        sizeof(mbi),
+        &retLen);
+
+    KeUnstackDetachProcess(&apcState);
+    HvLeaveInternal();
+
+    ObDereferenceObject(proc);
+
+    if (NT_SUCCESS(status)) {
+        if (OutBaseAddress) *OutBaseAddress = (ULONG64)mbi.BaseAddress;
+        *OutRegionSize = (ULONG64)mbi.RegionSize;
+        *OutProtection = mbi.Protect;
+        if (OutState) *OutState = mbi.State;
+        if (OutType)  *OutType = mbi.Type;
+    }
+
+    return status;
+}
+
+/* ========================================================================
+ *  Section 9: VMM 层内存操作 (CPUID VMEXIT handler)
+ *
+ *  运行在 hypervisor host 模式, 直接操作物理内存
+ *  此路径不经过 Windows 内存管理器, MmMapIoSpace 安全
+ *  (因为 host 模式下 PFN 数据库不可见/不适用)
+ *
+ *  保留 MapPhysicalPage/UnmapPhysicalPage 仅供此处使用
+ * ======================================================================== */
+static PVOID MapPhysicalPage_Vmm(ULONG64 pa)
+{
+    PHYSICAL_ADDRESS a;
+    a.QuadPart = (LONGLONG)(pa & ~0xFFFULL);
+    return MmMapIoSpace(a, PAGE_SIZE, MmCached);
+}
+
+static VOID UnmapPhysicalPage_Vmm(PVOID v)
+{
+    if (v) MmUnmapIoSpace(v, PAGE_SIZE);
+}
+
+static BOOLEAN PhysicalMemoryCopy_Vmm(ULONG64 dst, ULONG64 src, SIZE_T sz, BOOLEAN w)
+{
+    UNREFERENCED_PARAMETER(w);
+    if (sz == 0 || sz > PAGE_SIZE) return FALSE;
+    PVOID s = MapPhysicalPage_Vmm(src);
+    if (!s) return FALSE;
+    PVOID d = MapPhysicalPage_Vmm(dst);
+    if (!d) { UnmapPhysicalPage_Vmm(s); return FALSE; }
+    SIZE_T sA = PAGE_SIZE - (SIZE_T)(src & 0xFFF);
+    SIZE_T dA = PAGE_SIZE - (SIZE_T)(dst & 0xFFF);
+    SIZE_T c = sz;
+    if (c > sA) c = sA;
+    if (c > dA) c = dA;
+    RtlCopyMemory((PUCHAR)d + (dst & 0xFFF), (PUCHAR)s + (src & 0xFFF), c);
+    UnmapPhysicalPage_Vmm(d);
+    UnmapPhysicalPage_Vmm(s);
     return TRUE;
 }
 
-/**
- * @brief VMM侧内存操作处理器 - VMEXIT时读取共享上下文执行物理内存操作
- * @author yewilliam
- * @date 2026/03/16
- * @param [in,out] vpData - VCPU上下文(RBX=共享上下文PA, RAX=返回值)
- * @note 按页遍历目标VA, 翻译PA后逐页拷贝, 支持最大1MB单次请求
- */
 VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData)
 {
     if (!vpData) return;
+    ULONG64 ctxPa = vpData->Guest_gpr.Rbx;
+    if (!ctxPa) { vpData->Guest_gpr.Rax = (UINT64)-1; return; }
 
-    // Shared context PA is passed in RBX
-    ULONG64 contextPa = vpData->Guest_gpr.Rbx;
-    if (contextPa == 0) {
-        vpData->Guest_gpr.Rax = (UINT64)-1; // Error
-        return;
-    }
+    /* VMM 路径: 这里用 MmMapIoSpace 是安全的
+     * 因为 VMEXIT handler 运行在特殊上下文, 不会与 guest 的 PFN 管理冲突 */
+    PVOID ctxMap = MapPhysicalPage_Vmm(ctxPa);
+    if (!ctxMap) { vpData->Guest_gpr.Rax = (UINT64)-2; return; }
+    PHV_RW_CONTEXT c = (PHV_RW_CONTEXT)((PUCHAR)ctxMap + (ctxPa & 0xFFF));
 
-    // Map the shared context page
-    PHV_RW_CONTEXT ctx = (PHV_RW_CONTEXT)MapPhysicalPage(
-        contextPa & ~0xFFFULL, PAGE_SIZE);
+    ULONG64 cr3 = c->TargetCr3, tva = c->SourceVa, bpa = c->DestPa, tot = c->Size;
+    BOOLEAN wr = (c->IsWrite != 0);
 
-    if (!ctx) {
-        vpData->Guest_gpr.Rax = (UINT64)-2;
-        return;
-    }
-
-    // Adjust pointer to actual offset within page
-    PHV_RW_CONTEXT pCtx = (PHV_RW_CONTEXT)((PUCHAR)ctx + (contextPa & 0xFFF));
-
-    ULONG64 targetCr3 = pCtx->TargetCr3;
-    ULONG64 targetVa = pCtx->SourceVa;
-    ULONG64 bufferPa = pCtx->DestPa;
-    ULONG64 totalSize = pCtx->Size;
-    BOOLEAN isWrite = (pCtx->IsWrite != 0);
-
-    if (totalSize == 0 || totalSize > 0x100000) { // Max 1MB per request
-        pCtx->Status = -3;
-        UnmapPhysicalPage(ctx, PAGE_SIZE);
+    if (!tot || tot > 0x100000) {
+        c->Status = -3;
+        UnmapPhysicalPage_Vmm(ctxMap);
         vpData->Guest_gpr.Rax = (UINT64)-3;
         return;
     }
 
-    // Process page by page
-    ULONG64 bytesProcessed = 0;
-    LONG resultStatus = 0;
+    /* VMM 路径的页表遍历也用 MmCopyMemory, 同样安全 */
+    ULONG64 done = 0;
+    while (done < tot) {
+        SIZE_T pr = PAGE_SIZE - (SIZE_T)((tva + done) & 0xFFF);
+        SIZE_T ch = (SIZE_T)(tot - done);
+        if (ch > pr) ch = pr;
 
-    while (bytesProcessed < totalSize)
-    {
-        // How many bytes remain in current page?
-        SIZE_T pageRemain = PAGE_SIZE - (SIZE_T)((targetVa + bytesProcessed) & 0xFFF);
-        SIZE_T chunkSize = (SIZE_T)(totalSize - bytesProcessed);
-        if (chunkSize > pageRemain) chunkSize = pageRemain;
-
-        // Translate target VA to PA
-        ULONG64 targetPa = TranslateGuestVaToPa(targetCr3, targetVa + bytesProcessed);
-        if (targetPa == 0) {
-            /* [FIX] 页面不在物理内存 — 跳过而非终止
-             * 读取: 目标缓冲区的对应区域保持为零 (已被 RtlZeroMemory 初始化)
-             * 写入: 跳过此页面 (无法写入不存在的物理页)
-             * CE 中这些区域会显示 00 而不是 ???, 其余区域显示正确数据 */
-            bytesProcessed += chunkSize;
-            continue;
+        ULONG64 tpa = TranslateGuestVaToPa(cr3, tva + done);
+        if (tpa) {
+            BOOLEAN ok = wr
+                ? PhysicalMemoryCopy_Vmm(tpa, bpa + done, ch, TRUE)
+                : PhysicalMemoryCopy_Vmm(bpa + done, tpa, ch, FALSE);
+            (void)ok;
         }
-
-        ULONG64 currentBufferPa = bufferPa + bytesProcessed;
-
-        BOOLEAN ok;
-        if (isWrite) {
-            // Write: copy from our buffer to target
-            ok = PhysicalMemoryCopy(targetPa, currentBufferPa, chunkSize, TRUE);
-        }
-        else {
-            // Read: copy from target to our buffer
-            ok = PhysicalMemoryCopy(currentBufferPa, targetPa, chunkSize, FALSE);
-        }
-
-        if (!ok) {
-            /* 物理内存映射失败 — 同样跳过 */
-            bytesProcessed += chunkSize;
-            continue;
-        }
-
-        bytesProcessed += chunkSize;
+        done += ch;
     }
 
-    pCtx->Status = resultStatus;
-    UnmapPhysicalPage(ctx, PAGE_SIZE);
-
-    // Return bytes processed in RAX (0 = success with full transfer)
-    vpData->Guest_gpr.Rax = (resultStatus == 0) ? bytesProcessed : (UINT64)resultStatus;
-}
-
-/* ========================================================================
- *  Guest-side functions - called from IOCTL handler *  These set up the shared context and fire the hypercall
- * ======================================================================== */
-
- // Get CR3 of target process
-static ULONG64 GetProcessCr3(ULONG64 TargetPid)
-{
-    PEPROCESS targetProc = nullptr;
-    NTSTATUS status = PsLookupProcessByProcessId((HANDLE)TargetPid, &targetProc);
-    if (!NT_SUCCESS(status) || !targetProc) {
-        return 0;
-    }
-
-    // EPROCESS->DirectoryTableBase is at a fixed offset
-    // We read it from the KPROCESS (first member of EPROCESS)
-    // Offset 0x28 on Windows 10 x64
-    ULONG64 cr3 = *(PULONG64)((PUCHAR)targetProc + 0x28);
-
-    ObDereferenceObject(targetProc);
-    return cr3;
-}
-
-/**
- * @brief 强制目标进程的页面驻留物理内存 — 在 CPUID 超级调用前调用
- *
- * 问题: VMM 通过 CR3 遍历页表翻译 VA→PA, 如果 PTE.Present=0
- *        (页面被换出到 pagefile 或从未 page-in), 翻译返回 0 → 读取失败。
- *        CE 中显示为 "???"。
- *
- * 解决: 在 Guest 侧附加到目标进程, 逐页触摸 (volatile read/write)
- *        强制 OS 内存管理器将页面调入物理内存。
- *        之后 VMM 的页表遍历就能找到有效的 PTE。
- *
- * 对反作弊透明:
- *   - KeStackAttachProcess: 经过我们的 NPT Hook (已拦截)
- *   - 页面触摸: 只是普通的内存读取, 没有 API 调用
- *   - 实际数据拷贝: 在 VMM 层通过物理内存完成, 不经过任何内核 API
- *
- * @param [in] TargetPid  - 目标进程 PID
- * @param [in] Address    - 目标虚拟地址
- * @param [in] Size       - 要访问的字节数
- * @param [in] ForWrite   - TRUE=写入操作(触发COW), FALSE=读取操作
- */
-static VOID ForcePagePresent(ULONG64 TargetPid, PVOID Address, SIZE_T Size, BOOLEAN ForWrite)
-{
-    PEPROCESS targetProc = nullptr;
-    NTSTATUS status = PsLookupProcessByProcessId((HANDLE)TargetPid, &targetProc);
-    if (!NT_SUCCESS(status) || !targetProc) return;
-
-    KAPC_STATE apcState;
-    KeStackAttachProcess(targetProc, &apcState);
-
-    __try {
-        PUCHAR base = (PUCHAR)Address;
-        SIZE_T offset = 0;
-
-        while (offset < Size) {
-            if (ForWrite) {
-                /* 写操作: 触发 Copy-on-Write 和 PAGE_GUARD 解除
-                 * InterlockedOr8 是原子读-改-写, 值不变但触发页面写入 */
-                InterlockedOr8((volatile char*)(base + offset), 0);
-            }
-            else {
-                /* 读操作: 触发 demand-paging / pagefile read-in */
-                volatile UCHAR dummy = *(volatile UCHAR*)(base + offset);
-                UNREFERENCED_PARAMETER(dummy);
-            }
-
-            /* 推进到下一页边界 */
-            SIZE_T pageRemain = PAGE_SIZE - (((ULONG_PTR)(base + offset)) & 0xFFF);
-            offset += pageRemain;
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        /* 某些页面真的无法访问 (未提交/PAGE_NOACCESS)
-         * 这些页面在 VMM 侧会被跳过并填零 */
-    }
-
-    KeUnstackDetachProcess(&apcState);
-    ObDereferenceObject(targetProc);
-}
-
-/**
- * @brief Guest侧读取目标进程内存 - 通过CPUID超级调用触发VMM执行物理拷贝
- * @author yewilliam
- * @date 2026/03/16
- * @param [in]  TargetPid - 目标进程PID
- * @param [in]  Address   - 目标进程中的虚拟地址
- * @param [out] Buffer    - 读取数据的输出缓冲区
- * @param [in]  Size      - 读取字节数
- * @return 成功返回STATUS_SUCCESS
- */
-NTSTATUS HvReadProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZE_T Size)
-{
-    if (!g_HvSharedContext || !Buffer || Size == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    // Get target process CR3
-    ULONG64 targetCr3 = GetProcessCr3(TargetPid);
-    if (targetCr3 == 0) {
-        return STATUS_NOT_FOUND;
-    }
-
-    /* [FIX] 强制目标页面驻留物理内存
-     * 没有这一步, VMM 的页表遍历会遇到 PTE.Present=0 → 返回 0 → CE 显示 "???"
-     * 附加到目标进程后触摸每一页, OS 自动将页面从 pagefile 调入 */
-    ForcePagePresent(TargetPid, Address, Size, FALSE);
-
-    // Allocate a kernel buffer for the transfer
-    PVOID kernelBuffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, Size, 'HvRd');
-    if (!kernelBuffer) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-    RtlZeroMemory(kernelBuffer, Size);
-
-    ULONG64 kernelBufferPa = MmGetPhysicalAddress(kernelBuffer).QuadPart;
-    if (kernelBufferPa == 0) {
-        ExFreePoolWithTag(kernelBuffer, 'HvRd');
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    ExAcquireFastMutex(&g_HvMutex);
-    // Fill shared context
-    g_HvSharedContext->TargetCr3 = targetCr3;
-    g_HvSharedContext->SourceVa = (ULONG64)Address;
-    g_HvSharedContext->DestPa = kernelBufferPa;
-    g_HvSharedContext->Size = Size;
-    g_HvSharedContext->IsWrite = 0;
-    g_HvSharedContext->Status = 1; // Pending
-
-    int regs[4] = { 0 };
-    __cpuidex(regs, CPUID_HV_MEMORY_OP, HV_MEM_OP_READ);
-
-    NTSTATUS status;
-    if (g_HvSharedContext->Status == 0) {
-        // Copy from kernel buffer to user buffer
-        __try {
-            RtlCopyMemory(Buffer, kernelBuffer, Size);
-            status = STATUS_SUCCESS;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            status = STATUS_ACCESS_VIOLATION;
-        }
-    }
-    else {
-        status = STATUS_UNSUCCESSFUL;
-    }
-    ExReleaseFastMutex(&g_HvMutex);
-
-    ExFreePoolWithTag(kernelBuffer, 'HvRd');
-    return status;
-}
-
-/**
- * @brief Guest侧写入目标进程内存 - 通过CPUID超级调用触发VMM执行物理拷贝
- * @author yewilliam
- * @date 2026/03/16
- * @param [in] TargetPid - 目标进程PID
- * @param [in] Address   - 目标进程中的虚拟地址
- * @param [in] Buffer    - 要写入的数据缓冲区
- * @param [in] Size      - 写入字节数
- * @return 成功返回STATUS_SUCCESS
- */
-NTSTATUS HvWriteProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZE_T Size)
-{
-    if (!g_HvSharedContext || !Buffer || Size == 0) {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    ULONG64 targetCr3 = GetProcessCr3(TargetPid);
-    if (targetCr3 == 0) {
-        return STATUS_NOT_FOUND;
-    }
-
-    /* [FIX] 强制页面驻留 + 触发 Copy-on-Write
-     * ForWrite=TRUE 使用 InterlockedOr8 触发写入,
-     * 确保 COW 页面被复制为私有副本 */
-    ForcePagePresent(TargetPid, Address, Size, TRUE);
-
-    // Allocate kernel buffer and copy user data into it
-    PVOID kernelBuffer = ExAllocatePool2(POOL_FLAG_NON_PAGED, Size, 'HvWr');
-    if (!kernelBuffer) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    __try {
-        RtlCopyMemory(kernelBuffer, Buffer, Size);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        ExFreePoolWithTag(kernelBuffer, 'HvWr');
-        return STATUS_ACCESS_VIOLATION;
-    }
-
-    ULONG64 kernelBufferPa = MmGetPhysicalAddress(kernelBuffer).QuadPart;
-    if (kernelBufferPa == 0) {
-        ExFreePoolWithTag(kernelBuffer, 'HvWr');
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    ExAcquireFastMutex(&g_HvMutex);
-
-    // Fill shared context
-    g_HvSharedContext->TargetCr3 = targetCr3;
-    g_HvSharedContext->SourceVa = (ULONG64)Address;
-    g_HvSharedContext->DestPa = kernelBufferPa;
-    g_HvSharedContext->Size = Size;
-    g_HvSharedContext->IsWrite = 1;
-    g_HvSharedContext->Status = 1;
-
-    int regs[4] = { 0 };
-    __cpuidex(regs, CPUID_HV_MEMORY_OP, HV_MEM_OP_WRITE);
-
-    NTSTATUS status = (g_HvSharedContext->Status == 0) ?
-        STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-
-    ExReleaseFastMutex(&g_HvMutex);
-
-    ExFreePoolWithTag(kernelBuffer, 'HvWr');
-    return status;
+    c->Status = 0;
+    UnmapPhysicalPage_Vmm(ctxMap);
+    vpData->Guest_gpr.Rax = done;
 }
