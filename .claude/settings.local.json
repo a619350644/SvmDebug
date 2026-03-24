@@ -26,7 +26,16 @@
       "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/CE_MEMORY_BUG_FIX_SUMMARY.md\":*)",
       "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/VERIFICATION_CHECKLIST.txt\":*)",
       "Bash(find:*)",
-      "Bash(\"/c/Users/yejinzhao/FINAL_MERGE_SUMMARY.txt\":*)"
+      "Bash(\"/c/Users/yejinzhao/FINAL_MERGE_SUMMARY.txt\":*)",
+      "Bash(msbuild DBKKernel.sln /p:Configuration=Release /p:Platform=x64)",
+      "Bash(cmd /c \"cd D:\\\\工具\\\\cheat-engine-7.5\\\\DBKKernel && msbuild DBKKernel.sln /p:Configuration=Release /p:Platform=x64 2>&1\")",
+      "Bash(\"/c/Program Files \\(x86\\)/Microsoft Visual Studio/2022/BuildTools/MSBuild/Current/Bin/MSBuild.exe\" \"D:\\\\工具\\\\cheat-engine-7.5\\\\DBKKernel\\\\DBKKernel.sln\" /p:Configuration=Release /p:Platform=x64)",
+      "Bash(cmd /c \"D:\\\\Program Files ^\\(x86^\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe DBKKernel.sln -p:Configuration=Release -p:Platform=x64\")",
+      "Bash(__NEW_LINE_c94398941bd08ed0__ cd:*)",
+      "Bash(__NEW_LINE_aacf5ccc63e99679__ cd:*)",
+      "Bash(__NEW_LINE_cc619a89be79eda9__ cd:*)",
+      "Bash(__NEW_LINE_cc8712063d7b3dc4__ echo:*)",
+      "Bash(\"C:\\\\Users\\\\yejinzhao\\\\source\\\\repos\\\\SvmDebug\\\\README_v19_QUICK_START.txt\":*)"
     ]
   }
 }

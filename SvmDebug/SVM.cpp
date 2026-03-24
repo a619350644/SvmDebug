@@ -16,6 +16,7 @@
  */
 #include "SVM.h"
 #include "HvMemory.h"
+#include "HvBatchRead.h"
 #include "DebugApi.h"
 
 extern ULONG64 g_SystemCr3;
@@ -521,76 +522,17 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
             vpData->Guest_gpr.Rax = 0;
         }
         else if (leaf == CPUID_HV_MEMORY_OP) {
-            /* [BUG FIX] Do NOT overwrite RBX with g_HvSharedContextPa.
-             * Guest now sets RBX = context PA via HvCpuidWithRbx ASM helper.
-             * Old code forced VMM to always read SvmDebug's own shared context,
-             * which was empty/stale when DBKKernel triggered the CPUID.
-             * DBKKernel fills its own g_BridgeContext and passes g_BridgeContextPa
-             * via RBX. SvmDebug's own HvMemory.cpp also now passes g_HvSharedContextPa
-             * via RBX. Both work correctly without the overwrite. */
+            /* [BUG FIX] 不再强制覆盖 RBX。
+             * Guest 通过 HvCpuidWithRbx ASM 函数显式设置 RBX = 上下文 PA。
+             * DBKKernel 传 g_BridgeContextPa, SvmDebug 传 g_HvSharedContextPa。
+             * 旧代码强制 RBX = g_HvSharedContextPa 导致 DBKKernel 的上下文丢失。*/
             HvHandleMemoryOp(vpData);
         }
         else if (leaf == CPUID_HV_BATCH_READ) {
-#ifdef DEBUG
-            static volatile LONG s_batchDispatch = 0;
-            LONG dCnt = InterlockedIncrement(&s_batchDispatch);
-            if (dCnt <= 10 || (dCnt % 10000) == 0) {
-                SvmDebugPrint("[VMM] CPUID VMEXIT -> BATCH_READ dispatch #%d CPU=%d RIP=0x%llX\n",
-                    dCnt, vpData->ProcessorIndex, vmcb->StateSaveArea.Rip);
-            }
-#endif
+            /* [NEW] 批量散射读取 — DBKKernel First Scan / Memory Viewer 的核心路径
+             * DBKKernel 通过 HvCpuidWithRbx 将 g_BatchContextPa 放入 RBX。
+             * VMM 读取 RBX 得到 BatchContext PA, 遍历散射表逐条物理直读。*/
             HvHandleBatchRead(vpData);
-        }
-        else if (leaf == CPUID_HV_DIAG) {
-            /* ============================================================
-             * [DIAG] DBKKernel 诊断通道
-             * Guest 通过 CPUID(CPUID_HV_DIAG) 投递诊断信息到 VMM
-             * 编码: RCX 低8位=子命令, 高位=标志参数
-             *   bit 8  = SvmActive
-             *   bit 9  = BatchInitialized
-             *   bit 10-15 = pathCode (for READ_RESULT)
-             * VMM 用 SvmDebugPrint 输出 → Qt 日志窗口可见
-             * ============================================================ */
-            UINT32 rcxVal = (UINT32)vpData->Guest_gpr.Rcx;
-            UINT32 diagCmd = rcxVal & 0xFF;
-            BOOLEAN svmActive = (rcxVal >> 8) & 1;
-            BOOLEAN batchInit = (rcxVal >> 9) & 1;
-            UINT32  pathCode  = (rcxVal >> 10) & 0x3F;
-
-            switch (diagCmd) {
-            case HV_DIAG_INIT_STATUS:
-                SvmDebugPrint("[DIAG-DBK] DriverEntry INIT: SvmActive=%d BatchInit=%d\n",
-                    svmActive, batchInit);
-                break;
-            case HV_DIAG_READ_ENTER:
-                {
-                    static volatile LONG s_diagRead = 0;
-                    LONG rCnt = InterlockedIncrement(&s_diagRead);
-                    if (rCnt <= 20 || (rCnt % 5000) == 0) {
-                        SvmDebugPrint("[DIAG-DBK] CE_READMEMORY #%d: SvmActive=%d BatchInit=%d\n",
-                            rCnt, svmActive, batchInit);
-                    }
-                }
-                break;
-            case HV_DIAG_READ_RESULT:
-                {
-                    static volatile LONG s_diagResult = 0;
-                    LONG rCnt = InterlockedIncrement(&s_diagResult);
-                    if (rCnt <= 20 || (rCnt % 5000) == 0) {
-                        /* pathCode: 0=VMEXIT_OK, 1=FALLBACK, 2=LEGACY, 3=VMEXIT_FAIL */
-                        static const char* pathNames[] = {
-                            "VMEXIT_OK", "FALLBACK_Stealth", "LEGACY_noSVM", "VMEXIT_FAIL" };
-                        UINT32 idx = pathCode > 3 ? 3 : pathCode;
-                        SvmDebugPrint("[DIAG-DBK] CE_READ_RESULT #%d: path=%s\n",
-                            rCnt, pathNames[idx]);
-                    }
-                }
-                break;
-            default:
-                SvmDebugPrint("[DIAG-DBK] Unknown diagCmd=0x%X rcx=0x%X\n", diagCmd, rcxVal);
-                break;
-            }
-            vmcb->StateSaveArea.Rax = 0; /* ACK */
         }
         else if (leaf == CPUID_HV_DEBUG_OP) {
             HvHandleDebugOp(vpData);

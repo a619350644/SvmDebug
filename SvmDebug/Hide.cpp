@@ -1216,7 +1216,7 @@ static NTSTATUS NTAPI Fake_NtOpenProcess(
      *  ZwDuplicateObject → 转为用户句柄 → CE 拿到完整权限
      * ================================================================ */
     if (IsCallerProtected() && ClientId && ClientId->UniqueProcess &&
-        g_DebuggedPidCount > 0 && IsDebuggedPid(ClientId->UniqueProcess))
+        g_ElevatedPidCount > 0 && IsElevatedPid(ClientId->UniqueProcess))
     {
         PEPROCESS targetProc = NULL;
         NTSTATUS status;
@@ -1365,77 +1365,51 @@ static NTSTATUS NTAPI Fake_NtQueryInformationProcess(
         ProcessHandle, ProcessInfoClass, ProcessInfo, ProcessInfoLength, ReturnLength);
 }
 
-HANDLE   g_DebuggedPIDs[MAX_DEBUGGED_PIDS] = { 0 };
-volatile LONG g_DebuggedPidCount = 0;
+HANDLE   g_ElevatedPIDs[MAX_ELEVATED_PIDS] = { 0 };
+volatile LONG g_ElevatedPidCount = 0;
 
-BOOLEAN AddDebuggedPid(HANDLE Pid)
+BOOLEAN AddElevatedPid(HANDLE Pid)
 {
     if (!Pid) return FALSE;
-    for (LONG i = 0; i < g_DebuggedPidCount; i++)
-        if (g_DebuggedPIDs[i] == Pid) return TRUE;
-    LONG idx = InterlockedIncrement(&g_DebuggedPidCount) - 1;
-    if (idx >= MAX_DEBUGGED_PIDS) {
-        InterlockedDecrement(&g_DebuggedPidCount);
-        SvmDebugPrint("[Debugged] PID list full, cannot add %llu\n", (ULONG64)Pid);
+    for (LONG i = 0; i < g_ElevatedPidCount; i++)
+        if (g_ElevatedPIDs[i] == Pid) return TRUE;
+    LONG idx = InterlockedIncrement(&g_ElevatedPidCount) - 1;
+    if (idx >= MAX_ELEVATED_PIDS) {
+        InterlockedDecrement(&g_ElevatedPidCount);
         return FALSE;
     }
-    g_DebuggedPIDs[idx] = Pid;
-    SvmDebugPrint("[Debugged] PID %llu added (count=%ld)\n", (ULONG64)Pid, idx + 1);
+    g_ElevatedPIDs[idx] = Pid;
+    SvmDebugPrint("[Elevate] PID %llu added (count=%ld)\n", (ULONG64)Pid, idx + 1);
     return TRUE;
 }
 
-BOOLEAN RemoveDebuggedPid(HANDLE Pid)
+BOOLEAN RemoveElevatedPid(HANDLE Pid)
 {
-    for (LONG i = 0; i < g_DebuggedPidCount; i++) {
-        if (g_DebuggedPIDs[i] == Pid) {
-            for (LONG j = i; j < g_DebuggedPidCount - 1; j++)
-                g_DebuggedPIDs[j] = g_DebuggedPIDs[j + 1];
-            LONG n = InterlockedDecrement(&g_DebuggedPidCount);
-            g_DebuggedPIDs[n] = 0;
-            SvmDebugPrint("[Debugged] PID %llu removed (count=%ld)\n", (ULONG64)Pid, n);
+    for (LONG i = 0; i < g_ElevatedPidCount; i++) {
+        if (g_ElevatedPIDs[i] == Pid) {
+            for (LONG j = i; j < g_ElevatedPidCount - 1; j++)
+                g_ElevatedPIDs[j] = g_ElevatedPIDs[j + 1];
+            LONG n = InterlockedDecrement(&g_ElevatedPidCount);
+            g_ElevatedPIDs[n] = 0;
             return TRUE;
         }
     }
     return FALSE;
 }
 
-BOOLEAN IsDebuggedPid(HANDLE Pid)
+BOOLEAN IsElevatedPid(HANDLE Pid)
 {
-    if (g_DebuggedPidCount == 0 || !Pid) return FALSE;
-    LONG count = g_DebuggedPidCount;
-    for (LONG i = 0; i < count && i < MAX_DEBUGGED_PIDS; i++)
-        if (g_DebuggedPIDs[i] == Pid) return TRUE;
+    if (g_ElevatedPidCount == 0 || !Pid) return FALSE;
+    LONG count = g_ElevatedPidCount;
+    for (LONG i = 0; i < count && i < MAX_ELEVATED_PIDS; i++)
+        if (g_ElevatedPIDs[i] == Pid) return TRUE;
     return FALSE;
 }
 
-BOOLEAN IsDebuggedProcessHandle(HANDLE ProcessHandle)
+VOID ClearAllElevatedPids()
 {
-    if (g_DebuggedPidCount == 0) return FALSE;
-    if (!ProcessHandle || ProcessHandle == NtCurrentProcess() ||
-        ProcessHandle == (HANDLE)-1)
-        return FALSE;
-
-    if (!g_OrigObpRefByHandleWithTag)
-        return FALSE;
-
-    PEPROCESS target = NULL;
-    NTSTATUS status = g_OrigObpRefByHandleWithTag(
-        (ULONG_PTR)ProcessHandle, 0, *PsProcessType, KernelMode,
-        0x44666C54, (PVOID*)&target, NULL, 0);
-
-    if (!NT_SUCCESS(status) || !target)
-        return FALSE;
-
-    HANDLE pid = PsGetProcessId(target);
-    ObDereferenceObject(target);
-    return IsDebuggedPid(pid);
-}
-
-VOID ClearAllDebuggedPids(VOID)
-{
-    SvmDebugPrint("[Debugged] Clearing all %ld entries\n", g_DebuggedPidCount);
-    RtlZeroMemory(g_DebuggedPIDs, sizeof(g_DebuggedPIDs));
-    InterlockedExchange(&g_DebuggedPidCount, 0);
+    RtlZeroMemory(g_ElevatedPIDs, sizeof(g_ElevatedPIDs));
+    InterlockedExchange(&g_ElevatedPidCount, 0);
 }
 
 
@@ -1458,8 +1432,19 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
     FAKE_PRINT_ONCE_FOR(HOOK_NtQueryVirtualMemory);
     if (!g_OrigNtQueryVirtualMemory) return STATUS_UNSUCCESSFUL;
 
-    /* CE 查询任何外部进程 → 完全透传, 不篡改
-     * 这是修复 Memory Viewer 显示 ??? 的核心 */
+    /* [NEW] ElevatedPid 调用者直接放行 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId()))
+        return g_OrigNtQueryVirtualMemory(
+            ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
+
+    /* [BUG FIX] CE (保护进程) 查询任何外部进程 → 完全透传, 不篡改保护属性
+     * 没有这个豁免, CE 通过 kernel handle 查询目标进程时,
+     * 下面的伪装代码会把 PAGE_EXECUTE_READWRITE 改成 PAGE_READONLY
+     * → CE Memory Viewer 显示 ???, First Scan 跳过可执行区域
+     *
+     * 注意: CE 查自身 (NtCurrentProcess) 也需要放行,
+     * 因为 DBKKernel StealthQueryVM 用 kernel handle (不是 NtCurrentProcess),
+     * 但 CE R3 的 VirtualQueryEx 可能走 NtCurrentProcess 路径 */
     if (IsCallerProtected() &&
         ProcessHandle && ProcessHandle != NtCurrentProcess() &&
         ProcessHandle != (HANDLE)-1)
@@ -1469,40 +1454,29 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
             MemInfo, MemInfoLength, ReturnLength);
     }
 
-    /* 外部进程查询被保护进程 → 拒绝 */
+    /* 外部进程查询保护进程 - 拒绝 */
     if (g_ProtectedPidCount > 0 &&
-        !IsCallerProtected() &&
-        ProcessHandle && ProcessHandle != NtCurrentProcess() &&
-        ProcessHandle != (HANDLE)-1 &&
-        IsProtectedProcessHandle(ProcessHandle))
-    {
+        IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
         return STATUS_ACCESS_DENIED;
-    }
 
-    /* 调用原函数 */
+    /* 调用原函数获取真实内存信息 */
     NTSTATUS status = g_OrigNtQueryVirtualMemory(
         ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
 
-    /* protection 伪装: 对进程查询自身 (NtCurrentProcess) 时生效
-     * CE 查外部进程在上面 return 了, 不会到这里
-     * 游戏自查仍然会被伪装, 隐藏 Hook 痕迹
-     *
-     * [BUG FIX v19] 增加 KernelMode 豁免:
-     * DBKKernel 的 StealthQueryVM 曾使用 KeStackAttachProcess + NtCurrentProcess()
-     * 导致此伪装代码把 EXECUTE* 保护改为 PAGE_READONLY
-     * → CE Memory Viewer 显示 ??? + First Scan 跳过区域
-     * 虽然已改用 kernel handle (不再命中此路径), 但加防御性检查:
-     * 内核模式调用者不需要伪装 (只有用户态的游戏自查才需要) */
+    /* 伪装保护属性: 仅对用户态游戏"自查"生效 (隐藏 Hook 注入的可执行页)
+     * [BUG FIX] 增加 ExGetPreviousMode() == UserMode 防御:
+     * 内核态调用 (如 DBKKernel 的 ZwQueryVirtualMemory) 不需要伪装 */
     if (NT_SUCCESS(status) && MemInfoClass == 0 &&
         MemInfo && MemInfoLength >= sizeof(MEMORY_BASIC_INFORMATION) &&
-        (ProcessHandle == NtCurrentProcess() || ProcessHandle == (HANDLE)-1 || !ProcessHandle) &&
         ExGetPreviousMode() == UserMode)
     {
         PMEMORY_BASIC_INFORMATION mbi = (PMEMORY_BASIC_INFORMATION)MemInfo;
 
+        /* 检查是否是可疑的可执行内存页 */
         if (mbi->State == MEM_COMMIT && mbi->Type == MEM_PRIVATE &&
             (mbi->Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
         {
+            /* 伪造为只读页，隐藏执行权限 */
             mbi->Protect = PAGE_READONLY;
             mbi->AllocationProtect = PAGE_READONLY;
         }
@@ -1647,23 +1621,20 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
     if (IsCallerProtected() &&
         ProcessHandle && ProcessHandle != NtCurrentProcess())
     {
-        /* 检查目标是否是被调试进程 */
+        /* 检查目标是否是升权进程 (ACE游戏) */
         BOOLEAN usePhysical = FALSE;
-        if (g_DebuggedPidCount > 0) {
+        if (g_ElevatedPidCount > 0) {
             PEPROCESS targetProc = NULL;
             NTSTATUS st = ObReferenceObjectByHandle(
                 ProcessHandle, 0, *PsProcessType, KernelMode,
                 (PVOID*)&targetProc, NULL);
             if (NT_SUCCESS(st) && targetProc) {
                 HANDLE targetPid = PsGetProcessId(targetProc);
-                usePhysical = IsDebuggedPid(targetPid);
+                usePhysical = IsElevatedPid(targetPid);
                 ObDereferenceObject(targetProc);
 
                 if (usePhysical) {
-                    /* [v19] CPUID VMEXIT → VMM Host 物理直读
-                     * Guest R0 零 MmCopyMemory/MmMapIoSpace 调用
-                     * ACE 完全看不到任何物理内存操作 */
-                    NTSTATUS status = HvReadProcessMemory_Vmexit(
+                    NTSTATUS status = HvReadProcessMemory(
                         (ULONG64)(ULONG_PTR)targetPid, BaseAddress, Buffer, Size);
                     if (NumberOfBytesRead) {
                         __try { *NumberOfBytesRead = NT_SUCCESS(status) ? Size : 0; }
@@ -1679,8 +1650,8 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
             ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesRead);
     }
 
-    /* 被调试进程自身的调用 → 放行 */
-    if (g_DebuggedPidCount > 0 && IsDebuggedPid(PsGetCurrentProcessId()))
+    /* ElevatedPid 调用者放行 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId()))
         return g_OrigNtReadVirtualMemory(
             ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesRead);
 
@@ -1743,8 +1714,8 @@ static NTSTATUS NTAPI Fake_NtWriteVirtualMemory(
         }
     }
 
-    /* 被调试进程自身的调用 → 放行 */
-    if (g_DebuggedPidCount > 0 && IsDebuggedPid(PsGetCurrentProcessId()))
+    /* ElevatedPid 调用者放行 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId()))
         return g_OrigNtWriteVirtualMemory(
             ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesWritten);
 
@@ -1774,15 +1745,8 @@ static NTSTATUS NTAPI Fake_NtProtectVirtualMemory(
     FAKE_PRINT_ONCE_FOR(HOOK_NtProtectVirtualMemory);
     if (!g_OrigNtProtectVirtualMemory) return STATUS_UNSUCCESSFUL;
 
-    /* [NEW] 被调试进程自身 → 放行 */
-    if (g_DebuggedPidCount > 0 && IsDebuggedPid(PsGetCurrentProcessId()))
-        return g_OrigNtProtectVirtualMemory(
-            ProcessHandle, BaseAddress, RegionSize, NewProtect, OldProtect);
-
-    /* CE 修改被调试进程的内存属性 → 放行 */
-    if (IsCallerProtected() && g_DebuggedPidCount > 0 &&
-        ProcessHandle && ProcessHandle != NtCurrentProcess() &&
-        IsDebuggedProcessHandle(ProcessHandle))
+    /* [NEW] ElevatedPid 调用者直接放行 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId()))
         return g_OrigNtProtectVirtualMemory(
             ProcessHandle, BaseAddress, RegionSize, NewProtect, OldProtect);
 
@@ -1855,7 +1819,7 @@ static NTSTATUS NTAPI Fake_NtCreateThreadEx(
      * KTHREAD.PreviousMode offset:
      *   Win10 19041-19045 (20H1-22H2): 0x232
      * ================================================================ */
-    if (IsCallerProtected() && g_DebuggedPidCount > 0 &&
+    if (IsCallerProtected() && g_ElevatedPidCount > 0 &&
         ProcessHandle && ProcessHandle != NtCurrentProcess())
     {
         PEPROCESS targetProc = NULL;
@@ -1865,7 +1829,7 @@ static NTSTATUS NTAPI Fake_NtCreateThreadEx(
             (PVOID*)&targetProc, NULL);
 
         if (NT_SUCCESS(st) && targetProc) {
-            if (IsDebuggedPid(PsGetProcessId(targetProc))) {
+            if (IsElevatedPid(PsGetProcessId(targetProc))) {
                 /* 创建 kernel handle — ACE 的 ObCallback 跳过 */
                 HANDLE kHandle = NULL;
                 st = ObOpenObjectByPointer(
@@ -1891,7 +1855,7 @@ static NTSTATUS NTAPI Fake_NtCreateThreadEx(
                     *(CCHAR*)(kthread + 0x232) = savedMode;
                     ZwClose(kHandle);
 
-                    SvmDebugPrint("[Debugged] NtCreateThreadEx: CE thread in debugged PID, status=0x%X\n", st);
+                    SvmDebugPrint("[Elevate] NtCreateThreadEx: CE thread in elevated PID, status=0x%X\n", st);
                     return st;
                 }
                 /* ObOpenObjectByPointer 失败, 回退正常路径 */
@@ -2196,7 +2160,7 @@ static NTSTATUS NTAPI Fake_ObpRefByHandleWithTag(
     FAKE_PRINT_ONCE_FOR(HOOK_ObReferenceObjectByHandle);
     if (!g_OrigObpRefByHandleWithTag) return STATUS_UNSUCCESSFUL;
 
-    if (g_ProtectedPidCount == 0 && g_DebuggedPidCount == 0)
+    if (g_ProtectedPidCount == 0 && g_ElevatedPidCount == 0)
         return g_OrigObpRefByHandleWithTag(
             Handle, DesiredAccess, ObjectType, AccessMode,
             Tag, Object, HandleInfo, Flags);
@@ -2237,14 +2201,14 @@ static NTSTATUS NTAPI Fake_ObpRefByHandleWithTag(
         NTSTATUS status = g_OrigObpRefByHandleWithTag(
             Handle, 0, ObjectType, KernelMode, Tag, Object, HandleInfo, Flags);
 
-        if (NT_SUCCESS(status) && Object && *Object && HandleInfo && g_DebuggedPidCount > 0) {
+        if (NT_SUCCESS(status) && Object && *Object && HandleInfo && g_ElevatedPidCount > 0) {
             __try {
                 if (ObjectType == *PsProcessType) {
-                    if (IsDebuggedPid(PsGetProcessId((PEPROCESS)*Object)))
+                    if (IsElevatedPid(PsGetProcessId((PEPROCESS)*Object)))
                         HandleInfo->GrantedAccess = PROCESS_ALL_ACCESS;
                 }
                 else if (ObjectType == *PsThreadType) {
-                    if (IsDebuggedPid(PsGetThreadProcessId((PETHREAD)*Object)))
+                    if (IsElevatedPid(PsGetThreadProcessId((PETHREAD)*Object)))
                         HandleInfo->GrantedAccess = THREAD_ALL_ACCESS;
                 }
             }
@@ -2258,7 +2222,7 @@ static NTSTATUS NTAPI Fake_ObpRefByHandleWithTag(
     /* [NEW] 被调试程序(ElevatedPid)自身的句柄升权
      * 等价于 demo: DesiredAccess=0, KernelMode
      * 绕过 ACE ObRegisterCallbacks 的 GrantedAccess 裁剪 */
-    if (g_DebuggedPidCount > 0 && IsDebuggedPid(PsGetCurrentProcessId())) {
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId())) {
         NTSTATUS status = g_OrigObpRefByHandleWithTag(
             Handle, 0, ObjectType, KernelMode, Tag, Object, HandleInfo, Flags);
         if (NT_SUCCESS(status) && HandleInfo) {
@@ -2357,7 +2321,7 @@ static NTSTATUS NTAPI Fake_MmCopyVirtualMemory(
     }
 
     /* [NEW] ElevatedPid 调用者直接放行 — 与 IsCallerProtected 同等权限 */
-    if (g_DebuggedPidCount > 0 && IsDebuggedPid(PsGetCurrentProcessId())) {
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId())) {
         LeaveHookGuard(oldIrql);
         return g_OrigMmCopyVirtualMemory(
             FromProcess, FromAddress, ToProcess, ToAddress,
