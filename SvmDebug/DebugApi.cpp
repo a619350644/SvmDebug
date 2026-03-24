@@ -733,6 +733,31 @@ NTSTATUS NTAPI Fake_NtCreateDebugObject(
 
     /* 只有已注册的调试器才能创建调试对象 */
     BOOLEAN bIsDbg = IsDebugger(PsGetCurrentProcess());
+
+    /* ================================================================
+     * [FIX-v2] 自动注册: 如果有被调试进程存在, 调用 NtCreateDebugObject
+     * 的进程极可能是 CE。自动注册它, 让它拿到自定义句柄,
+     * 后续 NtDebugActiveProcess 走影子调试端口路径 (不是 Windows Debugger 模式)。
+     *
+     * 为什么不能等到 NtDebugActiveProcess 才注册:
+     *   CE 先调 NtCreateDebugObject → 此时 NOT debugger → 返回真实内核句柄
+     *   → 后续 NtDebugActiveProcess 走 Windows Debugger 模式
+     *   → DebugPort 被清零 → 后续事件丢失 → CE attach timeout
+     *
+     * 在这里注册后:
+     *   NtCreateDebugObject 返回自定义句柄 (isCustom=1)
+     *   → NtDebugActiveProcess 走影子调试端口 → 正常工作
+     * ================================================================ */
+    if (!bIsDbg && g_DebuggedPidCount > 0) {
+        PEPROCESS callerProc = PsGetCurrentProcess();
+        HANDLE callerPid = PsGetCurrentProcessId();
+        RegisterDebugger(callerProc, callerPid);
+        AddProtectedPid(callerPid);
+        SvmDebugPrint("[DebugApi] NtCreateDebugObject: Auto-registered debugger PID=%lld "
+            "(debugged PIDs exist)\n", (ULONG64)callerPid);
+        bIsDbg = TRUE;
+    }
+
     if (!bIsDbg) {
         SvmDebugPrint("[DebugApi] NtCreateDebugObject: caller PID=%lld NOT debugger, passthrough\n",
             (ULONG64)PsGetCurrentProcessId());
@@ -968,8 +993,42 @@ NTSTATUS NTAPI Fake_NtDebugActiveProcess(
     SvmDebugPrint("[DebugApi] Fake_NtDebugActiveProcess: PH=%p DH=%p isDbg=%d isCustom=%d PID=%lld\n",
         ProcessHandle, DebugHandle, bIsDbg, bIsCustomHandle, (ULONG64)PsGetCurrentProcessId());
 
+    /* ================================================================
+     * [FIX-v2] 自动注册: 检查 attach 的目标是否在 g_DebuggedPIDs 中
+     *
+     * 上一版检查 IsCallerProtected() 失败, 因为 CE 此时还没被保护。
+     * 正确逻辑: Launcher 已经将游戏 PID 加入 g_DebuggedPIDs,
+     *           当有人试图 attach 到该 PID 时, 那一定是我们的 CE。
+     *           自动注册它为调试器 + 加入保护列表。
+     * ================================================================ */
     if (!bIsDbg && !bIsCustomHandle) {
-        /* 既不是注册的调试器, DebugHandle 也不是自定义句柄 → 正常透传 */
+        BOOLEAN targetIsDebugged = FALSE;
+        PEPROCESS targetProc = NULL;
+        NTSTATUS st = ObReferenceObjectByHandle(
+            ProcessHandle, 0, *PsProcessType, KernelMode,
+            (PVOID*)&targetProc, NULL);
+
+        if (NT_SUCCESS(st) && targetProc) {
+            HANDLE targetPid = PsGetProcessId(targetProc);
+            targetIsDebugged = IsDebuggedPid(targetPid);
+            ObDereferenceObject(targetProc);
+        }
+
+        if (targetIsDebugged) {
+            /* 目标是我们标记的被调试进程 → 自动注册调用者为调试器 */
+            PEPROCESS callerProc = PsGetCurrentProcess();
+            HANDLE callerPid = PsGetCurrentProcessId();
+            RegisterDebugger(callerProc, callerPid);
+            AddProtectedPid(callerPid);
+            SvmDebugPrint("[DebugApi] Auto-registered debugger PID=%lld "
+                "(target is debugged PID)\n", (ULONG64)callerPid);
+            bIsDbg = TRUE;
+            /* 不 return, 继续执行后面的 bIsDbg && !bIsCustomHandle 分支 */
+        }
+    }
+
+    if (!bIsDbg && !bIsCustomHandle) {
+        /* 既不是注册的调试器, 目标也不是被调试进程 → 正常透传 */
         if (g_OrigNtDebugActiveProcess)
             return g_OrigNtDebugActiveProcess(ProcessHandle, DebugHandle);
         return STATUS_ACCESS_DENIED;
@@ -2179,9 +2238,11 @@ NTSTATUS DbgDispatchIoctl(
             return STATUS_BUFFER_TOO_SMALL;
 
         /* 附加操作由R3通过NtDebugActiveProcess完成,
-           这里可以做额外的预处理(如将目标加入保护列表) */
+           这里做预处理: 保护 + 标记为被调试 */
         PDBG_ATTACH_REQUEST req = (PDBG_ATTACH_REQUEST)InputBuffer;
         AddProtectedPid((HANDLE)req->TargetPid);
+        AddDebuggedPid((HANDLE)req->TargetPid);
+        SvmDebugPrint("[DebugApi] ATTACH: PID %llu -> protected + debugged\n", req->TargetPid);
         Status = STATUS_SUCCESS;
         break;
     }
@@ -2192,7 +2253,9 @@ NTSTATUS DbgDispatchIoctl(
             return STATUS_BUFFER_TOO_SMALL;
 
         PDBG_ATTACH_REQUEST req = (PDBG_ATTACH_REQUEST)InputBuffer;
+        RemoveDebuggedPid((HANDLE)req->TargetPid);
         RemoveProtectedPid((HANDLE)req->TargetPid);
+        SvmDebugPrint("[DebugApi] DETACH: PID %llu -> undebugged + unprotected\n", req->TargetPid);
         Status = STATUS_SUCCESS;
         break;
     }

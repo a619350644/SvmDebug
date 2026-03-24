@@ -16,6 +16,7 @@
  */
 #include "SVM.h"
 #include "HvMemory.h"
+#include "HvBatchRead.h"
 #include "DebugApi.h"
 
 extern ULONG64 g_SystemCr3;
@@ -521,8 +522,17 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
             vpData->Guest_gpr.Rax = 0;
         }
         else if (leaf == CPUID_HV_MEMORY_OP) {
-            vpData->Guest_gpr.Rbx = g_HvSharedContextPa;
+            /* [BUG FIX] 不再强制覆盖 RBX。
+             * Guest 通过 HvCpuidWithRbx ASM 函数显式设置 RBX = 上下文 PA。
+             * DBKKernel 传 g_BridgeContextPa, SvmDebug 传 g_HvSharedContextPa。
+             * 旧代码强制 RBX = g_HvSharedContextPa 导致 DBKKernel 的上下文丢失。*/
             HvHandleMemoryOp(vpData);
+        }
+        else if (leaf == CPUID_HV_BATCH_READ) {
+            /* [NEW] 批量散射读取 — DBKKernel First Scan / Memory Viewer 的核心路径
+             * DBKKernel 通过 HvCpuidWithRbx 将 g_BatchContextPa 放入 RBX。
+             * VMM 读取 RBX 得到 BatchContext PA, 遍历散射表逐条物理直读。*/
+            HvHandleBatchRead(vpData);
         }
         else if (leaf == CPUID_HV_DEBUG_OP) {
             HvHandleDebugOp(vpData);

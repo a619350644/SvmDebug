@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/*.cpp /c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/*.h)",
+      "Bash(find /c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug -name \"*.cpp\" -exec wc -l {} +)",
+      "Read(//c/Users/yejinzhao/Downloads/files \\(64\\)/**)",
+      "Read(//d/工具/cheat-engine-7.5/DBKKernel/**)",
+      "Bash(cat:*)",
+      "Bash(ls \"D:/工具/cheat-engine-7.5/DBKKernel/HvBatchRead\"*)",
+      "Bash(git lfs:*)",
+      "Read(//c/Users/yejinzhao/Documents/LaunchSvmDebug/**)",
+      "Bash(git -C \"C:\\\\Users\\\\yejinzhao\\\\Documents\\\\LaunchSvmDebug\" status)",
+      "Bash(gh auth:*)",
+      "Bash(where gh:*)",
+      "Bash(where git:*)",
+      "Bash(ls -la \"/Users/yejinzhao/Downloads/files \\(69\\)/\")",
+      "Bash(ls \"/c/Users/yejinzhao/Downloads/files \\(69\\)/\")",
+      "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/HvBatchRead.h\":*)",
+      "Bash(msbuild SvmDebug.sln /p:Configuration=Release /p:Platform=x64)",
+      "Bash(ls -lh \"/c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/\"*.h)",
+      "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/DIAGNOSTIC_TESTING.txt\":*)",
+      "Bash(ls -lh '/c/Users/yejinzhao/Downloads/files \\(71\\)/SvmDebug/')",
+      "Bash(ls -lh '/c/Users/yejinzhao/Downloads/files \\(71\\)/DBKKernel/')",
+      "Bash(ls:*)",
+      "Bash(diff \"/c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/Asm.asm\" \"/c/Users/yejinzhao/Downloads/files \\(71\\)/SvmDebug/Asm.asm\")",
+      "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/CE_MEMORY_BUG_FIX_SUMMARY.md\":*)",
+      "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/VERIFICATION_CHECKLIST.txt\":*)",
+      "Bash(find:*)",
+      "Bash(\"/c/Users/yejinzhao/FINAL_MERGE_SUMMARY.txt\":*)",
+      "Bash(msbuild DBKKernel.sln /p:Configuration=Release /p:Platform=x64)",
+      "Bash(cmd /c \"cd D:\\\\工具\\\\cheat-engine-7.5\\\\DBKKernel && msbuild DBKKernel.sln /p:Configuration=Release /p:Platform=x64 2>&1\")",
+      "Bash(\"/c/Program Files \\(x86\\)/Microsoft Visual Studio/2022/BuildTools/MSBuild/Current/Bin/MSBuild.exe\" \"D:\\\\工具\\\\cheat-engine-7.5\\\\DBKKernel\\\\DBKKernel.sln\" /p:Configuration=Release /p:Platform=x64)",
+      "Bash(cmd /c \"D:\\\\Program Files ^\\(x86^\\)\\\\Microsoft Visual Studio\\\\2022\\\\BuildTools\\\\MSBuild\\\\Current\\\\Bin\\\\MSBuild.exe DBKKernel.sln -p:Configuration=Release -p:Platform=x64\")",
+      "Bash(__NEW_LINE_c94398941bd08ed0__ cd:*)",
+      "Bash(__NEW_LINE_aacf5ccc63e99679__ cd:*)",
+      "Bash(__NEW_LINE_cc619a89be79eda9__ cd:*)",
+      "Bash(__NEW_LINE_cc8712063d7b3dc4__ echo:*)",
+      "Bash(\"C:\\\\Users\\\\yejinzhao\\\\source\\\\repos\\\\SvmDebug\\\\README_v19_QUICK_START.txt\":*)"
+    ]
+  }
+}

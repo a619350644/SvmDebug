@@ -1437,6 +1437,23 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
         return g_OrigNtQueryVirtualMemory(
             ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
 
+    /* [BUG FIX] CE (保护进程) 查询任何外部进程 → 完全透传, 不篡改保护属性
+     * 没有这个豁免, CE 通过 kernel handle 查询目标进程时,
+     * 下面的伪装代码会把 PAGE_EXECUTE_READWRITE 改成 PAGE_READONLY
+     * → CE Memory Viewer 显示 ???, First Scan 跳过可执行区域
+     *
+     * 注意: CE 查自身 (NtCurrentProcess) 也需要放行,
+     * 因为 DBKKernel StealthQueryVM 用 kernel handle (不是 NtCurrentProcess),
+     * 但 CE R3 的 VirtualQueryEx 可能走 NtCurrentProcess 路径 */
+    if (IsCallerProtected() &&
+        ProcessHandle && ProcessHandle != NtCurrentProcess() &&
+        ProcessHandle != (HANDLE)-1)
+    {
+        return g_OrigNtQueryVirtualMemory(
+            ProcessHandle, BaseAddress, MemInfoClass,
+            MemInfo, MemInfoLength, ReturnLength);
+    }
+
     /* 外部进程查询保护进程 - 拒绝 */
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
@@ -1446,9 +1463,12 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
     NTSTATUS status = g_OrigNtQueryVirtualMemory(
         ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
 
-    /* 如果查询成功且是 MemoryBasicInformation (class 0) */
+    /* 伪装保护属性: 仅对用户态游戏"自查"生效 (隐藏 Hook 注入的可执行页)
+     * [BUG FIX] 增加 ExGetPreviousMode() == UserMode 防御:
+     * 内核态调用 (如 DBKKernel 的 ZwQueryVirtualMemory) 不需要伪装 */
     if (NT_SUCCESS(status) && MemInfoClass == 0 &&
-        MemInfo && MemInfoLength >= sizeof(MEMORY_BASIC_INFORMATION))
+        MemInfo && MemInfoLength >= sizeof(MEMORY_BASIC_INFORMATION) &&
+        ExGetPreviousMode() == UserMode)
     {
         PMEMORY_BASIC_INFORMATION mbi = (PMEMORY_BASIC_INFORMATION)MemInfo;
 

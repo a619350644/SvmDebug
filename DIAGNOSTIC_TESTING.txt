@@ -1,0 +1,64 @@
+═══════════════════════════════════════════════════════════════════════════════
+                    DIAGNOSTIC CHANNEL TESTING GUIDE
+═══════════════════════════════════════════════════════════════════════════════
+
+WHAT WAS MERGED:
+  ✓ SvmDebug/SvmDebug/HvBatchRead.h (new file)
+  ✓ SvmDebug/SvmDebug/SVM.cpp (added CPUID_HV_DIAG handler)
+
+WHAT TO EXPECT IN LOGS:
+
+  When loading DBKKernel driver:
+    [DIAG-DBK] DriverEntry INIT: SvmActive=1 BatchInit=1
+
+  When CE performs first memory read:
+    [DIAG-DBK] CE_READMEMORY #1: SvmActive=1 BatchInit=1
+    [DIAG-DBK] CE_READ_RESULT #1: path=VMEXIT_OK
+
+  Throttling: Shows first 20 messages + every 5000th to avoid log spam
+
+
+KEY PATHS:
+  0 = VMEXIT_OK        ← IDEAL: Batch read via hypervisor
+  1 = FALLBACK_Stealth ← SVM active, but using guest R0 physical read
+  2 = LEGACY_noSVM     ← PROBLEM: No SVM, using KeAttachProcess (slow)
+  3 = VMEXIT_FAIL      ← ERROR: VMEXIT returned failure
+
+
+TROUBLESHOOTING:
+
+  [USER REPORTED ISSUE] All reads show: path=LEGACY_noSVM
+  
+  ├─ Check 1: Is SVM hypervisor initialized?
+  │  Look for: [DIAG-DBK] DriverEntry INIT: SvmActive=1
+  │  If SvmActive=0 → SvmDebug.sys load failed
+  │
+  ├─ Check 2: Is DBKKernel loaded?
+  │  If no [DIAG-DBK] messages at all → DBKKernel not loaded
+  │  → Load DBKKernel kernel driver first
+  │
+  ├─ Check 3: Is CE using IOCTL_CE_READMEMORY?
+  │  If no CE_READMEMORY messages → CE using legacy KeAttachProcess
+  │  → Update CE to use new IOCTL instead
+
+  [PARTIAL FIX] Some reads show: path=FALLBACK_Stealth
+  
+  ├─ SVM is working (SvmActive=1)
+  ├─ But batch read failed (might not be initialized)
+  ├─ Falling back to guest R0 StealthDirectRead (still safer than LEGACY)
+  └─ Check if HvBatchRead_Init() succeeded in DBKDrvr
+
+
+NEXT STEPS (DBKKernel side - not yet merged):
+
+  1. In DBKDrvr.c DriverEntry:
+     - Call HvBatchRead_Init()
+     - Report init status via CPUID(CPUID_HV_DIAG, HV_DIAG_INIT_STATUS)
+
+  2. In IOPLDispatcher.c IOCTL_CE_READMEMORY:
+     - Call HvBatchRead_SingleRead() (path 0)
+     - If fails, use StealthDirectRead (path 1)
+     - If no SVM, use KeAttachProcess (path 2)
+     - Report via CPUID(CPUID_HV_DIAG, HV_DIAG_READ_RESULT, pathCode)
+
+═══════════════════════════════════════════════════════════════════════════════

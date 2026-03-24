@@ -1332,7 +1332,7 @@ static BOOLEAN IsPhysicalAddressInProtectedProcess(ULONG64 StartPa, SIZE_T NumBy
 
     /* 计算请求覆盖的物理页范围 */
     ULONG64 paStart = StartPa & ~0xFFFULL;
-    ULONG64 paEnd   = (StartPa + NumBytes + 0xFFF) & ~0xFFFULL;
+    ULONG64 paEnd = (StartPa + NumBytes + 0xFFF) & ~0xFFFULL;
 
     LONG count = g_ProtectedPidCount;
     for (LONG i = 0; i < count && i < MAX_PROTECTED_PIDS; i++) {
@@ -1632,62 +1632,72 @@ NTSTATUS PrepareDeepHookResources(PULONG OutOkCount)
         /* 对象管理 */
         { "ObReferenceObjectByHandleWithTag", ScanForObReferenceObjectByHandleWithTag,
           (PVOID)Fake_ObReferenceObjectByHandleWithTag, HOOK_ObRefByHandleWithTag },
-        { "ObfDereferenceObject", ScanForObfDereferenceObject,
-          (PVOID)Fake_ObfDereferenceObject, HOOK_ObfDereferenceObject },
-        { "ObfDereferenceObjectWithTag", ScanForObfDereferenceObjectWithTag,
-          (PVOID)Fake_ObfDereferenceObjectWithTag, HOOK_ObfDereferenceObjectWithTag },
+          /* [DISABLED] ObfDereferenceObject / ObfDereferenceObjectWithTag:
+           * BSOD 0x3B IP_MISALIGNED — NPT SuspendedHook 竞态
+           *
+           * 根因: 这两个函数是内核调用频率最高的函数 (每秒百万次)。
+           * NPT hook 每次调用触发 #NPF VMEXIT, 且 trampoline 返回时
+           * SuspendedHook 窗口期允许同 CPU 其他调用绕过 FakePage,
+           * 执行 OriginalPage 的被覆盖区域 → 指令对齐错误 → BSOD。
+           *
+           * 影响: 零。proxy 函数是纯透传 (print-once + call original),
+           * 不包含任何保护/过滤逻辑。移除后无功能损失。*/
+           //{ "ObfDereferenceObject", ScanForObfDereferenceObject,
+           //  (PVOID)Fake_ObfDereferenceObject, HOOK_ObfDereferenceObject },
+           //{ "ObfDereferenceObjectWithTag", ScanForObfDereferenceObjectWithTag,
+           //  (PVOID)Fake_ObfDereferenceObjectWithTag, HOOK_ObfDereferenceObjectWithTag },
 
-        /* 进程/线程 */
-        { "PspInsertThread", ScanForPspInsertThread,
-        (PVOID)Fake_PspInsertThread, HOOK_PspInsertThread },
-        { "PspCallThreadNotifyRoutines", ScanForPspCallThreadNotifyRoutines,
-        (PVOID)Fake_PspCallThreadNotifyRoutines, HOOK_PspCallThreadNotifyRoutines },
-        //{ "PspExitThread", ScanForPspExitThread,
-        //(PVOID)Fake_PspExitThread, HOOK_PspExitThread },
+           /* 进程/线程 */
+           { "PspInsertThread", ScanForPspInsertThread,
+           (PVOID)Fake_PspInsertThread, HOOK_PspInsertThread },
+           { "PspCallThreadNotifyRoutines", ScanForPspCallThreadNotifyRoutines,
+           (PVOID)Fake_PspCallThreadNotifyRoutines, HOOK_PspCallThreadNotifyRoutines },
+           //{ "PspExitThread", ScanForPspExitThread,
+           //(PVOID)Fake_PspExitThread, HOOK_PspExitThread },
 
-        /* 内存管理 */
-        /* [DISABLED] MmProtectVirtualMemory: trampoline stolen bytes 问题 */
-        //{ "MmProtectVirtualMemory(internal)", ScanForMmProtectVirtualMemory,
-        //    (PVOID)Fake_MmProtectVirtualMemory_Deep, HOOK_MmProtectVirtualMemory_Deep },
-        /* [DISABLED] MiObtainReferencedVadEx: BSOD 0xA + 字体异常 */
-        //{ "MiObtainReferencedVadEx", ScanForMiObtainReferencedVadEx,
-        //    (PVOID)Fake_MiObtainReferencedVadEx, HOOK_MiObtainReferencedVadEx },
+           /* 内存管理 */
+           /* [DISABLED] MmProtectVirtualMemory: trampoline stolen bytes 问题 */
+           //{ "MmProtectVirtualMemory(internal)", ScanForMmProtectVirtualMemory,
+           //    (PVOID)Fake_MmProtectVirtualMemory_Deep, HOOK_MmProtectVirtualMemory_Deep },
+           /* [DISABLED] MiObtainReferencedVadEx: BSOD 0xA + 字体异常 */
+           //{ "MiObtainReferencedVadEx", ScanForMiObtainReferencedVadEx,
+           //    (PVOID)Fake_MiObtainReferencedVadEx, HOOK_MiObtainReferencedVadEx },
 
-        /* 异常/调度 */
-        /* [DISABLED] KiDispatchException: trampoline RIP-rel 重定位导致 BSOD 0x1E
-        * chrome.exe 触发正常异常 → trampoline 跳到用户态 0x7fff → SMEP → 蓝屏
-        * 此 Hook 仅日志记录 #DB 异常, CE 调试功能不需要 */
-        //{ "KiDispatchException", ScanForKiDispatchException,
-        //(PVOID)Fake_KiDispatchException, HOOK_KiDispatchException },
-        { "KiStackAttachProcess", ScanForKiStackAttachProcess,
-        (PVOID)Fake_KiStackAttachProcess, HOOK_KiStackAttachProcess },
+           /* 异常/调度 */
+           /* [DISABLED] KiDispatchException: trampoline RIP-rel 重定位导致 BSOD 0x1E
+           * chrome.exe 触发正常异常 → trampoline 跳到用户态 0x7fff → SMEP → 蓝屏
+           * 此 Hook 仅日志记录 #DB 异常, CE 调试功能不需要 */
+           //{ "KiDispatchException", ScanForKiDispatchException,
+           //(PVOID)Fake_KiDispatchException, HOOK_KiDispatchException },
+           { "KiStackAttachProcess", ScanForKiStackAttachProcess,
+           (PVOID)Fake_KiStackAttachProcess, HOOK_KiStackAttachProcess },
 
-               /* ---- Phase 2: 新增深度 Hook ---- */
+           /* ---- Phase 2: 新增深度 Hook ---- */
 
-       /* APC 注入防御 */
-       { "KiInsertQueueApc", ScanForKiInsertQueueApc,
-           (PVOID)Fake_KiInsertQueueApc, HOOK_KiInsertQueueApc },
+   /* APC 注入防御 */
+   { "KiInsertQueueApc", ScanForKiInsertQueueApc,
+       (PVOID)Fake_KiInsertQueueApc, HOOK_KiInsertQueueApc },
 
-        /* 物理内存防御 */
-        { "MmGetPhysicalAddress", ScanForMmGetPhysicalAddress,
-        (PVOID)Fake_MmGetPhysicalAddress_Deep, HOOK_MmGetPhysicalAddress_Deep },
-        { "MmMapIoSpace", ScanForMmMapIoSpace,
-        (PVOID)Fake_MmMapIoSpace_Deep, HOOK_MmMapIoSpace_Deep },
-        /* [DISABLED] MmMapLockedPagesSpecifyCache: BSOD in MmProbeAndLockPages */
-        //{ "MmMapLockedPagesSpecifyCache", ScanForMmMapLockedPagesSpecifyCache,
-        //(PVOID)Fake_MmMapLockedPages_Deep, HOOK_MmMapLockedPages_Deep },
+       /* 物理内存防御 */
+       { "MmGetPhysicalAddress", ScanForMmGetPhysicalAddress,
+       (PVOID)Fake_MmGetPhysicalAddress_Deep, HOOK_MmGetPhysicalAddress_Deep },
+       { "MmMapIoSpace", ScanForMmMapIoSpace,
+       (PVOID)Fake_MmMapIoSpace_Deep, HOOK_MmMapIoSpace_Deep },
+       /* [DISABLED] MmMapLockedPagesSpecifyCache: BSOD in MmProbeAndLockPages */
+       //{ "MmMapLockedPagesSpecifyCache", ScanForMmMapLockedPagesSpecifyCache,
+       //(PVOID)Fake_MmMapLockedPages_Deep, HOOK_MmMapLockedPages_Deep },
 
-        /* 句柄表隐藏 */
-        { "ExpLookupHandleTableEntry", ScanForExpLookupHandleTableEntry,
-            (PVOID)Fake_ExpLookupHandleTableEntry, HOOK_ExpLookupHandleTableEntry },
+       /* 句柄表隐藏 */
+       { "ExpLookupHandleTableEntry", ScanForExpLookupHandleTableEntry,
+           (PVOID)Fake_ExpLookupHandleTableEntry, HOOK_ExpLookupHandleTableEntry },
 
-        /* 进程生命周期 */
-        { "PspInsertProcess", ScanForPspInsertProcess,
-        (PVOID)Fake_PspInsertProcess, HOOK_PspInsertProcess },
+           /* 进程生命周期 */
+           { "PspInsertProcess", ScanForPspInsertProcess,
+           (PVOID)Fake_PspInsertProcess, HOOK_PspInsertProcess },
 
-        /* 硬件断点隐藏 */
-        //{ "PspGetContextThreadInternal", ScanForPspGetContextThreadInternal,
-        //    (PVOID)Fake_PspGetContextThreadInternal, HOOK_PspGetContextThreadInternal },
+           /* 硬件断点隐藏 */
+           //{ "PspGetContextThreadInternal", ScanForPspGetContextThreadInternal,
+           //    (PVOID)Fake_PspGetContextThreadInternal, HOOK_PspGetContextThreadInternal },
     };
 
     ULONG total = ARRAYSIZE(deepHooks);

@@ -33,6 +33,7 @@
  */
 
 #include "HvMemory.h"
+#include "HvBatchRead.h"
 #include "SVM.h"
 
  /* ========================================================================
@@ -491,21 +492,38 @@ static VOID UnmapPhysicalPage_Vmm(PVOID v)
 
 static BOOLEAN PhysicalMemoryCopy_Vmm(ULONG64 dst, ULONG64 src, SIZE_T sz, BOOLEAN w)
 {
-    UNREFERENCED_PARAMETER(w);
     if (sz == 0 || sz > PAGE_SIZE) return FALSE;
-    PVOID s = MapPhysicalPage_Vmm(src);
-    if (!s) return FALSE;
-    PVOID d = MapPhysicalPage_Vmm(dst);
-    if (!d) { UnmapPhysicalPage_Vmm(s); return FALSE; }
-    SIZE_T sA = PAGE_SIZE - (SIZE_T)(src & 0xFFF);
-    SIZE_T dA = PAGE_SIZE - (SIZE_T)(dst & 0xFFF);
-    SIZE_T c = sz;
-    if (c > sA) c = sA;
-    if (c > dA) c = dA;
-    RtlCopyMemory((PUCHAR)d + (dst & 0xFFF), (PUCHAR)s + (src & 0xFFF), c);
-    UnmapPhysicalPage_Vmm(d);
-    UnmapPhysicalPage_Vmm(s);
-    return TRUE;
+
+    if (!w) {
+        /* [PERF FIX] 读取路径: MmCopyMemory 读源 → MmMapIoSpace 写目标
+         * 旧代码映射 src + dst 两页, 现在只映射 dst 一页
+         * 消除源页 MmMapIoSpace, 减少 50% TLB flush */
+        UCHAR tmpBuf[PAGE_SIZE];
+        SIZE_T copied = ReadPhysicalBytes(src, tmpBuf, sz);
+        if (copied == 0) return FALSE;
+
+        PVOID d = MapPhysicalPage_Vmm(dst);
+        if (!d) return FALSE;
+        RtlCopyMemory((PUCHAR)d + (dst & 0xFFF), tmpBuf, copied);
+        UnmapPhysicalPage_Vmm(d);
+        return TRUE;
+    }
+    else {
+        /* 写入路径: 保持原逻辑 (需要映射目标页为可写) */
+        PVOID s = MapPhysicalPage_Vmm(src);
+        if (!s) return FALSE;
+        PVOID d = MapPhysicalPage_Vmm(dst);
+        if (!d) { UnmapPhysicalPage_Vmm(s); return FALSE; }
+        SIZE_T sA = PAGE_SIZE - (SIZE_T)(src & 0xFFF);
+        SIZE_T dA = PAGE_SIZE - (SIZE_T)(dst & 0xFFF);
+        SIZE_T c = sz;
+        if (c > sA) c = sA;
+        if (c > dA) c = dA;
+        RtlCopyMemory((PUCHAR)d + (dst & 0xFFF), (PUCHAR)s + (src & 0xFFF), c);
+        UnmapPhysicalPage_Vmm(d);
+        UnmapPhysicalPage_Vmm(s);
+        return TRUE;
+    }
 }
 
 VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData)
@@ -550,4 +568,173 @@ VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData)
     c->Status = 0;
     UnmapPhysicalPage_Vmm(ctxMap);
     vpData->Guest_gpr.Rax = done;
+}
+
+/* ========================================================================
+ *  Section: 批量散射读取 — VMM Host 侧
+ *
+ *  Guest 通过 CPUID(CPUID_HV_BATCH_READ) 触发 VMEXIT,
+ *  RBX = BatchContext 的物理地址 (由 HvCpuidWithRbx ASM 设置)。
+ *  Host 遍历散射表, 逐条页表遍历+物理直读, 写入输出缓冲区。
+ *
+ *  这是 CE First Scan / Memory Viewer 的核心 VMEXIT 读取路径。
+ * ======================================================================== */
+
+VOID HvHandleBatchRead(PVCPU_CONTEXT vpData)
+{
+    static volatile LONG s_vmmBatchCount = 0;
+
+    if (!vpData) return;
+
+    ULONG64 ctxPa = vpData->Guest_gpr.Rbx;
+    if (!ctxPa) {
+        vpData->Guest_gpr.Rax = (UINT64)-1;
+        return;
+    }
+
+    PVOID ctxMap = MapPhysicalPage_Vmm(ctxPa);
+    if (!ctxMap) {
+        vpData->Guest_gpr.Rax = (UINT64)-2;
+        return;
+    }
+    PHV_BATCH_CONTEXT ctx = (PHV_BATCH_CONTEXT)((PUCHAR)ctxMap + (ctxPa & 0xFFF));
+
+    ULONG64 cr3 = ctx->TargetCr3;
+    ULONG32 entryCount = ctx->EntryCount;
+    ULONG32 totalOutput = ctx->TotalOutputSize;
+    ULONG64 entriesPa = ctx->EntriesPa;
+    ULONG64 outputPa = ctx->OutputPa;
+
+    {
+        LONG cnt = InterlockedIncrement(&s_vmmBatchCount);
+        if (cnt <= 10 || (cnt % 5000) == 0) {
+            SvmDebugPrint("[VMM-BatchRead] #%d: CR3=0x%llX entries=%u totalOut=%u\n",
+                cnt, cr3, entryCount, totalOutput);
+        }
+    }
+
+    if (!cr3 || !entryCount || entryCount > HV_BATCH_MAX_ENTRIES ||
+        !totalOutput || totalOutput > HV_BATCH_MAX_OUTPUT ||
+        !entriesPa || !outputPa)
+    {
+        ctx->Status = -3;
+        ctx->SuccessCount = 0;
+        UnmapPhysicalPage_Vmm(ctxMap);
+        vpData->Guest_gpr.Rax = (UINT64)-3;
+        return;
+    }
+
+    /* 映射散射表 */
+    SIZE_T tableBytes = (SIZE_T)entryCount * sizeof(HV_SCATTER_ENTRY);
+    PHYSICAL_ADDRESS tablePhys;
+    tablePhys.QuadPart = (LONGLONG)(entriesPa & ~0xFFFULL);
+    SIZE_T tableMapSize = (SIZE_T)(entriesPa & 0xFFF) + tableBytes;
+    tableMapSize = (tableMapSize + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    PVOID tableMap = MmMapIoSpace(tablePhys, tableMapSize, MmCached);
+    if (!tableMap) {
+        ctx->Status = -4;
+        ctx->SuccessCount = 0;
+        UnmapPhysicalPage_Vmm(ctxMap);
+        vpData->Guest_gpr.Rax = (UINT64)-4;
+        return;
+    }
+    PHV_SCATTER_ENTRY entries = (PHV_SCATTER_ENTRY)((PUCHAR)tableMap + (entriesPa & 0xFFF));
+
+    ULONG32 successCount = 0;
+    PVOID   cachedOutMap = NULL;
+    ULONG64 cachedOutPage = 0;
+
+    for (ULONG32 i = 0; i < entryCount; i++)
+    {
+        PHV_SCATTER_ENTRY entry = &entries[i];
+        ULONG64 gva = entry->GuestVa;
+        ULONG32 sz = entry->Size;
+        ULONG32 outOff = entry->OutputOffset;
+
+        if (sz == 0 || sz > PAGE_SIZE || outOff + sz > totalOutput) {
+            entry->Status = 2;
+            continue;
+        }
+
+        BOOLEAN anyOk = FALSE;
+        ULONG32 done = 0;
+
+        while (done < sz)
+        {
+            ULONG32 pageRem = (ULONG32)(PAGE_SIZE - ((gva + done) & 0xFFF));
+            ULONG32 chunk = sz - done;
+            if (chunk > pageRem) chunk = pageRem;
+
+            ULONG64 dPa = outputPa + outOff + done;
+            ULONG64 dPagePa = dPa & ~0xFFFULL;
+            ULONG32 dOff = (ULONG32)(dPa & 0xFFF);
+
+            ULONG32 dAvail = PAGE_SIZE - dOff;
+            if (chunk > dAvail) chunk = dAvail;
+
+            ULONG64 srcPa = TranslateGuestVaToPa(cr3, gva + done);
+
+            if (!cachedOutMap || cachedOutPage != dPagePa) {
+                if (cachedOutMap) UnmapPhysicalPage_Vmm(cachedOutMap);
+                cachedOutMap = MapPhysicalPage_Vmm(dPa);
+                cachedOutPage = dPagePa;
+            }
+
+            if (!cachedOutMap) { done += chunk; continue; }
+            PUCHAR dstPtr = (PUCHAR)cachedOutMap + dOff;
+
+            if (!srcPa) {
+                RtlZeroMemory(dstPtr, chunk);
+                done += chunk;
+                continue;
+            }
+
+            /* [PERF FIX] 用 MmCopyMemory 代替 MmMapIoSpace 读取源页
+             *
+             * 旧代码: MapPhysicalPage_Vmm(srcPa) + memcpy + UnmapPhysicalPage_Vmm
+             *   每个条目 1 次 MmMapIoSpace + 1 次 MmUnmapIoSpace
+             *   5000 次 scan = 5000 次 map/unmap = TLB shootdown IPI 风暴
+             *   → CLOCK_WATCHDOG_TIMEOUT (0x101) + 其他 CPU 卡死
+             *
+             * 新代码: MmCopyMemory(MM_COPY_MEMORY_PHYSICAL)
+             *   零映射, 零 PFN 修改, 零 TLB flush
+             *   直接从物理地址拷贝到栈缓冲区, 再写入输出映射 */
+            {
+                UCHAR tmpBuf[PAGE_SIZE];
+                SIZE_T copied = ReadPhysicalBytes(srcPa, tmpBuf, chunk);
+                if (copied > 0) {
+                    RtlCopyMemory(dstPtr, tmpBuf, copied);
+                    if (copied < chunk)
+                        RtlZeroMemory(dstPtr + copied, chunk - copied);
+                    anyOk = TRUE;
+                }
+                else {
+                    RtlZeroMemory(dstPtr, chunk);
+                }
+            }
+
+            done += chunk;
+        }
+
+        entry->Status = anyOk ? 0 : 1;
+        if (anyOk) successCount++;
+    }
+
+    if (cachedOutMap) UnmapPhysicalPage_Vmm(cachedOutMap);
+    MmUnmapIoSpace(tableMap, tableMapSize);
+
+    ctx->SuccessCount = successCount;
+    ctx->Status = (successCount == entryCount) ? 0 : -1;
+
+    {
+        LONG cnt = s_vmmBatchCount;
+        if (cnt <= 10 || (cnt % 5000) == 0) {
+            SvmDebugPrint("[VMM-BatchRead] DONE #%d: success=%u/%u status=%d\n",
+                cnt, successCount, entryCount, ctx->Status);
+        }
+    }
+
+    UnmapPhysicalPage_Vmm(ctxMap);
+    vpData->Guest_gpr.Rax = (UINT64)successCount;
 }

@@ -3,7 +3,6 @@
  * @brief 进程保护逻辑头文件 - 保护配置、全局变量、回调管理结构体
  * @author yewilliam
  * @date 2026/03/16
- * @modified 2026/03/24 — 用 g_DebuggedPIDs 替换 g_ElevatedPIDs
  */
 
 #pragma once
@@ -16,65 +15,15 @@
 
 #include "winApiDef.h"   // 所有函数指针 typedef 都在这里
 
-/* ========================================================================
- *  [NEW] 被调试进程管理 — 替代旧的 g_ElevatedPIDs
- *
- *  设计:
- *    CE attach 目标 → AddDebuggedPid(targetPid)
- *    CE detach 目标 → RemoveDebuggedPid(targetPid)
- *    各 Fake_ 函数检查: CE 操作被调试进程 → 完全透传, 不篡改
- * ======================================================================== */
-#define MAX_DEBUGGED_PIDS  16
+#define MAX_ELEVATED_PIDS  10
 
-extern HANDLE   g_DebuggedPIDs[MAX_DEBUGGED_PIDS];
-extern volatile LONG g_DebuggedPidCount;
+extern HANDLE   g_ElevatedPIDs[MAX_ELEVATED_PIDS];
+extern volatile LONG g_ElevatedPidCount;
 
-/**
- * @brief 添加 PID 到被调试列表 (CE attach 时调用)
- * @param [in] Pid - 被调试的目标进程 PID
- * @return TRUE=成功/已存在, FALSE=列表已满
- */
-BOOLEAN AddDebuggedPid(HANDLE Pid);
-
-/**
- * @brief 从被调试列表移除 PID (CE detach 时调用)
- * @param [in] Pid - 要移除的进程 PID
- * @return TRUE=移除成功, FALSE=未找到
- */
-BOOLEAN RemoveDebuggedPid(HANDLE Pid);
-
-/**
- * @brief 检查 PID 是否在被调试列表中
- * @param [in] Pid - 要检查的进程 PID
- * @return TRUE=被调试中, FALSE=未被调试
- */
-BOOLEAN IsDebuggedPid(HANDLE Pid);
-
-/**
- * @brief 检查进程句柄是否指向被调试进程
- * @param [in] ProcessHandle - 进程句柄
- * @return TRUE=指向被调试进程, FALSE=不是
- */
-BOOLEAN IsDebuggedProcessHandle(HANDLE ProcessHandle);
-
-/**
- * @brief 清除所有被调试 PID
- */
-VOID ClearAllDebuggedPids(VOID);
-
-
-/* ========================================================================
- *  [COMPAT] 保留旧接口名称, 映射到新函数 (编译期过渡)
- *  如果其他文件还在用 ElevatedPid, 可以暂时不改调用方
- * ======================================================================== */
-#define MAX_ELEVATED_PIDS       MAX_DEBUGGED_PIDS
-#define g_ElevatedPIDs          g_DebuggedPIDs
-#define g_ElevatedPidCount      g_DebuggedPidCount
-#define AddElevatedPid          AddDebuggedPid
-#define RemoveElevatedPid       RemoveDebuggedPid
-#define IsElevatedPid           IsDebuggedPid
-#define ClearAllElevatedPids    ClearAllDebuggedPids
-
+BOOLEAN AddElevatedPid(HANDLE Pid);
+BOOLEAN RemoveElevatedPid(HANDLE Pid);
+BOOLEAN IsElevatedPid(HANDLE Pid);
+VOID    ClearAllElevatedPids();
 
  /* ========================================================================
   *  权限常量 — 进程/线程访问权限掩码, 用于句柄权限裁剪

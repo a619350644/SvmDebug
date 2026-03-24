@@ -38,8 +38,11 @@
 #define IOCTL_SVM_DISABLE_CALLBACKS     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x824, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SVM_RESTORE_CALLBACKS     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x825, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_SVM_PROTECT_EX            CTL_CODE(FILE_DEVICE_UNKNOWN, 0x826, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_SVM_ELEVATE_PID    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x828, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_SVM_UNELEVATE_PID  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x829, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_SET_DEBUGGED_PID    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x828, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SVM_UNSET_DEBUGGED_PID  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x829, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* [COMPAT] */
+#define IOCTL_SVM_ELEVATE_PID         IOCTL_SVM_SET_DEBUGGED_PID
+#define IOCTL_SVM_UNELEVATE_PID       IOCTL_SVM_UNSET_DEBUGGED_PID
 
 /* ========================================================================
  *  全局变量
@@ -244,25 +247,25 @@ static NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             (SIZE_T)req->Size);
         break;
     }
-    case IOCTL_SVM_ELEVATE_PID:
+    case IOCTL_SVM_SET_DEBUGGED_PID:
     {
         if (inLen < sizeof(PROTECT_INFO) || !buffer) {
             status = STATUS_INVALID_PARAMETER; break;
         }
         PPROTECT_INFO pi = (PPROTECT_INFO)buffer;
-        AddElevatedPid((HANDLE)pi->Pid);
-        SvmDebugPrint("[IOCTL] ELEVATE_PID: %llu\n", pi->Pid);
+        AddDebuggedPid((HANDLE)pi->Pid);
+        SvmDebugPrint("[IOCTL] SET_DEBUGGED_PID: %llu\n", pi->Pid);
         break;
     }
 
-    case IOCTL_SVM_UNELEVATE_PID:
+    case IOCTL_SVM_UNSET_DEBUGGED_PID:
     {
         if (inLen < sizeof(PROTECT_INFO) || !buffer) {
             status = STATUS_INVALID_PARAMETER; break;
         }
         PPROTECT_INFO pi = (PPROTECT_INFO)buffer;
-        RemoveElevatedPid((HANDLE)pi->Pid);
-        SvmDebugPrint("[IOCTL] UNELEVATE_PID: %llu\n", pi->Pid);
+        RemoveDebuggedPid((HANDLE)pi->Pid);
+        SvmDebugPrint("[IOCTL] UNSET_DEBUGGED_PID: %llu\n", pi->Pid);
         break;
     }
     case IOCTL_HV_WRITE_MEMORY:
