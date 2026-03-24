@@ -551,3 +551,142 @@ VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData)
     UnmapPhysicalPage_Vmm(ctxMap);
     vpData->Guest_gpr.Rax = done;
 }
+
+/* ========================================================================
+ *  Section: 批量散射读取 — VMM Host 侧
+ *
+ *  Guest 通过 CPUID(CPUID_HV_BATCH_READ) 触发 VMEXIT,
+ *  RBX = BatchContext 的物理地址。
+ *  Host 遍历散射表, 逐条页表遍历+物理直读, 写入输出缓冲区。
+ * ======================================================================== */
+
+VOID HvHandleBatchRead(PVCPU_CONTEXT vpData)
+{
+    if (!vpData) return;
+
+    ULONG64 ctxPa = vpData->Guest_gpr.Rbx;
+    if (!ctxPa) {
+        vpData->Guest_gpr.Rax = (UINT64)-1;
+        return;
+    }
+
+    PVOID ctxMap = MapPhysicalPage_Vmm(ctxPa);
+    if (!ctxMap) {
+        vpData->Guest_gpr.Rax = (UINT64)-2;
+        return;
+    }
+    PHV_BATCH_CONTEXT ctx = (PHV_BATCH_CONTEXT)((PUCHAR)ctxMap + (ctxPa & 0xFFF));
+
+    ULONG64 cr3         = ctx->TargetCr3;
+    ULONG32 entryCount  = ctx->EntryCount;
+    ULONG32 totalOutput = ctx->TotalOutputSize;
+    ULONG64 entriesPa   = ctx->EntriesPa;
+    ULONG64 outputPa    = ctx->OutputPa;
+
+    if (!cr3 || !entryCount || entryCount > HV_BATCH_MAX_ENTRIES ||
+        !totalOutput || totalOutput > HV_BATCH_MAX_OUTPUT ||
+        !entriesPa || !outputPa)
+    {
+        ctx->Status = -3;
+        ctx->SuccessCount = 0;
+        UnmapPhysicalPage_Vmm(ctxMap);
+        vpData->Guest_gpr.Rax = (UINT64)-3;
+        return;
+    }
+
+    /* 一次性映射整个散射表 (物理连续, 但可能跨页) */
+    SIZE_T tableBytes = (SIZE_T)entryCount * sizeof(HV_SCATTER_ENTRY);
+    PHYSICAL_ADDRESS tablePhys;
+    tablePhys.QuadPart = (LONGLONG)(entriesPa & ~0xFFFULL);
+    SIZE_T tableMapSize = (SIZE_T)(entriesPa & 0xFFF) + tableBytes;
+    tableMapSize = (tableMapSize + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    PVOID tableMap = MmMapIoSpace(tablePhys, tableMapSize, MmCached);
+    if (!tableMap) {
+        ctx->Status = -4;
+        ctx->SuccessCount = 0;
+        UnmapPhysicalPage_Vmm(ctxMap);
+        vpData->Guest_gpr.Rax = (UINT64)-4;
+        return;
+    }
+    PHV_SCATTER_ENTRY entries = (PHV_SCATTER_ENTRY)((PUCHAR)tableMap + (entriesPa & 0xFFF));
+
+    ULONG32 successCount = 0;
+    PVOID   cachedOutMap = NULL;
+    ULONG64 cachedOutPage = 0;
+
+    for (ULONG32 i = 0; i < entryCount; i++)
+    {
+        PHV_SCATTER_ENTRY entry = &entries[i];
+
+        ULONG64 gva    = entry->GuestVa;
+        ULONG32 sz     = entry->Size;
+        ULONG32 outOff = entry->OutputOffset;
+
+        if (sz == 0 || sz > PAGE_SIZE || outOff + sz > totalOutput) {
+            entry->Status = 2;
+            continue;
+        }
+
+        BOOLEAN anyOk = FALSE;
+        ULONG32 done = 0;
+
+        while (done < sz)
+        {
+            ULONG32 pageRem = (ULONG32)(PAGE_SIZE - ((gva + done) & 0xFFF));
+            ULONG32 chunk = sz - done;
+            if (chunk > pageRem) chunk = pageRem;
+
+            ULONG64 dPa     = outputPa + outOff + done;
+            ULONG64 dPagePa = dPa & ~0xFFFULL;
+            ULONG32 dOff    = (ULONG32)(dPa & 0xFFF);
+
+            ULONG32 dAvail = PAGE_SIZE - dOff;
+            if (chunk > dAvail) chunk = dAvail;
+
+            ULONG64 srcPa = TranslateGuestVaToPa(cr3, gva + done);
+
+            if (!cachedOutMap || cachedOutPage != dPagePa) {
+                if (cachedOutMap) UnmapPhysicalPage_Vmm(cachedOutMap);
+                cachedOutMap = MapPhysicalPage_Vmm(dPa);
+                cachedOutPage = dPagePa;
+            }
+
+            if (!cachedOutMap) { done += chunk; continue; }
+            PUCHAR dstPtr = (PUCHAR)cachedOutMap + dOff;
+
+            if (!srcPa) {
+                RtlZeroMemory(dstPtr, chunk);
+                done += chunk;
+                continue;
+            }
+
+            PVOID srcMap = MapPhysicalPage_Vmm(srcPa);
+            if (srcMap) {
+                PUCHAR srcPtr = (PUCHAR)srcMap + (srcPa & 0xFFF);
+                ULONG32 srcAvail = PAGE_SIZE - (ULONG32)(srcPa & 0xFFF);
+                if (chunk > srcAvail) chunk = srcAvail;
+                RtlCopyMemory(dstPtr, srcPtr, chunk);
+                UnmapPhysicalPage_Vmm(srcMap);
+                anyOk = TRUE;
+            } else {
+                RtlZeroMemory(dstPtr, chunk);
+            }
+
+            done += chunk;
+        }
+
+        entry->Status = anyOk ? 0 : 1;
+        if (anyOk) successCount++;
+    }
+
+    if (cachedOutMap) UnmapPhysicalPage_Vmm(cachedOutMap);
+
+    MmUnmapIoSpace(tableMap, tableMapSize);
+
+    ctx->SuccessCount = successCount;
+    ctx->Status = (successCount == entryCount) ? 0 : -1;
+    UnmapPhysicalPage_Vmm(ctxMap);
+
+    vpData->Guest_gpr.Rax = (UINT64)successCount;
+}

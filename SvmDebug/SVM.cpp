@@ -524,6 +524,9 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
             vpData->Guest_gpr.Rbx = g_HvSharedContextPa;
             HvHandleMemoryOp(vpData);
         }
+        else if (leaf == CPUID_HV_BATCH_READ) {
+            HvHandleBatchRead(vpData);
+        }
         else if (leaf == CPUID_HV_DEBUG_OP) {
             HvHandleDebugOp(vpData);
         }

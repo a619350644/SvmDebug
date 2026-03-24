@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc -l /c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/*.cpp /c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/*.h)",
+      "Bash(find /c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug -name \"*.cpp\" -exec wc -l {} +)",
+      "Read(//c/Users/yejinzhao/Downloads/files \\(64\\)/**)",
+      "Read(//d/工具/cheat-engine-7.5/DBKKernel/**)",
+      "Bash(cat:*)",
+      "Bash(ls \"D:/工具/cheat-engine-7.5/DBKKernel/HvBatchRead\"*)",
+      "Bash(git lfs:*)",
+      "Read(//c/Users/yejinzhao/Documents/LaunchSvmDebug/**)",
+      "Bash(git -C \"C:\\\\Users\\\\yejinzhao\\\\Documents\\\\LaunchSvmDebug\" status)",
+      "Bash(gh auth:*)",
+      "Bash(where gh:*)",
+      "Bash(where git:*)"
+    ]
+  }
+}

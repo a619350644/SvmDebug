@@ -65,6 +65,10 @@ typedef struct _VCPU_CONTEXT VCPU_CONTEXT, * PVCPU_CONTEXT;
 /* VMM-level */
 VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData);
 
+/* [NEW] 批量散射读取 — VMM Host 侧 */
+#include "HvBatchRead.h"
+VOID HvHandleBatchRead(PVCPU_CONTEXT vpData);
+
 /* Driver-level */
 NTSTATUS HvReadProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZE_T Size);
 NTSTATUS HvWriteProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZE_T Size);
