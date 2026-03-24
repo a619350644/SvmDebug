@@ -29,6 +29,12 @@ extern "C" {
 
 /* CPUID 超级调用叶号 (紧接 CPUID_HV_MEMORY_OP = 0x41414150) */
 #define CPUID_HV_BATCH_READ     0x41414151
+#define CPUID_HV_DIAG           0x41414152  /* [DIAG] 诊断通道 */
+
+/* 诊断子命令 (放在 ECX 中) */
+#define HV_DIAG_INIT_STATUS     0x01  /* DriverEntry 初始化状态报告 */
+#define HV_DIAG_READ_ENTER      0x02  /* IOCTL_CE_READMEMORY 入口 */
+#define HV_DIAG_READ_RESULT     0x03  /* IOCTL_CE_READMEMORY 结果 */
 
 /* 限制 */
 #define HV_BATCH_MAX_ENTRIES    512

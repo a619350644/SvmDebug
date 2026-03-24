@@ -12,7 +12,13 @@
       "Bash(git -C \"C:\\\\Users\\\\yejinzhao\\\\Documents\\\\LaunchSvmDebug\" status)",
       "Bash(gh auth:*)",
       "Bash(where gh:*)",
-      "Bash(where git:*)"
+      "Bash(where git:*)",
+      "Bash(ls -la \"/Users/yejinzhao/Downloads/files \\(69\\)/\")",
+      "Bash(ls \"/c/Users/yejinzhao/Downloads/files \\(69\\)/\")",
+      "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/HvBatchRead.h\":*)",
+      "Bash(msbuild SvmDebug.sln /p:Configuration=Release /p:Platform=x64)",
+      "Bash(ls -lh \"/c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/\"*.h)",
+      "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/DIAGNOSTIC_TESTING.txt\":*)"
     ]
   }
 }

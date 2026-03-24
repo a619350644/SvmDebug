@@ -1652,7 +1652,10 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
                 ObDereferenceObject(targetProc);
 
                 if (usePhysical) {
-                    NTSTATUS status = HvReadProcessMemory(
+                    /* [v19] CPUID VMEXIT → VMM Host 物理直读
+                     * Guest R0 零 MmCopyMemory/MmMapIoSpace 调用
+                     * ACE 完全看不到任何物理内存操作 */
+                    NTSTATUS status = HvReadProcessMemory_Vmexit(
                         (ULONG64)(ULONG_PTR)targetPid, BaseAddress, Buffer, Size);
                     if (NumberOfBytesRead) {
                         __try { *NumberOfBytesRead = NT_SUCCESS(status) ? Size : 0; }

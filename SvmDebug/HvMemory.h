@@ -71,6 +71,7 @@ VOID HvHandleBatchRead(PVCPU_CONTEXT vpData);
 
 /* Driver-level */
 NTSTATUS HvReadProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZE_T Size);
+NTSTATUS HvReadProcessMemory_Vmexit(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZE_T Size);
 NTSTATUS HvWriteProcessMemory(ULONG64 TargetPid, PVOID Address, PVOID Buffer, SIZE_T Size);
 
 /* [FIX-v4] 真正的 ZwQueryVirtualMemory — 通过 SvmDebug 上下文调用 */
