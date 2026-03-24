@@ -492,21 +492,38 @@ static VOID UnmapPhysicalPage_Vmm(PVOID v)
 
 static BOOLEAN PhysicalMemoryCopy_Vmm(ULONG64 dst, ULONG64 src, SIZE_T sz, BOOLEAN w)
 {
-    UNREFERENCED_PARAMETER(w);
     if (sz == 0 || sz > PAGE_SIZE) return FALSE;
-    PVOID s = MapPhysicalPage_Vmm(src);
-    if (!s) return FALSE;
-    PVOID d = MapPhysicalPage_Vmm(dst);
-    if (!d) { UnmapPhysicalPage_Vmm(s); return FALSE; }
-    SIZE_T sA = PAGE_SIZE - (SIZE_T)(src & 0xFFF);
-    SIZE_T dA = PAGE_SIZE - (SIZE_T)(dst & 0xFFF);
-    SIZE_T c = sz;
-    if (c > sA) c = sA;
-    if (c > dA) c = dA;
-    RtlCopyMemory((PUCHAR)d + (dst & 0xFFF), (PUCHAR)s + (src & 0xFFF), c);
-    UnmapPhysicalPage_Vmm(d);
-    UnmapPhysicalPage_Vmm(s);
-    return TRUE;
+
+    if (!w) {
+        /* [PERF FIX] 读取路径: MmCopyMemory 读源 → MmMapIoSpace 写目标
+         * 旧代码映射 src + dst 两页, 现在只映射 dst 一页
+         * 消除源页 MmMapIoSpace, 减少 50% TLB flush */
+        UCHAR tmpBuf[PAGE_SIZE];
+        SIZE_T copied = ReadPhysicalBytes(src, tmpBuf, sz);
+        if (copied == 0) return FALSE;
+
+        PVOID d = MapPhysicalPage_Vmm(dst);
+        if (!d) return FALSE;
+        RtlCopyMemory((PUCHAR)d + (dst & 0xFFF), tmpBuf, copied);
+        UnmapPhysicalPage_Vmm(d);
+        return TRUE;
+    }
+    else {
+        /* 写入路径: 保持原逻辑 (需要映射目标页为可写) */
+        PVOID s = MapPhysicalPage_Vmm(src);
+        if (!s) return FALSE;
+        PVOID d = MapPhysicalPage_Vmm(dst);
+        if (!d) { UnmapPhysicalPage_Vmm(s); return FALSE; }
+        SIZE_T sA = PAGE_SIZE - (SIZE_T)(src & 0xFFF);
+        SIZE_T dA = PAGE_SIZE - (SIZE_T)(dst & 0xFFF);
+        SIZE_T c = sz;
+        if (c > sA) c = sA;
+        if (c > dA) c = dA;
+        RtlCopyMemory((PUCHAR)d + (dst & 0xFFF), (PUCHAR)s + (src & 0xFFF), c);
+        UnmapPhysicalPage_Vmm(d);
+        UnmapPhysicalPage_Vmm(s);
+        return TRUE;
+    }
 }
 
 VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData)
@@ -673,17 +690,28 @@ VOID HvHandleBatchRead(PVCPU_CONTEXT vpData)
                 continue;
             }
 
-            PVOID srcMap = MapPhysicalPage_Vmm(srcPa);
-            if (srcMap) {
-                PUCHAR srcPtr = (PUCHAR)srcMap + (srcPa & 0xFFF);
-                ULONG32 srcAvail = PAGE_SIZE - (ULONG32)(srcPa & 0xFFF);
-                if (chunk > srcAvail) chunk = srcAvail;
-                RtlCopyMemory(dstPtr, srcPtr, chunk);
-                UnmapPhysicalPage_Vmm(srcMap);
-                anyOk = TRUE;
-            }
-            else {
-                RtlZeroMemory(dstPtr, chunk);
+            /* [PERF FIX] 用 MmCopyMemory 代替 MmMapIoSpace 读取源页
+             *
+             * 旧代码: MapPhysicalPage_Vmm(srcPa) + memcpy + UnmapPhysicalPage_Vmm
+             *   每个条目 1 次 MmMapIoSpace + 1 次 MmUnmapIoSpace
+             *   5000 次 scan = 5000 次 map/unmap = TLB shootdown IPI 风暴
+             *   → CLOCK_WATCHDOG_TIMEOUT (0x101) + 其他 CPU 卡死
+             *
+             * 新代码: MmCopyMemory(MM_COPY_MEMORY_PHYSICAL)
+             *   零映射, 零 PFN 修改, 零 TLB flush
+             *   直接从物理地址拷贝到栈缓冲区, 再写入输出映射 */
+            {
+                UCHAR tmpBuf[PAGE_SIZE];
+                SIZE_T copied = ReadPhysicalBytes(srcPa, tmpBuf, chunk);
+                if (copied > 0) {
+                    RtlCopyMemory(dstPtr, tmpBuf, copied);
+                    if (copied < chunk)
+                        RtlZeroMemory(dstPtr + copied, chunk - copied);
+                    anyOk = TRUE;
+                }
+                else {
+                    RtlZeroMemory(dstPtr, chunk);
+                }
             }
 
             done += chunk;
