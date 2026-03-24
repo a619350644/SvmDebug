@@ -1485,10 +1485,18 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
 
     /* protection 伪装: 对进程查询自身 (NtCurrentProcess) 时生效
      * CE 查外部进程在上面 return 了, 不会到这里
-     * 游戏自查仍然会被伪装, 隐藏 Hook 痕迹 */
+     * 游戏自查仍然会被伪装, 隐藏 Hook 痕迹
+     *
+     * [BUG FIX v19] 增加 KernelMode 豁免:
+     * DBKKernel 的 StealthQueryVM 曾使用 KeStackAttachProcess + NtCurrentProcess()
+     * 导致此伪装代码把 EXECUTE* 保护改为 PAGE_READONLY
+     * → CE Memory Viewer 显示 ??? + First Scan 跳过区域
+     * 虽然已改用 kernel handle (不再命中此路径), 但加防御性检查:
+     * 内核模式调用者不需要伪装 (只有用户态的游戏自查才需要) */
     if (NT_SUCCESS(status) && MemInfoClass == 0 &&
         MemInfo && MemInfoLength >= sizeof(MEMORY_BASIC_INFORMATION) &&
-        (ProcessHandle == NtCurrentProcess() || ProcessHandle == (HANDLE)-1 || !ProcessHandle))
+        (ProcessHandle == NtCurrentProcess() || ProcessHandle == (HANDLE)-1 || !ProcessHandle) &&
+        ExGetPreviousMode() == UserMode)
     {
         PMEMORY_BASIC_INFORMATION mbi = (PMEMORY_BASIC_INFORMATION)MemInfo;
 

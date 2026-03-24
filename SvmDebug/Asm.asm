@@ -141,4 +141,38 @@ Asm_CallOrig7Args PROC
     jmp r10
 Asm_CallOrig7Args ENDP
 
+; =========================================================================
+; @brief Execute CPUID with RBX explicitly set to a context PA
+;
+; [BUG FIX] __cpuidex does NOT set RBX before CPUID.
+; VMM's HvHandleMemoryOp reads vpData->Guest_gpr.Rbx as shared context PA.
+; Without this, RBX contains garbage -> VMM maps wrong physical address.
+;
+; Also fixes the VMM-side bug where SVM.cpp forcibly overwrote RBX with
+; g_HvSharedContextPa -- now Guest explicitly passes the correct PA.
+;
+; @param RCX = CPUID leaf (EAX input)
+; @param RDX = CPUID sub-leaf (ECX input)
+; @param R8  = value to set in RBX (shared context physical address)
+; @param R9  = pointer to int[4] output array {eax, ebx, ecx, edx}
+; =========================================================================
+HvCpuidWithRbx PROC
+    push rbx              ; RBX is callee-saved per x64 ABI
+
+    mov eax, ecx          ; EAX = leaf
+    mov ecx, edx          ; ECX = sub-leaf
+    mov rbx, r8           ; RBX = context physical address
+
+    cpuid                 ; triggers VMEXIT -- VMM reads RBX
+
+    ; Store CPUID results
+    mov [r9],    eax      ; regs[0]
+    mov [r9+4],  ebx      ; regs[1]
+    mov [r9+8],  ecx      ; regs[2]
+    mov [r9+12], edx      ; regs[3]
+
+    pop rbx               ; restore caller's RBX
+    ret
+HvCpuidWithRbx ENDP
+
 END

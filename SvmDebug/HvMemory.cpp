@@ -35,6 +35,12 @@
 #include "HvMemory.h"
 #include "SVM.h"
 
+/* [BUG FIX] ASM helper: sets RBX = context PA before CPUID.
+ * Without this, __cpuidex leaves RBX as garbage, and VMM previously
+ * hardcoded RBX = g_HvSharedContextPa (which broke DBKKernel's separate context).
+ * Now both SvmDebug and DBKKernel pass their own context PA via RBX. */
+extern "C" void HvCpuidWithRbx(int leaf, int subleaf, ULONG64 rbxValue, int* regs);
+
  /* ========================================================================
   *  Per-CPU bypass flag (v14)
   * ======================================================================== */
@@ -464,9 +470,11 @@ NTSTATUS HvReadProcessMemory_Vmexit(ULONG64 pid, PVOID addr, PVOID buf, SIZE_T s
 
         KeMemoryBarrier();
 
-        /* ★ 一次 CPUID — 一次 VMEXIT — VMM Host 物理直读 ★ */
+        /* ★ 一次 CPUID — 一次 VMEXIT — VMM Host 物理直读 ★
+         * [BUG FIX] 使用 HvCpuidWithRbx 显式传递 g_HvSharedContextPa 到 RBX
+         * VMM 不再强制覆盖 RBX, Guest 必须自行传入正确的上下文 PA */
         int regs[4] = { 0 };
-        __cpuidex(regs, CPUID_HV_MEMORY_OP, HV_MEM_OP_READ);
+        HvCpuidWithRbx(CPUID_HV_MEMORY_OP, HV_MEM_OP_READ, g_HvSharedContextPa, regs);
 
         LONG vmStatus = g_HvSharedContext->Status;
         if (vmStatus != 0) {

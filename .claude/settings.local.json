@@ -18,7 +18,15 @@
       "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/HvBatchRead.h\":*)",
       "Bash(msbuild SvmDebug.sln /p:Configuration=Release /p:Platform=x64)",
       "Bash(ls -lh \"/c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/\"*.h)",
-      "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/DIAGNOSTIC_TESTING.txt\":*)"
+      "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/DIAGNOSTIC_TESTING.txt\":*)",
+      "Bash(ls -lh '/c/Users/yejinzhao/Downloads/files \\(71\\)/SvmDebug/')",
+      "Bash(ls -lh '/c/Users/yejinzhao/Downloads/files \\(71\\)/DBKKernel/')",
+      "Bash(ls:*)",
+      "Bash(diff \"/c/Users/yejinzhao/source/repos/SvmDebug/SvmDebug/Asm.asm\" \"/c/Users/yejinzhao/Downloads/files \\(71\\)/SvmDebug/Asm.asm\")",
+      "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/CE_MEMORY_BUG_FIX_SUMMARY.md\":*)",
+      "Bash(\"/c/Users/yejinzhao/source/repos/SvmDebug/VERIFICATION_CHECKLIST.txt\":*)",
+      "Bash(find:*)",
+      "Bash(\"/c/Users/yejinzhao/FINAL_MERGE_SUMMARY.txt\":*)"
     ]
   }
 }

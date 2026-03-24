@@ -521,7 +521,13 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
             vpData->Guest_gpr.Rax = 0;
         }
         else if (leaf == CPUID_HV_MEMORY_OP) {
-            vpData->Guest_gpr.Rbx = g_HvSharedContextPa;
+            /* [BUG FIX] Do NOT overwrite RBX with g_HvSharedContextPa.
+             * Guest now sets RBX = context PA via HvCpuidWithRbx ASM helper.
+             * Old code forced VMM to always read SvmDebug's own shared context,
+             * which was empty/stale when DBKKernel triggered the CPUID.
+             * DBKKernel fills its own g_BridgeContext and passes g_BridgeContextPa
+             * via RBX. SvmDebug's own HvMemory.cpp also now passes g_HvSharedContextPa
+             * via RBX. Both work correctly without the overwrite. */
             HvHandleMemoryOp(vpData);
         }
         else if (leaf == CPUID_HV_BATCH_READ) {
