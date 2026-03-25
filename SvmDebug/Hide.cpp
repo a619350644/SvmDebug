@@ -1386,17 +1386,82 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
     PVOID MemInfo, SIZE_T MemInfoLength, PSIZE_T ReturnLength)
 {
     FAKE_PRINT_ONCE_FOR(HOOK_NtQueryVirtualMemory);
+
+    /* [TRACE] 无条件入口 — Release 也打印，只打一次 */
+    {
+        static volatile LONG _tEntry = 0;
+        if (InterlockedCompareExchange(&_tEntry, 1, 0) == 0)
+            SvmDebugPrint("[QVM-TRACE] ENTRY: handle=0x%p caller=%llu protected=%d elevated=%d\n",
+                ProcessHandle, (ULONG64)PsGetCurrentProcessId(),
+                (int)IsCallerProtected(),
+                (int)(g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId())));
+    }
+
     if (!g_OrigNtQueryVirtualMemory) return STATUS_UNSUCCESSFUL;
 
-    /* [NEW] ElevatedPid 调用者直接放行 */
-    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId()))
+    /* [PATH A] ElevatedPid 调用者直接放行 */
+    if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId())) {
+        static volatile LONG _tA = 0;
+        if (InterlockedCompareExchange(&_tA, 1, 0) == 0)
+            SvmDebugPrint("[QVM-TRACE] PATH-A: ElevatedPid passthrough\n");
         return g_OrigNtQueryVirtualMemory(
             ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
+    }
 
+    /* [PATH B] CE (Protected caller) 查询目标进程
+     * 用临时 OBJ_KERNEL_HANDLE 绕过 ObRegisterCallbacks 降权 */
+    if (IsCallerProtected() &&
+        ProcessHandle && ProcessHandle != NtCurrentProcess())
+    {
+        PEPROCESS targetProc = NULL;
+        NTSTATUS status = ObReferenceObjectByHandle(
+            ProcessHandle, 0, *PsProcessType, KernelMode,
+            (PVOID*)&targetProc, NULL);
+
+        {
+            static volatile LONG _tB1 = 0;
+            if (InterlockedCompareExchange(&_tB1, 1, 0) == 0)
+                SvmDebugPrint("[QVM-TRACE] PATH-B: CE caller, ObRefByHandle status=0x%X\n", status);
+        }
+
+        if (NT_SUCCESS(status) && targetProc) {
+            HANDLE kernelHandle = NULL;
+            status = ObOpenObjectByPointer(
+                targetProc, OBJ_KERNEL_HANDLE, NULL,
+                0x0400, /* PROCESS_QUERY_INFORMATION */
+                *PsProcessType, KernelMode, &kernelHandle);
+            ObDereferenceObject(targetProc);
+
+            if (NT_SUCCESS(status) && kernelHandle) {
+                status = g_OrigNtQueryVirtualMemory(
+                    kernelHandle, BaseAddress, MemInfoClass,
+                    MemInfo, MemInfoLength, ReturnLength);
+                ZwClose(kernelHandle);
+                {
+                    static volatile LONG _tB2 = 0;
+                    if (InterlockedCompareExchange(&_tB2, 1, 0) == 0)
+                        SvmDebugPrint("[QVM-TRACE] PATH-B: kernel handle query status=0x%X\n", status);
+                }
+                return status;
+            }
+        }
+    }
+
+    /* [PATH C] 外部进程查询受保护进程 → 拒绝 */
     if (g_ProtectedPidCount > 0 &&
-        IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
+        IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected()) {
+        static volatile LONG _tC = 0;
+        if (InterlockedCompareExchange(&_tC, 1, 0) == 0)
+            SvmDebugPrint("[QVM-TRACE] PATH-C: ACCESS_DENIED\n");
         return STATUS_ACCESS_DENIED;
+    }
 
+    /* [PATH D] 默认透传 */
+    {
+        static volatile LONG _tD = 0;
+        if (InterlockedCompareExchange(&_tD, 1, 0) == 0)
+            SvmDebugPrint("[QVM-TRACE] PATH-D: default passthrough\n");
+    }
     return g_OrigNtQueryVirtualMemory(
         ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
 }

@@ -18,6 +18,12 @@
 #include "HvMemory.h"
 #include "DebugApi.h"
 
+/* ================================================================
+ * 全局计数器 - 用于追踪 NtReadVirtualMemory / ZwQueryVirtualMemory 的页面访问
+ * ================================================================ */
+static volatile LONG64 g_ReadMemoryNpfCount = 0;      // NtReadVirtualMemory FakePa 访问计数
+static volatile LONG64 g_QueryMemoryNpfCount = 0;     // ZwQueryVirtualMemory FakePa 访问计数
+
  /* HvBatchRead 常量 — 避免直接 #include "HvBatchRead.h" (extern "C" + ntifs.h 冲突) */
 #ifndef CPUID_HV_BATCH_READ
 #define CPUID_HV_BATCH_READ  0x41414151
@@ -578,9 +584,38 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
     case VMEXIT_NPF:
     {
         UINT64 faultHpa = vmcb->ControlArea.ExitInfo2;
+        UINT64 faultPagePa = faultHpa & ~0xFFF;
         UINT64 errorCode = vmcb->ControlArea.ExitInfo1;
         BOOLEAN isExecFault = (errorCode & 0x10) != 0;
         PNPT_HOOK_CONTEXT hookCtx = FindHookByFaultPa(faultHpa);
+
+        /* [NPF-PROOF] 计数器日志 - 追踪 NtReadVirtualMemory / ZwQueryVirtualMemory 的页面访问 */
+        // NtReadVirtualMemory 的 FakePa 是 0x7C613000
+        if (faultPagePa == 0x7C613000)
+        {
+            LONG64 count = InterlockedIncrement64(&g_ReadMemoryNpfCount);
+            // 每 1000 次打印一次，避免日志风暴
+            if (count % 1000 == 1)
+            {
+                DbgPrintEx(0, 0, "[SvmDebug] [NPF-PROOF] "
+                    "NtReadVirtualMemory page hit #%lld, "
+                    "faultPA=0x%llX, RIP=0x%llX\n",
+                    count, faultHpa, vmcb->StateSaveArea.Rip);
+            }
+        }
+
+        // ZwQueryVirtualMemory 的 FakePa 是 0x7C61E000
+        if (faultPagePa == 0x7C61E000)
+        {
+            LONG64 count = InterlockedIncrement64(&g_QueryMemoryNpfCount);
+            if (count % 1000 == 1)
+            {
+                DbgPrintEx(0, 0, "[SvmDebug] [NPF-PROOF] "
+                    "ZwQueryVirtualMemory page hit #%lld, "
+                    "faultPA=0x%llX, RIP=0x%llX\n",
+                    count, faultHpa, vmcb->StateSaveArea.Rip);
+            }
+        }
 
         if (hookCtx != nullptr) {
             if (isExecFault) {
@@ -589,10 +624,10 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
 
 
                 PNPT_HOOK_CONTEXT matchedHook = nullptr;
-                ULONG64 faultPagePa = hookCtx->OriginalPagePa;
+                ULONG64 faultPagePa_hook = hookCtx->OriginalPagePa;
                 for (int hi = 0; hi < HOOK_MAX_COUNT; hi++) {
                     if (g_HookList[hi].IsUsed &&
-                        g_HookList[hi].OriginalPagePa == faultPagePa &&
+                        g_HookList[hi].OriginalPagePa == faultPagePa_hook &&
                         guestRip == (ULONG64)g_HookList[hi].TargetAddress) {
                         matchedHook = &g_HookList[hi];
                         break;
