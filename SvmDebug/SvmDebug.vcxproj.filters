@@ -111,6 +111,9 @@
     <ClInclude Include="SvmLog.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="HvBatchRead.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <MASM Include="SvmRun.asm">

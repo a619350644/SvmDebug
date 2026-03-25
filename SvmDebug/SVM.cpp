@@ -18,6 +18,17 @@
 #include "HvMemory.h"
 #include "DebugApi.h"
 
+ /* HvBatchRead 常量 — 避免直接 #include "HvBatchRead.h" (extern "C" + ntifs.h 冲突) */
+#ifndef CPUID_HV_BATCH_READ
+#define CPUID_HV_BATCH_READ  0x41414151
+#endif
+#ifndef CPUID_HV_DIAG
+#define CPUID_HV_DIAG        0x41414152
+#endif
+
+/* 前向声明 (定义在 HvMemory.cpp) */
+VOID HvHandleBatchRead(PVCPU_CONTEXT vpData);
+
 extern ULONG64 g_SystemCr3;
 /**
  * @brief 强制刷新NPT TLB - 清除VMCB缓存并重新加载NPT CR3
@@ -527,6 +538,14 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
         else if (leaf == CPUID_HV_DEBUG_OP) {
             HvHandleDebugOp(vpData);
         }
+        else if (leaf == CPUID_HV_BATCH_READ) {
+            HvHandleBatchRead(vpData);
+        }
+        else if (leaf == CPUID_HV_DIAG) {
+            /* 诊断通道: ECX = 子命令, RBX = 参数
+             * 返回 RAX = 0 (确认收到) */
+            vpData->Guest_gpr.Rax = 0;
+        }
         else if (HandleHypercallCommand(vpData, vmcb, leaf)) {
             /* handled */
         }
@@ -644,6 +663,19 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
                     vmcb->StateSaveArea.Rflags &= ~(1ULL << 8);
                     vmcb->StateSaveArea.Dr6 &= ~(1ULL << 14);
                     g_NptBreakpoints[i].IsSingleStepping = FALSE;
+
+                    /* TODO: 通知调试器断点命中
+                     *
+                     * 不能在 VMEXIT handler 中直接注入 #BP 到 Guest!
+                     * 原因: 单步恢复后 Guest 的 RSP/栈帧已经变化,
+                     *       强行修改 RIP + 注入异常会导致栈指针与 RIP 不匹配
+                     *       → Windows RtlpGetStackLimitsEx 检测栈越界 → BSOD 0x139
+                     *
+                     * 正确方案: 通过共享内存标记断点命中事件,
+                     *          R0 层的 Fake_DbgkForwardException 或轮询机制
+                     *          将 STATUS_BREAKPOINT 事件投递到影子调试队列。
+                     */
+
                     handled = TRUE;
                     break;
                 }
@@ -661,6 +693,10 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
             reinject.Fields.Type = 3;
             reinject.Fields.Valid = 1;
             vmcb->ControlArea.EventInj = reinject.AsUInt64;
+            /* [FIX] 设置 RF (Resume Flag, bit 16) 防止执行断点无限 #DB 循环
+             * 没有 RF 时, 如果 DR0-DR3 设置了执行断点, 回到同一条指令
+             * 会再次触发 #DB → VMEXIT → 回注 → #DB → ... 无限循环 */
+            vmcb->StateSaveArea.Rflags |= (1ULL << 16);
         }
         break;
     }
@@ -726,11 +762,10 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
                 ForceNptFlush(vpData);
             }
 
-            /* 设置 TF → 执行 1 条原始指令后 #DB VMEXIT → 重新激活断点 */
+            /* 设置 TF → 执行 1 条原始指令后 #DB VMEXIT → 重新激活断点
+             * 注意: 调试器通知机制尚未实现 (见 #DB handler 中的 TODO) */
             vmcb->StateSaveArea.Rflags |= (1ULL << 8);
             g_NptBreakpoints[bpIdx].IsSingleStepping = TRUE;
-
-            /* TODO: 投递 STATUS_BREAKPOINT 事件到 DebugApi 事件队列 */
         }
         else {
             /* 不是我们的断点 — 回注到 Guest OS */
@@ -748,7 +783,16 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
         ULONG crNum = 0, gprNum = 0, instrLen = 0;
         BOOLEAN isCrWrite = FALSE;
 
-        if (DecodeCrInstructionFromRip(vmcb->StateSaveArea.Rip, &crNum, &gprNum, &instrLen, &isCrWrite))
+        /* [FIX] 先验证 Guest RSP 是否在合法范围
+         * 如果 RSP 看起来已经越界(非 canonical 或为 0),
+         * 不尝试模拟, 直接回注 #GP 让 Guest 处理 */
+        UINT64 guestRsp = vmcb->StateSaveArea.Rsp;
+        BOOLEAN rspValid = (guestRsp != 0) &&
+                           ((guestRsp < 0x800000000000ULL) ||
+                            (guestRsp >= 0xFFFF800000000000ULL));
+
+        if (rspValid &&
+            DecodeCrInstructionFromRip(vmcb->StateSaveArea.Rip, &crNum, &gprNum, &instrLen, &isCrWrite))
         {
             if (isCrWrite) {
                 UINT64 value = ReadGuestGpr(vpData, vmcb, gprNum);
@@ -774,6 +818,7 @@ void SvHandleVmExit(PVCPU_CONTEXT vpData)
             vmcb->StateSaveArea.Rip += instrLen;
         }
         else {
+            /* 回注 #GP */
             EVENTINJ reinject = { 0 };
             reinject.Fields.Vector = 13;
             reinject.Fields.Type = 3;

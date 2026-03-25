@@ -171,6 +171,7 @@
     <ClInclude Include="hde\table64.h" />
     <ClInclude Include="Hide.h" />
     <ClInclude Include="Hook.h" />
+    <ClInclude Include="HvBatchRead.h" />
     <ClInclude Include="HvMemory.h" />
     <ClInclude Include="MDL\MDL.h" />
     <ClInclude Include="NPT.h" />

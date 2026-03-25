@@ -14,11 +14,49 @@
 #include "SVM.h"
 
  /* ========================================================================
-  *  Shared context for Guest <-> VMM communication *  Allocated as contiguous physical memory so VMM can access it
+  * HvBatchRead 类型定义 — 内联而非 #include "HvBatchRead.h"
+  * 原因: HvBatchRead.h 中 extern "C" 包裹 #include <ntifs.h> 导致
+  *       C++ 编译时语法错误 (C2144)。将所需类型直接定义于此。
   * ======================================================================== */
+#ifndef CPUID_HV_BATCH_READ
+#define CPUID_HV_BATCH_READ     0x41414151
+#endif
+#ifndef HV_BATCH_MAX_ENTRIES
+#define HV_BATCH_MAX_ENTRIES    512
+#endif
+
+#pragma pack(push, 8)
+typedef struct _HV_SCATTER_ENTRY {
+    ULONG64 GuestVa;
+    ULONG   Size;
+    ULONG   OutputOffset;
+    ULONG   Status;
+    ULONG   Reserved;
+} HV_SCATTER_ENTRY, * PHV_SCATTER_ENTRY;
+
+typedef struct _HV_BATCH_CONTEXT {
+    ULONG64 TargetCr3;
+    ULONG   EntryCount;
+    ULONG   TotalOutputSize;
+    ULONG64 EntriesPa;
+    ULONG64 OutputPa;
+    ULONG   SuccessCount;
+    volatile LONG Status;
+} HV_BATCH_CONTEXT, * PHV_BATCH_CONTEXT;
+#pragma pack(pop)
+
+/* ========================================================================
+ *  Shared context for Guest <-> VMM communication *  Allocated as contiguous physical memory so VMM can access it
+ * ======================================================================== */
 PHV_RW_CONTEXT g_HvSharedContext = nullptr;
 ULONG64 g_HvSharedContextPa = 0;
 FAST_MUTEX g_HvMutex;
+
+/* [FIX-v14] Per-CPU bypass flag — 防止 SvmDebug 内部操作被自己的 Hook 拦截 */
+#ifndef HV_MAX_CPU
+#define HV_MAX_CPU 256
+#endif
+volatile LONG g_HvInternalOp[HV_MAX_CPU] = { 0 };
 
 /**
  * @brief 初始化Guest-VMM共享上下文页 - 分配连续物理内存供超级调用通信
@@ -66,6 +104,15 @@ VOID HvFreeSharedContext()
 /* ========================================================================
  *  Guest VA -> Guest PA translation by walking x64 page tables *  Runs in VMM (Host) context - reads physical memory directly
  * ======================================================================== */
+
+/* -----------------------------------------------------------------
+ * 第1级: 快速路径 — 用于 TranslateGuestVaToPa 的页表遍历
+ *
+ * MmGetVirtualForPhysical 从 PFN 数据库直接返回 VA:
+ *   - 页表页(PML4/PDPT/PD/PT)始终是内核分配的，返回内核 VA
+ *   - 不分配系统 PTE，零开销
+ *   - 不需要取消映射
+ * ----------------------------------------------------------------- */
 static PVOID MapPhysicalPage(ULONG64 PhysAddr, SIZE_T Size)
 {
     UNREFERENCED_PARAMETER(Size);
@@ -78,6 +125,33 @@ static VOID UnmapPhysicalPage(PVOID Va, SIZE_T Size)
 {
     UNREFERENCED_PARAMETER(Va);
     UNREFERENCED_PARAMETER(Size);
+    /* MmGetVirtualForPhysical 不需要取消映射 */
+}
+
+/* -----------------------------------------------------------------
+ * 第2级: 安全路径 — 用于 PhysicalMemoryCopy 的数据页访问
+ *
+ * MmMapIoSpace 创建独立的系统 PTE 映射:
+ *   - 返回的 VA 在系统空间，任何 CR3 下都可访问
+ *   - 不会触发缺页（非分页映射）
+ *   - 需要配对调用 UnmapPhysicalPageSafe 释放系统 PTE
+ *
+ * 为什么不能用 MmGetVirtualForPhysical:
+ *   用户进程的数据页 → 返回用户态 VA → VMM Host 栈上访问 → 缺页
+ *   → Windows 检查 RSP 不在线程栈范围 → BSOD 0x139
+ * ----------------------------------------------------------------- */
+static PVOID MapPhysicalPageSafe(ULONG64 PhysAddr)
+{
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = (LONGLONG)(PhysAddr & ~0xFFFULL);
+    return MmMapIoSpace(pa, PAGE_SIZE, MmCached);
+}
+
+static VOID UnmapPhysicalPageSafe(PVOID Va)
+{
+    if (Va) {
+        MmUnmapIoSpace(Va, PAGE_SIZE);
+    }
 }
 
 /**
@@ -181,12 +255,13 @@ static BOOLEAN PhysicalMemoryCopy(
     UNREFERENCED_PARAMETER(IsWrite);
     if (Size == 0 || Size > PAGE_SIZE) return FALSE;
 
-    PVOID srcMap = MapPhysicalPage(SrcPa, PAGE_SIZE);
+    /* [FIX] 使用安全路径映射数据页 — 避免用户 VA 在 Host 栈上缺页 */
+    PVOID srcMap = MapPhysicalPageSafe(SrcPa);
     if (!srcMap) return FALSE;
 
-    PVOID dstMap = MapPhysicalPage(DestPa, PAGE_SIZE);
+    PVOID dstMap = MapPhysicalPageSafe(DestPa);
     if (!dstMap) {
-        UnmapPhysicalPage(srcMap, PAGE_SIZE);
+        UnmapPhysicalPageSafe(srcMap);
         return FALSE;
     }
 
@@ -204,8 +279,8 @@ static BOOLEAN PhysicalMemoryCopy(
         (PUCHAR)srcMap + srcOffset,
         copyLen);
 
-    UnmapPhysicalPage(dstMap, PAGE_SIZE);
-    UnmapPhysicalPage(srcMap, PAGE_SIZE);
+    UnmapPhysicalPageSafe(dstMap);
+    UnmapPhysicalPageSafe(srcMap);
 
     return TRUE;
 }
@@ -301,6 +376,112 @@ VOID HvHandleMemoryOp(PVCPU_CONTEXT vpData)
 
     // Return bytes processed in RAX (0 = success with full transfer)
     vpData->Guest_gpr.Rax = (resultStatus == 0) ? bytesProcessed : (UINT64)resultStatus;
+}
+
+/* ========================================================================
+ *  Batch Scatter-Gather Read — VMM 侧处理器
+ *
+ *  CE 扫描内存时将多个读取请求打包为散射表,
+ *  通过一次 CPUID VMEXIT 传给 VMM Host,
+ *  Host 在物理层一次性读取所有条目返回结果。
+ *
+ *  数据流:
+ *    Guest RBX = HV_BATCH_CONTEXT 物理地址
+ *    VMM: 映射 BatchContext → 映射 ScatterEntries → 逐条翻译 + 拷贝
+ *    返回: BatchContext.SuccessCount / Status
+ * ======================================================================== */
+
+VOID HvHandleBatchRead(PVCPU_CONTEXT vpData)
+{
+    if (!vpData) return;
+
+    ULONG64 ctxPa = vpData->Guest_gpr.Rbx;
+    if (ctxPa == 0) {
+        vpData->Guest_gpr.Rax = (UINT64)-1;
+        return;
+    }
+
+    /* 映射 BatchContext 页 */
+    PHV_BATCH_CONTEXT ctx = (PHV_BATCH_CONTEXT)MapPhysicalPage(
+        ctxPa & ~0xFFFULL, PAGE_SIZE);
+    if (!ctx) {
+        vpData->Guest_gpr.Rax = (UINT64)-2;
+        return;
+    }
+    PHV_BATCH_CONTEXT pCtx = (PHV_BATCH_CONTEXT)((PUCHAR)ctx + (ctxPa & 0xFFF));
+
+    ULONG64 targetCr3 = pCtx->TargetCr3;
+    ULONG entryCount = pCtx->EntryCount;
+    ULONG64 entriesPa = pCtx->EntriesPa;
+    ULONG64 outputPa = pCtx->OutputPa;
+
+    if (entryCount == 0 || entryCount > HV_BATCH_MAX_ENTRIES ||
+        entriesPa == 0 || outputPa == 0 || targetCr3 == 0) {
+        pCtx->Status = -3;
+        pCtx->SuccessCount = 0;
+        UnmapPhysicalPage(ctx, PAGE_SIZE);
+        vpData->Guest_gpr.Rax = (UINT64)-3;
+        return;
+    }
+
+    ULONG successCount = 0;
+
+    /* 逐条处理散射条目 */
+    for (ULONG i = 0; i < entryCount; i++) {
+        /* 映射当前条目所在的物理页 */
+        ULONG64 entryPa = entriesPa + i * sizeof(HV_SCATTER_ENTRY);
+        PHV_SCATTER_ENTRY entryPage = (PHV_SCATTER_ENTRY)MapPhysicalPage(
+            entryPa & ~0xFFFULL, PAGE_SIZE);
+        if (!entryPage) continue;
+
+        PHV_SCATTER_ENTRY pEntry = (PHV_SCATTER_ENTRY)((PUCHAR)entryPage + (entryPa & 0xFFF));
+        ULONG64 guestVa = pEntry->GuestVa;
+        ULONG size = pEntry->Size;
+        ULONG outOffset = pEntry->OutputOffset;
+
+        if (size == 0 || size > PAGE_SIZE) {
+            pEntry->Status = (ULONG)-1;
+            UnmapPhysicalPage(entryPage, PAGE_SIZE);
+            continue;
+        }
+
+        /* 按页遍历, 翻译 VA→PA 并拷贝 */
+        ULONG bytesRead = 0;
+        BOOLEAN anyFailed = FALSE;
+
+        while (bytesRead < size) {
+            SIZE_T pageRemain = PAGE_SIZE - (SIZE_T)((guestVa + bytesRead) & 0xFFF);
+            SIZE_T chunkSize = (SIZE_T)(size - bytesRead);
+            if (chunkSize > pageRemain) chunkSize = pageRemain;
+
+            ULONG64 srcPa = TranslateGuestVaToPa(targetCr3, guestVa + bytesRead);
+            if (srcPa == 0) {
+                /* 页面不存在, 跳过 (输出缓冲区对应区域保持为零) */
+                bytesRead += (ULONG)chunkSize;
+                continue;
+            }
+
+            ULONG64 dstPa = outputPa + outOffset + bytesRead;
+            if (!PhysicalMemoryCopy(dstPa, srcPa, chunkSize, FALSE)) {
+                anyFailed = TRUE;
+                bytesRead += (ULONG)chunkSize;
+                continue;
+            }
+
+            bytesRead += (ULONG)chunkSize;
+        }
+
+        pEntry->Status = anyFailed ? (ULONG)-1 : 0;
+        if (!anyFailed) successCount++;
+
+        UnmapPhysicalPage(entryPage, PAGE_SIZE);
+    }
+
+    pCtx->SuccessCount = successCount;
+    pCtx->Status = (successCount == entryCount) ? 0 : -1;
+    UnmapPhysicalPage(ctx, PAGE_SIZE);
+
+    vpData->Guest_gpr.Rax = (UINT64)successCount;
 }
 
 /* ========================================================================

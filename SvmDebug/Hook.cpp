@@ -616,15 +616,25 @@ NTSTATUS BuildTrampoline(PNPT_HOOK_CONTEXT HookContext)
             *(dst + dstOffset++) = 0x50;   // push rax
             *(dst + dstOffset++) = 0x51;   // push rcx
 
-            // 如果源寄存器不是 rcx，则 mov rcx, srcGpr
-            if (srcGpr != 1) {
-                UCHAR rexByte = 0x48;       // REX.W
-                if (srcGpr >= 8) rexByte |= 0x04; // REX.B 置1
+            // 将源寄存器的值移入 rcx (VMMCALL 约定: RCX = 要写入 CR 的值)
+            if (srcGpr == 4) {
+                // [FIX] srcGpr == RSP: push 之后 RSP 已变, 需要补偿 +16
+                *(dst + dstOffset++) = 0x48;   // REX.W
+                *(dst + dstOffset++) = 0x8D;   // LEA
+                *(dst + dstOffset++) = 0x4C;   // ModRM: rcx, [rsp+disp8]
+                *(dst + dstOffset++) = 0x24;   // SIB: base=rsp, index=none
+                *(dst + dstOffset++) = 0x10;   // disp8 = +16 (补偿 2 次 push)
+            }
+            else if (srcGpr != 1) {
+                // 普通寄存器 → mov rcx, srcGpr
+                UCHAR rexByte = 0x48;          // REX.W
+                if (srcGpr >= 8) rexByte |= 0x01;  // [FIX] REX.B (不是 REX.R!)
                 *(dst + dstOffset++) = rexByte;
-                *(dst + dstOffset++) = 0x89; // MOV r/m64, r64
-                // ModRM: mod=11, reg=srcGpr低3位, rm=1 (rcx)
+                *(dst + dstOffset++) = 0x89;   // MOV r/m64, r64
+                // ModRM: mod=11, reg=srcGpr低3位, rm=1(rcx)
                 *(dst + dstOffset++) = (UCHAR)(0xC0 | ((srcGpr & 7) << 3) | 1);
             }
+            // srcGpr == 1 (RCX): 值已经在 RCX 中, 无需 MOV
 
             // 将 VMCALL 参数（写CR操作码）放入 eax
             *(dst + dstOffset++) = 0xB8;   // mov eax, imm32
@@ -648,9 +658,15 @@ NTSTATUS BuildTrampoline(PNPT_HOOK_CONTEXT HookContext)
             if (hs.rex_b) dstGpr += 8;
             if (hs.rex_r) crNum += 8;
 
-            // 保存现场：push rax; push rcx
-            *(dst + dstOffset++) = 0x50;
-            *(dst + dstOffset++) = 0x51;
+            // [FIX] 只保存会被 VMMCALL 破坏的寄存器
+            // VMMCALL 约定: RAX = 操作码, RCX = 返回值
+            // 如果 dstGpr 是 RAX 或 RCX, 不需要保存它(因为它就是目标)
+
+            BOOLEAN saveRax = (dstGpr != 0); // 如果目标就是 RAX, 不需要保存/恢复
+            BOOLEAN saveRcx = (dstGpr != 1); // 如果目标就是 RCX, 不需要保存/恢复
+
+            if (saveRax) *(dst + dstOffset++) = 0x50; // push rax
+            if (saveRcx) *(dst + dstOffset++) = 0x51; // push rcx
 
             // 将 VMCALL 参数（读CR操作码）放入 eax
             *(dst + dstOffset++) = 0xB8;
@@ -662,19 +678,27 @@ NTSTATUS BuildTrampoline(PNPT_HOOK_CONTEXT HookContext)
             *(dst + dstOffset++) = 0x01;
             *(dst + dstOffset++) = 0xD9;
 
-            // 将结果（rax）移动到目标寄存器（如果目标不是 rcx 的话）
-            if (dstGpr != 1) {
+            // VMMCALL 返回后 RCX 持有 CR 值
+            // 将 RCX 移入目标寄存器
+            if (dstGpr == 0) {
+                // [FIX] 目标是 RAX: mov rax, rcx
+                *(dst + dstOffset++) = 0x48;
+                *(dst + dstOffset++) = 0x89;
+                *(dst + dstOffset++) = 0xC8; // ModRM: mod=11, reg=1(rcx), rm=0(rax)
+            }
+            else if (dstGpr != 1) {
+                // 目标不是 RCX: mov dstGpr, rcx
                 UCHAR rexByte = 0x48;
-                if (dstGpr >= 8) rexByte |= 0x01; // REX.B 置1
+                if (dstGpr >= 8) rexByte |= 0x01;
                 *(dst + dstOffset++) = rexByte;
-                *(dst + dstOffset++) = 0x89;       // MOV r/m64, r64
-                // ModRM: mod=11, reg=1 (rcx), rm=dstGpr低3位
+                *(dst + dstOffset++) = 0x89;
                 *(dst + dstOffset++) = (UCHAR)(0xC0 | (1 << 3) | (dstGpr & 7));
             }
+            // dstGpr == 1: 值已经在 RCX, 无需 MOV
 
-            // 恢复现场：pop rcx; pop rax
-            *(dst + dstOffset++) = 0x59;
-            *(dst + dstOffset++) = 0x58;
+            // [FIX] 恢复顺序: 先 pop rcx 再 pop rax, 且只恢复之前保存的
+            if (saveRcx) *(dst + dstOffset++) = 0x59; // pop rcx
+            if (saveRax) *(dst + dstOffset++) = 0x58; // pop rax
         }
         // 7. 其他普通指令：直接复制原始字节
         else
