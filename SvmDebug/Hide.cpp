@@ -113,10 +113,6 @@ static __forceinline VOID LeaveHookGuard(KIRQL OldIrql)
 /* ========================================================================
  *  多目标保护 — PID / HWND 管理
  * ======================================================================== */
-
- /* [DIAG-v23] 前向声明 */
-void ResetScanDiagCounters();
-
 BOOLEAN AddProtectedPid(HANDLE Pid)
 {
     if (!Pid) return FALSE;
@@ -135,10 +131,6 @@ BOOLEAN AddProtectedPid(HANDLE Pid)
     g_ProtectedPIDs[idx] = Pid;
     if (idx == 0)
         g_ProtectedPID = Pid;
-
-    /* [DIAG-v23] 重置扫描诊断计数器, 新的保护session开始 */
-    ResetScanDiagCounters();
-
     return TRUE;
 }
 
@@ -223,35 +215,6 @@ VOID ClearAllProtectedTargets()
 
     /* [NEW] 联动清除升权列表, 防止 PID 复用导致错误升权 */
     ClearAllElevatedPids();
-}
-
-/* ========================================================================
- *  [DIAG-v23] 扫描诊断计数器 — 只在保护激活后计数, 可重置
- *
- *  解决问题: 前100条日志被系统其他进程在保护激活前消耗完
- *  方案: 计数器只在 g_ProtectedPidCount>0 时递增
- *        PROTECT_PID 时自动重置, 每次扫描session都有新的配额
- * ======================================================================== */
-static volatile LONG s_diag_NtRVM = 0;
-static volatile LONG s_diag_MmCVM = 0;
-static volatile LONG s_diag_QVM = 0;
-
-void ResetScanDiagCounters()
-{
-    InterlockedExchange(&s_diag_NtRVM, 0);
-    InterlockedExchange(&s_diag_MmCVM, 0);
-    InterlockedExchange(&s_diag_QVM, 0);
-    SvmDebugPrint("[DIAG] Scan counters reset\n");
-}
-
-
-/* 只在保护激活时计数, 前500条 + 每2000条 */
-/* [DIAG-v24] CE-only 计数器 — 只在 IsCallerProtected() 时调用
- * 系统进程的调用不消耗配额, 确保 Next Scan 的日志可见 */
-static __forceinline BOOLEAN DiagShouldLog_CE(volatile LONG* counter) {
-    LONG n = InterlockedIncrement(counter);
-    /* 前2000条 + 每5000条 */
-    return (n <= 2000) || ((n % 5000) == 0);
 }
 
 
@@ -1251,8 +1214,6 @@ static NTSTATUS NTAPI Fake_NtOpenProcess(
                 ZwClose(userHandle);
                 return STATUS_ACCESS_VIOLATION;
             }
-            SvmDebugPrint("[Elevate] NtOpenProcess: CE got ALL_ACCESS handle for PID %llu\n",
-                (ULONG64)ClientId->UniqueProcess);
             return STATUS_SUCCESS;
         }
 
@@ -1370,7 +1331,6 @@ BOOLEAN AddElevatedPid(HANDLE Pid)
         return FALSE;
     }
     g_ElevatedPIDs[idx] = Pid;
-    SvmDebugPrint("[Elevate] PID %llu added (count=%ld)\n", (ULONG64)Pid, idx + 1);
     return TRUE;
 }
 
@@ -1422,89 +1382,42 @@ static NTSTATUS NTAPI Fake_NtQueryVirtualMemory(
 {
     FAKE_PRINT_ONCE_FOR(HOOK_NtQueryVirtualMemory);
 
-    /* [TRACE] 无条件入口 — Release 也打印，只打一次 */
-    {
-        static volatile LONG _tEntry = 0;
-        if (InterlockedCompareExchange(&_tEntry, 1, 0) == 0)
-            SvmDebugPrint("[QVM-TRACE] ENTRY: handle=0x%p caller=%llu protected=%d elevated=%d\n",
-                ProcessHandle, (ULONG64)PsGetCurrentProcessId(),
-                (int)IsCallerProtected(),
-                (int)(g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId())));
-    }
 
     if (!g_OrigNtQueryVirtualMemory) return STATUS_UNSUCCESSFUL;
 
-    /* [DIAG-v24] 只计数 CE 调用 */
-    BOOLEAN qvmIsCE = (g_ProtectedPidCount > 0) && IsCallerProtected();
-    BOOLEAN qvmLog = qvmIsCE && DiagShouldLog_CE(&s_diag_QVM);
-    LONG qvmSeq = s_diag_QVM;
-    if (qvmLog)
-        SvmDebugPrint("[QVM] #%d h=%p addr=%p caller=%llu prot=%d\n",
-            qvmSeq, ProcessHandle, BaseAddress,
-            (ULONG64)PsGetCurrentProcessId(), (int)IsCallerProtected());
 
     /* [PATH A] ElevatedPid 调用者直接放行 */
     if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId())) {
-        static volatile LONG _tA = 0;
-        if (InterlockedCompareExchange(&_tA, 1, 0) == 0)
-            SvmDebugPrint("[QVM-TRACE] PATH-A: ElevatedPid passthrough\n");
         return g_OrigNtQueryVirtualMemory(
             ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
     }
 
-    /* [PATH B] CE (Protected caller) 查询目标进程
-     * 用临时 OBJ_KERNEL_HANDLE 绕过 ObRegisterCallbacks 降权 */
-    if (IsCallerProtected() &&
-        ProcessHandle && ProcessHandle != NtCurrentProcess())
-    {
-        PEPROCESS targetProc = NULL;
-        NTSTATUS status = ObReferenceObjectByHandle(
-            ProcessHandle, 0, *PsProcessType, KernelMode,
-            (PVOID*)&targetProc, NULL);
-
-        {
-            static volatile LONG _tB1 = 0;
-            if (InterlockedCompareExchange(&_tB1, 1, 0) == 0)
-                SvmDebugPrint("[QVM-TRACE] PATH-B: CE caller, ObRefByHandle status=0x%X\n", status);
-        }
-
-        if (NT_SUCCESS(status) && targetProc) {
-            HANDLE kernelHandle = NULL;
-            status = ObOpenObjectByPointer(
-                targetProc, OBJ_KERNEL_HANDLE, NULL,
-                0x0400, /* PROCESS_QUERY_INFORMATION */
-                *PsProcessType, KernelMode, &kernelHandle);
-            ObDereferenceObject(targetProc);
-
-            if (NT_SUCCESS(status) && kernelHandle) {
-                status = g_OrigNtQueryVirtualMemory(
-                    kernelHandle, BaseAddress, MemInfoClass,
-                    MemInfo, MemInfoLength, ReturnLength);
-                ZwClose(kernelHandle);
-                {
-                    static volatile LONG _tB2 = 0;
-                    if (InterlockedCompareExchange(&_tB2, 1, 0) == 0)
-                        SvmDebugPrint("[QVM-TRACE] PATH-B: kernel handle query status=0x%X\n", status);
-                }
-                return status;
-            }
-        }
+    /* [FIX-v26] CE 调用者直接透传 — 不再创建临时内核句柄
+     *
+     * 旧代码 PATH-B 用 ObOpenObjectByPointer(OBJ_KERNEL_HANDLE, 0x0400) 创建
+     * 临时句柄查询 QVM。问题: 内核句柄返回的 MEMORY_BASIC_INFORMATION 的
+     * State/Protect 字段可能与用户句柄不同，导致 CE Next Scan 认为内存区域
+     * 不可读 → 跳过所有 ReadProcessMemory 调用 → Found: 0。
+     *
+     * 修复: CE 是受保护进程，Fake_ObpRefByHandleWithTag 已经用
+     * DesiredAccess=0 + KernelMode 绕过了句柄权限检查。
+     * 所以 CE 的原始用户句柄可以直接传给 g_OrigNtQueryVirtualMemory。
+     */
+    if (IsCallerProtected()) {
+        NTSTATUS status = g_OrigNtQueryVirtualMemory(
+            ProcessHandle, BaseAddress, MemInfoClass,
+            MemInfo, MemInfoLength, ReturnLength);
+        return status;
     }
 
     /* [PATH C] 外部进程查询受保护进程 → 拒绝 */
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected()) {
-        static volatile LONG _tC = 0;
-        if (InterlockedCompareExchange(&_tC, 1, 0) == 0)
-            SvmDebugPrint("[QVM-TRACE] PATH-C: ACCESS_DENIED\n");
         return STATUS_ACCESS_DENIED;
     }
 
     /* [PATH D] 默认透传 */
     {
-        static volatile LONG _tD = 0;
-        if (InterlockedCompareExchange(&_tD, 1, 0) == 0)
-            SvmDebugPrint("[QVM-TRACE] PATH-D: default passthrough\n");
     }
     return g_OrigNtQueryVirtualMemory(
         ProcessHandle, BaseAddress, MemInfoClass, MemInfo, MemInfoLength, ReturnLength);
@@ -1635,17 +1548,6 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
     FAKE_PRINT_ONCE_FOR(HOOK_NtReadVirtualMemory);
     if (!g_OrigNtReadVirtualMemory) return STATUS_UNSUCCESSFUL;
 
-    /* [DIAG-v24] 只计数 CE 进程的调用, 系统进程不消耗配额 */
-    BOOLEAN isCE = (g_ProtectedPidCount > 0) && IsCallerProtected();
-    BOOLEAN doLog = isCE && DiagShouldLog_CE(&s_diag_NtRVM);
-    LONG seq = s_diag_NtRVM;
-    /* CE 每1000次读取打印一次总数摘要 */
-    static volatile LONG s_ceReadTotal = 0;
-    if (isCE) {
-        LONG t = InterlockedIncrement(&s_ceReadTotal);
-        if (t == 1 || (t % 1000) == 0)
-            SvmDebugPrint("[NtRVM-SUM] CE total reads: %d\n", t);
-    }
 
     /* CE 读升权目标 → 直接 MmCopyVirtualMemory 绕过句柄 */
     if (IsCallerProtected() && g_ElevatedPidCount > 0 &&
@@ -1669,8 +1571,6 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
                     __try { *NumberOfBytesRead = bytesCopied; }
                     __except (EXCEPTION_EXECUTE_HANDLER) {}
                 }
-                if (doLog) SvmDebugPrint("[NtRVM] #%d ELEV-MMCOPY: addr=%p size=%llu st=0x%X\n",
-                    seq, BaseAddress, (ULONG64)Size, status);
                 return status;
             }
             ObDereferenceObject(targetProc);
@@ -1679,7 +1579,6 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
 
     /* ElevatedPid 调用者放行 */
     if (g_ElevatedPidCount > 0 && IsElevatedPid(PsGetCurrentProcessId())) {
-        if (doLog) SvmDebugPrint("[NtRVM] #%d ELEVPID-PASS\n", seq);
         return g_OrigNtReadVirtualMemory(
             ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesRead);
     }
@@ -1688,8 +1587,6 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
     if (g_ProtectedPidCount > 0 &&
         IsProtectedProcessHandle(ProcessHandle) && !IsCallerProtected())
     {
-        if (doLog) SvmDebugPrint("[NtRVM] #%d BLOCK-ZERO: addr=%p size=%llu caller=%llu\n",
-            seq, BaseAddress, (ULONG64)Size, (ULONG64)PsGetCurrentProcessId());
         __try {
             RtlZeroMemory(Buffer, Size);
             if (NumberOfBytesRead) *NumberOfBytesRead = Size;
@@ -1699,18 +1596,8 @@ static NTSTATUS NTAPI Fake_NtReadVirtualMemory(
     }
 
     /* 默认透传 */
-    {
-        NTSTATUS st = g_OrigNtReadVirtualMemory(
-            ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesRead);
-        if (doLog) {
-            ULONG f4 = 0;
-            __try { if (Buffer && Size >= 4) f4 = *(PULONG)Buffer; }
-            __except (1) {}
-            SvmDebugPrint("[NtRVM] #%d PASS: h=%p addr=%p sz=%llu st=0x%X f4=0x%08X c=%llu\n",
-                seq, ProcessHandle, BaseAddress, (ULONG64)Size, st, f4, (ULONG64)PsGetCurrentProcessId());
-        }
-        return st;
-    }
+    return g_OrigNtReadVirtualMemory(
+        ProcessHandle, BaseAddress, Buffer, Size, NumberOfBytesRead);
 }
 
 /**
@@ -1902,7 +1789,6 @@ static NTSTATUS NTAPI Fake_NtCreateThreadEx(
                     *(CCHAR*)(kthread + 0x232) = savedMode;
                     ZwClose(kHandle);
 
-                    SvmDebugPrint("[Elevate] NtCreateThreadEx: CE thread in elevated PID, status=0x%X\n", st);
                     return st;
                 }
                 /* ObOpenObjectByPointer 失败, 回退正常路径 */
@@ -2265,8 +2151,6 @@ static NTSTATUS NTAPI Fake_ObpRefByHandleWithTag(
             static volatile LONG s_ElevHitCount = 0;
             LONG n = InterlockedIncrement(&s_ElevHitCount);
             if (n <= 10) {
-                SvmDebugPrint("[DIAG-Hide] ElevatedPid branch HIT! PID=%llu, Handle=0x%llX, status=0x%X (hit#%ld)\n",
-                    (ULONG64)PsGetCurrentProcessId(), (ULONG64)Handle, status, n);
             }
         }
 
@@ -2328,17 +2212,8 @@ static NTSTATUS NTAPI Fake_MmCopyVirtualMemory(
     FAKE_PRINT_ONCE_FOR(HOOK_MmCopyVirtualMemory);
     if (!g_OrigMmCopyVirtualMemory) return STATUS_UNSUCCESSFUL;
 
-    /* [DIAG-v24] 只计数 CE 调用, 系统进程不消耗配额 */
-    BOOLEAN mmIsCE = (g_ProtectedPidCount > 0) && IsCallerProtected();
-    BOOLEAN doLog = mmIsCE && DiagShouldLog_CE(&s_diag_MmCVM);
-    LONG seq = s_diag_MmCVM;
 
     if (g_ProtectedPidCount == 0) {
-        /* [DIAG] 如果保护曾经激活过又变成0, 说明 CLEAR_ALL 发生了 */
-        static volatile LONG s_earlyExit = 0;
-        LONG n = InterlockedIncrement(&s_earlyExit);
-        if (n <= 5)
-            SvmDebugPrint("[MmCVM] EARLY-EXIT #%d: g_ProtectedPidCount==0! (保护已清除?)\n", n);
         return g_OrigMmCopyVirtualMemory(
             FromProcess, FromAddress, ToProcess, ToAddress,
             BufferSize, PreviousMode, NumberOfBytesCopied);
@@ -2346,13 +2221,6 @@ static NTSTATUS NTAPI Fake_MmCopyVirtualMemory(
 
     KIRQL oldIrql;
     if (!EnterHookGuard(&oldIrql)) {
-        /* [DIAG-v24] Guard 失败也要记录 CE 的调用 */
-        if (mmIsCE) {
-            static volatile LONG s_guardFail = 0;
-            LONG gf = InterlockedIncrement(&s_guardFail);
-            if (gf <= 20 || (gf % 1000) == 0)
-                SvmDebugPrint("[MmCVM] GUARD-FAIL #%d: CE call bypassed guard!\n", gf);
-        }
         return g_OrigMmCopyVirtualMemory(
             FromProcess, FromAddress, ToProcess, ToAddress,
             BufferSize, PreviousMode, NumberOfBytesCopied);
@@ -2363,14 +2231,6 @@ static NTSTATUS NTAPI Fake_MmCopyVirtualMemory(
         NTSTATUS st = g_OrigMmCopyVirtualMemory(
             FromProcess, FromAddress, ToProcess, ToAddress,
             BufferSize, PreviousMode, NumberOfBytesCopied);
-        /* [DIAG-v24] CE-PASS 摘要 */
-        {
-            static volatile LONG s_ceMmTotal = 0;
-            LONG mt = InterlockedIncrement(&s_ceMmTotal);
-            if (mt <= 50 || (mt % 1000) == 0)
-                SvmDebugPrint("[MmCVM-SUM] CE-PASS #%d: from=%p sz=%llu st=0x%X\n",
-                    mt, FromAddress, (ULONG64)BufferSize, st);
-        }
         return st;
     }
 
@@ -2389,12 +2249,6 @@ static NTSTATUS NTAPI Fake_MmCopyVirtualMemory(
     LeaveHookGuard(oldIrql);
 
     if (touchesProtected) {
-        if (doLog)
-            SvmDebugPrint("[MmCVM] #%d BLOCKED: fromPid=%llu toPid=%llu caller=%llu\n",
-                seq,
-                (ULONG64)(FromProcess ? PsGetProcessId(FromProcess) : 0),
-                (ULONG64)(ToProcess ? PsGetProcessId(ToProcess) : 0),
-                (ULONG64)PsGetCurrentProcessId());
         if (NumberOfBytesCopied) *NumberOfBytesCopied = 0;
         return STATUS_ACCESS_VIOLATION;
     }

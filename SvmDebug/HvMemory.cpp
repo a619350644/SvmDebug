@@ -105,14 +105,14 @@ VOID HvFreeSharedContext()
  *  Guest VA -> Guest PA translation by walking x64 page tables *  Runs in VMM (Host) context - reads physical memory directly
  * ======================================================================== */
 
-/* -----------------------------------------------------------------
- * 第1级: 快速路径 — 用于 TranslateGuestVaToPa 的页表遍历
- *
- * MmGetVirtualForPhysical 从 PFN 数据库直接返回 VA:
- *   - 页表页(PML4/PDPT/PD/PT)始终是内核分配的，返回内核 VA
- *   - 不分配系统 PTE，零开销
- *   - 不需要取消映射
- * ----------------------------------------------------------------- */
+ /* -----------------------------------------------------------------
+  * 第1级: 快速路径 — 用于 TranslateGuestVaToPa 的页表遍历
+  *
+  * MmGetVirtualForPhysical 从 PFN 数据库直接返回 VA:
+  *   - 页表页(PML4/PDPT/PD/PT)始终是内核分配的，返回内核 VA
+  *   - 不分配系统 PTE，零开销
+  *   - 不需要取消映射
+  * ----------------------------------------------------------------- */
 static PVOID MapPhysicalPage(ULONG64 PhysAddr, SIZE_T Size)
 {
     UNREFERENCED_PARAMETER(Size);
@@ -205,7 +205,20 @@ static ULONG64 TranslateGuestVaToPa(ULONG64 GuestCr3, ULONG64 GuestVa)
     ULONG64 pde = pdPage[pdIdx];
     UnmapPhysicalPage(pdPage, PAGE_SIZE);
 
-    if (!(pde & 1)) return 0;
+    if (!(pde & 1)) {
+        /* [FIX] 检查 Transition PDE (罕见但可能)
+         * Windows x64 Software PTE 格式 (bit 0 = 0):
+         *   bit 10 = Transition (1 = 页面在物理内存的 standby/modified list)
+         *   bit 11 = Prototype  (0 = 非共享原型)
+         *   bits 12-51 = PFN    (页帧号, 仍然有效!)
+         * 如果是 Transition, PFN 指向有效的物理页, 可以继续遍历 */
+        if ((pde & 0xC00) == 0x400) {
+            /* Transition PDE — 继续, 当作 present 处理 */
+        }
+        else {
+            return 0;
+        }
+    }
 
     // Check for 2MB large page
     if (pde & (1ULL << 7)) {
@@ -221,7 +234,31 @@ static ULONG64 TranslateGuestVaToPa(ULONG64 GuestCr3, ULONG64 GuestVa)
     ULONG64 pte = ptPage[ptIdx];
     UnmapPhysicalPage(ptPage, PAGE_SIZE);
 
-    if (!(pte & 1)) return 0;
+    if (!(pte & 1)) {
+        /* [FIX] 检查 Transition PTE — 这是 Next Scan 结果锐减的根因
+         *
+         * 时序: BatchForcePages 触摸页面 (Present=1)
+         *       → 填充 BatchContext
+         *       → CPUID VMEXIT
+         *       → VMM 遍历页表
+         *
+         * 在触摸和 VMM 遍历之间, Windows 内存管理器可能:
+         *   1. 清除 Accessed bit (工作集修剪扫描)
+         *   2. 将页面移到 Modified/Standby list (Transition)
+         *   3. PTE.Present 从 1 → 0, 但 PTE.Transition = 1, PFN 仍有效
+         *
+         * 4800+ 个页面中, 大量处于 Transition 状态 → 旧代码返回 0 → 填零
+         * → CE 值不匹配 → 4862 → 115
+         *
+         * Transition PTE 判定: bit 10 = 1 (Transition), bit 11 = 0 (非 Prototype)
+         * PFN 在 bits 12-51, 与 Present PTE 的 PFN 位置完全相同 */
+        if ((pte & 0xC00) == 0x400) {
+            /* Transition PTE — PFN 有效, 页面在物理内存中 */
+            ULONG64 pageBase = pte & 0x000FFFFFFFFFF000ULL;
+            return pageBase | offset;
+        }
+        return 0; /* 真正不在物理内存 (paged out / demand zero / prototype) */
+    }
 
     ULONG64 pageBase = pte & 0x000FFFFFFFFFF000ULL;
     return pageBase | offset;
@@ -428,11 +465,11 @@ VOID HvHandleBatchRead(PVCPU_CONTEXT vpData)
 
     /* 逐条处理散射条目 */
     for (ULONG i = 0; i < entryCount; i++) {
-        /* 映射当前条目所在的物理页 */
         ULONG64 entryPa = entriesPa + i * sizeof(HV_SCATTER_ENTRY);
         PHV_SCATTER_ENTRY entryPage = (PHV_SCATTER_ENTRY)MapPhysicalPage(
             entryPa & ~0xFFFULL, PAGE_SIZE);
-        if (!entryPage) continue;
+        if (!entryPage)
+            continue;
 
         PHV_SCATTER_ENTRY pEntry = (PHV_SCATTER_ENTRY)((PUCHAR)entryPage + (entryPa & 0xFFF));
         ULONG64 guestVa = pEntry->GuestVa;
@@ -456,7 +493,7 @@ VOID HvHandleBatchRead(PVCPU_CONTEXT vpData)
 
             ULONG64 srcPa = TranslateGuestVaToPa(targetCr3, guestVa + bytesRead);
             if (srcPa == 0) {
-                /* 页面不存在, 跳过 (输出缓冲区对应区域保持为零) */
+                anyFailed = TRUE;
                 bytesRead += (ULONG)chunkSize;
                 continue;
             }
@@ -478,7 +515,7 @@ VOID HvHandleBatchRead(PVCPU_CONTEXT vpData)
     }
 
     pCtx->SuccessCount = successCount;
-    pCtx->Status = (successCount == entryCount) ? 0 : -1;
+    pCtx->Status = 0;
     UnmapPhysicalPage(ctx, PAGE_SIZE);
 
     vpData->Guest_gpr.Rax = (UINT64)successCount;
