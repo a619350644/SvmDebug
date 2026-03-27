@@ -155,6 +155,7 @@
     <ClCompile Include="hde\hde64.cpp" />
     <ClCompile Include="Hide.cpp" />
     <ClCompile Include="Hook.cpp" />
+    <ClCompile Include="HvMapSlot.cpp" />
     <ClCompile Include="HvMemory.cpp" />
     <ClCompile Include="MDL\MDL.cpp" />
     <ClCompile Include="NPT.cpp" />
@@ -172,6 +173,7 @@
     <ClInclude Include="Hide.h" />
     <ClInclude Include="Hook.h" />
     <ClInclude Include="HvBatchRead.h" />
+    <ClInclude Include="HvMapSlot.h" />
     <ClInclude Include="HvMemory.h" />
     <ClInclude Include="MDL\MDL.h" />
     <ClInclude Include="NPT.h" />

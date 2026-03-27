@@ -64,6 +64,9 @@
     <ClCompile Include="SvmLog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="HvMapSlot.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Common.h">
@@ -112,6 +115,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="HvBatchRead.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="HvMapSlot.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
